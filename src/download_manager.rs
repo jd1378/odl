@@ -15,7 +15,7 @@ use tokio::sync::Semaphore;
 use tokio::{io::AsyncWriteExt, sync::Mutex};
 
 use crate::credentials::Credentials;
-use crate::fs_utils::set_file_mtime_async;
+use crate::fs_utils::{atomic_replace, set_file_mtime_async};
 use crate::response_info::ResponseInfo;
 use crate::{
     conflict::{Conflict, ConflictResolution, SaveConflict, SaveConflictResolution},
@@ -225,7 +225,7 @@ impl DownloadManager {
             read_delimited_message_from_path::<DownloadMetadata, PathBuf>(&metadata_temp_path).await
         {
             // Move unfinished atomic write (temp metadata) to current metadata if not broken
-            tokio::fs::rename(&metadata_temp_path, &metadata_path).await?;
+            atomic_replace(metadata_temp_path.clone(), metadata_path.clone()).await?;
         } else {
             // If temp metadata exists but is unreadable/broken, delete it
             if tokio::fs::try_exists(&metadata_temp_path)
