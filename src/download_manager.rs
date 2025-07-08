@@ -1,0 +1,1131 @@
+use derive_builder::Builder;
+use fs2::FileExt;
+use futures::future::join_all;
+use futures::stream::{FuturesOrdered, StreamExt};
+use prost::Message;
+use reqwest::{
+    Proxy, Url,
+    header::{HeaderMap, HeaderValue, RANGE},
+};
+use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
+use reqwest_retry::RetryTransientMiddleware;
+use std::path::Path;
+use std::{path::PathBuf, sync::Arc, time::Duration};
+use tokio::sync::Semaphore;
+use tokio::{io::AsyncWriteExt, sync::Mutex};
+
+use crate::credentials::Credentials;
+use crate::fs_utils::set_file_mtime_async;
+use crate::response_info::ResponseInfo;
+use crate::{
+    conflict::{Conflict, ConflictResolution, SaveConflict, SaveConflictResolution},
+    download::Download,
+    download_metadata::{DownloadMetadata, PartDetails},
+    error::OdlError,
+    fs_utils::{
+        self, IsUnique, atomic_write, is_filename_unique, read_delimited_message_from_path,
+    },
+    retry_policies::FixedThenExponentialRetry,
+};
+
+#[derive(Builder, Debug)]
+#[builder(build_fn(validate = "Self::validate"))]
+pub struct DownloadManager {
+    /// Directory of where to keep files when downloading. This is where we keep track of our downloads.
+    #[builder(default = fs_utils::get_odl_dir().unwrap_or_else(|| {
+                let tmp_dir = std::path::PathBuf::from("/tmp/odl");
+                std::fs::create_dir_all(&tmp_dir).ok();
+                tmp_dir
+            }))]
+    download_dir: PathBuf,
+    /// Number of maximum connections.
+    #[builder(default = 6)]
+    max_connections: u64,
+    /// Number of maximum retries after which a download is considered failed.
+    #[builder(default = 3)]
+    max_retries: u32,
+    /// Amount of time to wait between retries.
+    #[builder(default = Duration::from_millis(500))]
+    wait_between_retries: Duration,
+    /// Custom HTTP headers.
+    #[builder(default = None)]
+    headers: Option<HeaderMap>,
+    /// Custom request Proxy to use for downloads
+    #[builder(default = None)]
+    proxy: Option<Proxy>,
+    /// Whether to use the last-modified sent by server when saving the file
+    #[builder(default = false)]
+    use_server_time: bool,
+}
+
+impl DownloadManager {
+    const METADATA_FILENAME: &'static str = "metadata.pb";
+    const METADATA_TEMP_FILENAME: &'static str = "metadata.pb.temp";
+    const LOCK_FILENAME: &'static str = "odl.lock";
+
+    pub fn wait_between_retries(self: &Self) -> Duration {
+        return self.wait_between_retries;
+    }
+
+    pub fn set_wait_between_retries(self: &mut Self, value: Duration) {
+        self.wait_between_retries = value;
+    }
+
+    pub fn max_connections(self: &Self) -> u64 {
+        return self.max_connections;
+    }
+
+    pub fn set_max_connections(self: &mut Self, value: u64) {
+        self.max_connections = if value > 0 { value } else { 1 }
+    }
+
+    pub fn proxy(self: &Self) -> &Option<Proxy> {
+        return &self.proxy;
+    }
+
+    pub fn set_proxy(self: &mut Self, value: Option<Proxy>) {
+        self.proxy = value
+    }
+
+    pub fn max_retries(self: &Self) -> u32 {
+        return self.max_retries;
+    }
+
+    pub fn set_max_retries(self: &mut Self, value: u32) {
+        self.max_retries = value
+    }
+
+    pub fn use_server_time(self: &Self) -> bool {
+        return self.use_server_time;
+    }
+
+    pub fn set_use_server_time(self: &mut Self, value: bool) {
+        self.use_server_time = value
+    }
+
+    fn get_client(
+        self: &Self,
+        instructions: Option<&Download>,
+    ) -> Result<ClientWithMiddleware, OdlError> {
+        let retry_policy = FixedThenExponentialRetry {
+            max_n_retries: self.max_retries,
+            wait_time: self.wait_between_retries,
+            n_fixed_retries: 3,
+        };
+        let mut client = reqwest::Client::builder();
+        if let Some(proxy) = &self.proxy {
+            client = client.proxy(proxy.clone());
+        }
+        if let Some(headers) = &self.headers {
+            client = client.default_headers(headers.clone());
+        }
+        if let Some(download) = instructions {
+            if let Some(proxy) = download.proxy() {
+                client = client.proxy(proxy.clone());
+            }
+        }
+
+        Ok(ClientBuilder::new(client.build()?)
+            .with(RetryTransientMiddleware::new_with_policy(retry_policy))
+            .build())
+    }
+
+    pub async fn evaluate(
+        self: &Self,
+        url: Url,
+        credentials: Option<Credentials>,
+    ) -> Result<Download, OdlError> {
+        let client = self.get_client(None)?;
+
+        let mut req = client
+            .head(url)
+            // we request hash just in case server implements and responds
+            // we will use this later for checking the final file against
+            .header(
+                "Want-Repr-Digest",
+                "sha-512=9, sha-384=8, sha-256=7, sha-1=1, md5=1",
+            )
+            .header(
+                "Want-Content-Digest",
+                "sha-512=9, sha-384=8, sha-256=7, sha-1=1, md5=1",
+            );
+        if let Some(creds) = &credentials {
+            req = req.basic_auth(creds.username(), creds.password());
+        }
+
+        let resp = req.send().await?;
+        let info = ResponseInfo::from(resp);
+        // TODO: fix save_dir based on detected file type category
+        let instruction = Download::from_response_info(
+            &self.download_dir,
+            Path::new("./").to_path_buf(),
+            info,
+            self.max_connections,
+            self.use_server_time,
+            credentials,
+            self.proxy.clone(),
+        );
+
+        return Ok(instruction);
+    }
+
+    pub async fn download<CR, SCR>(
+        self: &Self,
+        instruction: Download,
+        conflict_resolver: CR,
+        save_conflict_resolver: SCR,
+    ) -> Result<PathBuf, OdlError>
+    where
+        CR: Fn(Conflict) -> ConflictResolution,
+        SCR: Fn(SaveConflict) -> SaveConflictResolution,
+    {
+        tokio::fs::create_dir_all(instruction.download_dir()).await?;
+        match tokio::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(instruction.download_dir().join(Self::LOCK_FILENAME))
+            .await
+        {
+            Ok(f) => {
+                let f = f.into_std().await;
+                if let Err(_) = f.try_lock_exclusive() {
+                    return Err(OdlError::LockfileInUse);
+                }
+
+                let result = self
+                    .process_download(instruction, conflict_resolver, save_conflict_resolver)
+                    .await;
+                let _ = FileExt::unlock(&f);
+                result
+            }
+            Err(e) => {
+                return Err(OdlError::StdIoError { e });
+            }
+        }
+    }
+
+    async fn process_download<CR, SCR>(
+        self: &Self,
+        instruction: Download,
+        conflict_resolver: CR,
+        save_conflict_resolver: SCR,
+    ) -> Result<PathBuf, OdlError>
+    where
+        CR: Fn(Conflict) -> ConflictResolution,
+        SCR: Fn(SaveConflict) -> SaveConflictResolution,
+    {
+        let metadata_path = instruction.download_dir().join(Self::METADATA_FILENAME);
+        let metadata_temp_path = instruction
+            .download_dir()
+            .join(Self::METADATA_TEMP_FILENAME);
+
+        // recover from metadata write crash
+        if let Ok(_) =
+            read_delimited_message_from_path::<DownloadMetadata, PathBuf>(&metadata_temp_path).await
+        {
+            // Move unfinished atomic write (temp metadata) to current metadata if not broken
+            tokio::fs::rename(&metadata_temp_path, &metadata_path).await?;
+        } else {
+            // If temp metadata exists but is unreadable/broken, delete it
+            if tokio::fs::try_exists(&metadata_temp_path)
+                .await
+                .unwrap_or(false)
+            {
+                let _ = tokio::fs::remove_file(&metadata_temp_path).await;
+            }
+        }
+
+        let disk_metadata: Result<DownloadMetadata, std::io::Error> =
+            read_delimited_message_from_path::<DownloadMetadata, PathBuf>(&metadata_path).await;
+        let mut metadata: DownloadMetadata = if let Ok(mut disk_metadata) = disk_metadata {
+            disk_metadata.is_resumable = instruction.is_resumable(); // always update resumability
+            disk_metadata
+        } else {
+            if let Err(e) = disk_metadata {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    // Create a directory for the download if it doesn't exist
+                    let file_name = instruction.filename();
+                    let target_dir = self.download_dir.join(&file_name);
+                    std::fs::create_dir_all(&target_dir)?;
+                }
+            }
+            let metadata = instruction.as_metadata();
+            metadata
+        };
+
+        if !metadata.finished {
+            // Do possible corruption checks between new download instructions and the metadata on disk
+            let mut is_server_file_changed = false;
+            if metadata.last_etag != *instruction.etag() {
+                is_server_file_changed = true;
+            }
+            if metadata.last_modified != instruction.last_modified() {
+                is_server_file_changed = true;
+            }
+            if metadata.size != instruction.size() {
+                is_server_file_changed = true;
+            }
+
+            if is_server_file_changed {
+                let resolution = conflict_resolver(Conflict::ServerFileChanged);
+                if resolution == ConflictResolution::Abort {
+                    return Err(OdlError::DownloadAbortedDuetoConflict {
+                        conflict: Conflict::ServerFileChanged,
+                    });
+                } else if resolution == ConflictResolution::Restart {
+                    metadata.last_etag = instruction.etag().clone();
+                    metadata.last_modified = instruction.last_modified();
+                    metadata.size = instruction.size();
+                    DownloadManager::remove_all_parts(instruction.download_dir()).await;
+                    metadata.parts =
+                        Download::determine_parts(metadata.size, metadata.max_connections);
+                }
+            }
+            if !metadata.is_resumable {
+                let resolution = conflict_resolver(Conflict::NotResumable);
+                if resolution == ConflictResolution::Abort {
+                    return Err(OdlError::DownloadAbortedDuetoConflict {
+                        conflict: Conflict::NotResumable,
+                    });
+                } else if resolution == ConflictResolution::Restart {
+                    metadata.last_etag = instruction.etag().clone();
+                    metadata.last_modified = instruction.last_modified();
+                    metadata.size = instruction.size();
+                    DownloadManager::remove_all_parts(instruction.download_dir()).await;
+                    metadata.parts =
+                        Download::determine_parts(metadata.size, metadata.max_connections);
+                }
+            }
+
+            // write metadata changes, if any back to disk
+            let encoded = metadata.encode_length_delimited_to_vec();
+            atomic_write(metadata_path.clone(), metadata_temp_path.clone(), &encoded).await?;
+
+            let mut to_download = Vec::new();
+
+            // Collect all unfinished part ulids
+            let unfinished_ulids: Vec<String> = metadata
+                .parts
+                .iter()
+                .filter_map(|(_, p)| {
+                    if !p.finished {
+                        return Some(p.ulid.clone());
+                    }
+                    return None;
+                })
+                .collect();
+
+            // get file stats in parallel
+            let stats_futures = unfinished_ulids.into_iter().map(|ulid: String| {
+                let part_path = instruction.download_dir().join(format!("{}.part", ulid));
+                async move {
+                    let file = tokio::fs::OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .open(part_path)
+                        .await?;
+                    let metadata = file.metadata().await?;
+                    Ok::<(String, u64), std::io::Error>((ulid, metadata.len()))
+                }
+            });
+            let stats_results = join_all(stats_futures).await;
+
+            for stat_result in stats_results.into_iter() {
+                match stat_result {
+                    Ok((ulid, size)) => {
+                        if let Some(part) = metadata.parts.get_mut(&ulid) {
+                            if size == part.size {
+                                part.finished = true;
+                            } else {
+                                to_download.push(part.clone());
+                            }
+                        } else {
+                            return Err(OdlError::MetadataError {
+                                message: format!("Part with ulid {} not found in metadata", ulid),
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        return Err(OdlError::MetadataError {
+                            message: format!("Failed to read size of part file: {}", e.to_string()),
+                        });
+                    }
+                }
+            }
+
+            // Write metadata after checking parts, since we may have some changes
+            let encoded = metadata.encode_length_delimited_to_vec();
+            atomic_write(metadata_path.clone(), metadata_temp_path.clone(), &encoded).await?;
+
+            // Download all parts: first part serial, rest in parallel if first succeeds
+            // Downloads count should be according to max_connections of metadata
+            if !to_download.is_empty() {
+                // Mutex for safe access across threads
+                // We need this because downloads can happen in parallel and may finish at any point in time
+                // we want to safely write the metadata in case any of them finish at the same time
+                let metadata_mutex = Arc::new(Mutex::new(metadata));
+
+                // reqwest is thread-safe
+                let client = Arc::new(self.get_client(Some(&instruction))?);
+
+                // we will add permits once we confirm everything is okay on first download
+                let semaphore = Arc::new(Semaphore::new(1));
+                let mut first_iter = true;
+                let first_permit = semaphore.acquire().await?;
+
+                let mut futures = FuturesOrdered::new();
+
+                for part in to_download.into_iter() {
+                    let semaphore = semaphore.clone();
+                    let metadata_mutex = Arc::clone(&metadata_mutex);
+                    let url = instruction.url().clone();
+                    let ulid = part.ulid.clone();
+                    let part_path = instruction.download_dir().join(format!("{}.part", ulid));
+                    let part_details = part;
+                    let client: Arc<ClientWithMiddleware> = Arc::clone(&client);
+                    let first_push = first_iter.clone();
+                    first_iter = false;
+
+                    futures.push_back(tokio::spawn(async move {
+                        let _permit = if !first_push {
+                            Some(semaphore.acquire().await?)
+                        } else {
+                            None
+                        };
+                        // Dummy progress callback, replace as needed
+                        let progress_callback = |_downloaded: u64| {};
+                        let started_callback = || {
+                            if first_push {
+                                let metadata = Arc::clone(&metadata_mutex);
+                                let semaphore: Arc<Semaphore> = Arc::clone(&semaphore);
+                                tokio::spawn(async move {
+                                    let mdata = metadata.lock().await;
+                                    if mdata.max_connections - 1 > 0 {
+                                        semaphore.add_permits(
+                                            mdata.max_connections.try_into().unwrap_or(1),
+                                        );
+                                    }
+                                });
+                            }
+                        };
+                        let res = DownloadManager::download_part(
+                            &client,
+                            &url,
+                            Some(&part_details),
+                            &part_path,
+                            started_callback,
+                            progress_callback,
+                        )
+                        .await;
+
+                        // Mark part as finished and update metadata safely, but as soon as possible
+                        if res.is_ok() {
+                            let mut mdata = metadata_mutex.lock().await;
+                            if let Some(part) = mdata.parts.get_mut(&ulid) {
+                                part.finished = true;
+                            } else {
+                                return Err(OdlError::MetadataError {
+                                    message: format!(
+                                        "Part with ulid {} not found in metadata",
+                                        ulid
+                                    ),
+                                });
+                            }
+                        }
+                        drop(_permit);
+                        res
+                    }));
+                }
+
+                // Wait for first future that finishes
+                // If it was not successful, close the semaphore and return the error
+                if let Some(res) = futures.next().await {
+                    if let Err(e) = res? {
+                        // If the first download fails, prevent further downloads and return the error
+                        semaphore.close();
+                        return Err(e);
+                    }
+                }
+                drop(first_permit);
+
+                // Wait for all downloads to finish
+                while let Some(result) = futures.next().await {
+                    result??;
+                }
+
+                // Move metadata back from mutex to metadata variable
+                let mut mdata = Arc::try_unwrap(metadata_mutex)
+                    .map_err(|_| OdlError::MetadataError {
+                        message: "Failed to unwrap Arc for metadata".to_string(),
+                    })?
+                    .into_inner();
+                mdata.finished = true;
+                let encoded = mdata.encode_length_delimited_to_vec();
+                atomic_write(metadata_path.clone(), metadata_temp_path.clone(), &encoded).await?;
+                metadata = mdata;
+            }
+        }
+
+        // We are finished downloading now, concatenate parts
+        tokio::fs::create_dir_all(instruction.save_dir()).await?;
+        let mut final_path = instruction.save_dir().join(&metadata.filename);
+        if tokio::fs::try_exists(&final_path).await.unwrap_or(false) {
+            let resolution = save_conflict_resolver(SaveConflict::FinalFileExists);
+            match resolution {
+                SaveConflictResolution::ReplaceAndContinue => {
+                    // Remove the existing file before proceeding
+                    tokio::fs::remove_file(&final_path).await?;
+                }
+                SaveConflictResolution::AddNumberToNameAndContinue => {
+                    // Change the final path and write metadata to disk
+                    let new_final_path = is_filename_unique(&final_path).await?;
+                    match new_final_path {
+                        IsUnique::SuggestedAlternative(filename) => {
+                            metadata.filename = filename;
+                            let encoded = metadata.encode_length_delimited_to_vec();
+                            atomic_write(
+                                metadata_path.clone(),
+                                metadata_temp_path.clone(),
+                                &encoded,
+                            )
+                            .await?;
+                            final_path = instruction.save_dir().join(&metadata.filename);
+                        }
+                        _ => {
+                            // do nothing
+                        }
+                    }
+                }
+                _ => {
+                    return Err(OdlError::DownloadSaveAbortedDuetoConflict {
+                        conflict: SaveConflict::FinalFileExists,
+                    });
+                }
+            }
+        }
+
+        // Concat parts at final path
+        let mut final_file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&final_path)
+            .await?;
+        let mut sorted_parts: Vec<&PartDetails> = metadata.parts.values().collect();
+        sorted_parts.sort_by_key(|p| p.offset);
+        for p in sorted_parts.iter() {
+            let part_path = instruction.download_dir().join(format!("{}.part", p.ulid));
+            let mut part_file = tokio::fs::File::open(&part_path).await?;
+            tokio::io::copy(&mut part_file, &mut final_file).await?;
+        }
+
+        if metadata.use_server_time {
+            if let Some(last_modified) = metadata.last_modified {
+                if let Err(e) = set_file_mtime_async(&final_path, last_modified).await {
+                    tracing::error!(
+                        "Failed to set file mtime for {}: {}",
+                        final_path.display(),
+                        e
+                    );
+                }
+            }
+        }
+
+        // Remove all part files
+        Self::remove_all_parts(&instruction.download_dir()).await;
+
+        Ok(final_path)
+    }
+
+    async fn download_part<S, F>(
+        client: &ClientWithMiddleware,
+        url: &Url,
+        part_details: Option<&PartDetails>,
+        part_path: &PathBuf,
+        started_callback: S,
+        mut progress_callback: F,
+    ) -> Result<(), OdlError>
+    where
+        S: FnOnce() + Send,
+        F: FnMut(u64) + Send,
+    {
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(part_path)
+            .await?;
+
+        let mut req = client.get(url.clone());
+        if let Some(part) = part_details {
+            let range_header = format!("bytes={}-{}", part.offset, part.offset + part.size - 1);
+            req = req.header(
+                RANGE,
+                HeaderValue::from_str(&range_header).map_err(|e| OdlError::Other {
+                    message: "Internal Error: Invalid header value was used at download_part"
+                        .to_string(),
+                    origin: Box::new(e),
+                })?,
+            );
+        }
+
+        let mut resp = req.send().await.map_err(OdlError::from)?;
+
+        let mut downloaded: u64 = 0;
+        // Read the first chunk
+        match resp.chunk().await.map_err(OdlError::from)? {
+            Some(b) => {
+                downloaded += b.len() as u64;
+                file.write_all(&b).await?;
+                progress_callback(downloaded);
+                started_callback(); // Only called once, after first successful chunk
+            }
+            None => {
+                started_callback(); // Not even sure if it's possible, but anyway
+                return Ok(());
+            }
+        }
+
+        // Read the rest of the chunks
+        while let Some(b) = resp.chunk().await.map_err(OdlError::from)? {
+            downloaded += b.len() as u64;
+            file.write_all(&b).await?;
+            progress_callback(downloaded);
+        }
+
+        file.flush().await?;
+
+        Ok(())
+    }
+
+    async fn remove_all_parts(download_dir: &PathBuf) {
+        // Remove all .part files in the download directory
+        // Effectively resetting the download progress
+        if let Ok(mut entries) = tokio::fs::read_dir(&download_dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                if let Some(ext) = path.extension() {
+                    if ext == "part" {
+                        let _ = tokio::fs::remove_file(&path).await;
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl DownloadManagerBuilder {
+    fn validate(&self) -> Result<(), DownloadManagerBuilderError> {
+        if let Some(max_connections) = self.max_connections {
+            if max_connections == 0 {
+                return Err(DownloadManagerBuilderError::UninitializedField(
+                    "max_connections",
+                ));
+            }
+        }
+        if let Some(wait_between_retries) = self.wait_between_retries {
+            if wait_between_retries == Duration::from_millis(0) {
+                return Err(DownloadManagerBuilderError::UninitializedField(
+                    "wait_between_retries",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::download::DownloadBuilder;
+    use crate::download_metadata::PartDetails;
+    use mockito::Matcher;
+    use mockito::Server;
+    use std::collections::HashMap;
+    use tokio::fs;
+
+    #[tokio::test]
+    async fn test_download_manager_multipart_download() -> Result<(), Box<dyn std::error::Error>> {
+        // Prepare test data
+        let file_content = b"HelloWorldThisIsATestFile";
+        let part1 = &file_content[..10]; // "HelloWorld"
+        let part2 = &file_content[10..]; // "ThisIsATestFile"
+
+        // Start mock server
+        let mut server = Server::new_async().await;
+        let url = server.url();
+
+        // HEAD request returns file info
+        let head_mock = server
+            .mock("HEAD", "/testfile")
+            .with_status(200)
+            .with_header("content-length", &file_content.len().to_string())
+            .with_header("accept-ranges", "bytes")
+            .with_header("etag", "testetag")
+            .with_header("last-modified", "Wed, 21 Oct 2015 07:28:00 GMT")
+            .create_async()
+            .await;
+
+        // GET requests for each part
+        let get_mock1 = server
+            .mock("GET", "/testfile")
+            .match_header("range", Matcher::Exact("bytes=0-9".into()))
+            .with_status(206)
+            .with_body(part1)
+            .create_async()
+            .await;
+
+        let get_mock2 = server
+            .mock("GET", "/testfile")
+            .match_header(
+                "range",
+                Matcher::Exact(format!("bytes=10-{}", file_content.len() - 1)),
+            )
+            .with_status(206)
+            .with_body(part2)
+            .create_async()
+            .await;
+
+        // Build DownloadManager with 2 connections and separate download/save dirs
+        let tmp_download_dir = tempfile::tempdir()?;
+        let tmp_save_dir = tempfile::tempdir()?;
+        let dlm = DownloadManagerBuilder::default()
+            .download_dir(tmp_download_dir.path().to_path_buf())
+            .max_connections(2)
+            .build()
+            .unwrap();
+
+        // Evaluate to get Download instruction
+        let instruction = dlm
+            .evaluate(Url::parse(&format!("{}/testfile", url)).unwrap(), None)
+            .await?;
+
+        // Patch the instruction to simulate 2 parts
+        let instruction = DownloadBuilder::default()
+            .download_dir(instruction.download_dir().clone())
+            .save_dir(tmp_save_dir.path().to_path_buf())
+            .filename(instruction.filename().to_string())
+            .url(instruction.url().clone())
+            .size(Some(file_content.len() as u64))
+            .max_connections(2)
+            .parts({
+                let mut parts = HashMap::new();
+                parts.insert(
+                    "part1".to_string(),
+                    PartDetails {
+                        ulid: "part1".to_string(),
+                        offset: 0,
+                        size: 10,
+                        finished: false,
+                    },
+                );
+                parts.insert(
+                    "part2".to_string(),
+                    PartDetails {
+                        ulid: "part2".to_string(),
+                        offset: 10,
+                        size: (file_content.len() - 10) as u64,
+                        finished: false,
+                    },
+                );
+                parts
+            })
+            .is_resumable(true)
+            .build()
+            .unwrap();
+
+        // Download and concatenate
+        let final_path = dlm
+            .download(
+                instruction,
+                |_| ConflictResolution::Abort,
+                |_| SaveConflictResolution::ReplaceAndContinue,
+            )
+            .await?;
+
+        // Check file content
+        let result = fs::read(&final_path).await?;
+        assert_eq!(result, file_content);
+
+        // Ensure mocks were hit
+        head_mock.assert_async().await;
+        get_mock1.assert_async().await;
+        get_mock2.assert_async().await;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_download_manager_single_part_download() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // Prepare test data
+        let file_content = b"SinglePartFileContent";
+        let part = &file_content[..];
+
+        // Start mock server
+        let mut server = Server::new_async().await;
+        let url = server.url();
+
+        // HEAD request returns file info
+        let head_mock = server
+            .mock("HEAD", "/singlefile")
+            .with_status(200)
+            .with_header("content-length", &file_content.len().to_string())
+            .with_header("accept-ranges", "bytes")
+            .with_header("etag", "singleetag")
+            .with_header("last-modified", "Thu, 22 Oct 2015 07:28:00 GMT")
+            .create_async()
+            .await;
+
+        // GET request for the whole file (single part)
+        let get_mock = server
+            .mock("GET", "/singlefile")
+            .match_header(
+                "range",
+                Matcher::Exact(format!("bytes=0-{}", file_content.len() - 1)),
+            )
+            .with_status(206)
+            .with_body(part)
+            .create_async()
+            .await;
+
+        // Build DownloadManager with 1 connection and separate download/save dirs
+        let tmp_download_dir = tempfile::tempdir()?;
+        let tmp_save_dir = tempfile::tempdir()?;
+        let dlm = DownloadManagerBuilder::default()
+            .download_dir(tmp_download_dir.path().to_path_buf())
+            .max_connections(1)
+            .build()
+            .unwrap();
+
+        // Evaluate to get Download instruction
+        let instruction = dlm
+            .evaluate(Url::parse(&format!("{}/singlefile", url)).unwrap(), None)
+            .await?;
+        // Patch the instruction to simulate 1 part
+        let instruction = DownloadBuilder::default()
+            .download_dir(instruction.download_dir().clone())
+            .save_dir(tmp_save_dir.path().to_path_buf())
+            .filename(instruction.filename().to_string())
+            .url(instruction.url().clone())
+            .size(Some(file_content.len() as u64))
+            .max_connections(1)
+            .parts({
+                let mut parts = HashMap::new();
+                parts.insert(
+                    "part1".to_string(),
+                    PartDetails {
+                        ulid: "part1".to_string(),
+                        offset: 0,
+                        size: file_content.len() as u64,
+                        finished: false,
+                    },
+                );
+                parts
+            })
+            .is_resumable(true)
+            .build()
+            .unwrap();
+
+        // Download and concatenate
+        let final_path = dlm
+            .download(
+                instruction,
+                |_| ConflictResolution::Abort,
+                |_| SaveConflictResolution::ReplaceAndContinue,
+            )
+            .await?;
+
+        // Check file content
+        let result = fs::read(&final_path).await?;
+        assert_eq!(result, file_content);
+
+        // Ensure mocks were hit
+        head_mock.assert_async().await;
+        get_mock.assert_async().await;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_download_manager_multipart_not_resumable_download()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Prepare test data
+        let file_content = b"NonResumableMultipartFile";
+
+        // Start mock server
+        let mut server = Server::new_async().await;
+        let url = server.url();
+
+        // HEAD request returns file info, but not resumable (no accept-ranges)
+        let head_mock = server
+            .mock("HEAD", "/nonresumablefile")
+            .with_status(200)
+            .with_header("content-length", &file_content.len().to_string())
+            .with_header("etag", "nonresumableetag")
+            .with_header("last-modified", "Fri, 23 Oct 2015 07:28:00 GMT")
+            .create_async()
+            .await;
+
+        // Build DownloadManager with 2 connections and separate download/save dirs
+        let tmp_download_dir = tempfile::tempdir()?;
+        let tmp_save_dir = tempfile::tempdir()?;
+        let dlm = DownloadManagerBuilder::default()
+            .download_dir(tmp_download_dir.path().to_path_buf())
+            .max_connections(2)
+            .build()
+            .unwrap();
+
+        // Evaluate to get Download instruction
+        let instruction = dlm
+            .evaluate(
+                Url::parse(&format!("{}/nonresumablefile", url)).unwrap(),
+                None,
+            )
+            .await?;
+
+        // Patch the instruction to simulate 2 parts, but not resumable
+        let instruction = DownloadBuilder::default()
+            .download_dir(instruction.download_dir().clone())
+            .save_dir(tmp_save_dir.path().to_path_buf())
+            .filename(instruction.filename().to_string())
+            .url(instruction.url().clone())
+            .size(Some(file_content.len() as u64))
+            .max_connections(2)
+            .parts({
+                let mut parts = HashMap::new();
+                parts.insert(
+                    "part1".to_string(),
+                    PartDetails {
+                        ulid: "part1".to_string(),
+                        offset: 0,
+                        size: 10,
+                        finished: false,
+                    },
+                );
+                parts.insert(
+                    "part2".to_string(),
+                    PartDetails {
+                        ulid: "part2".to_string(),
+                        offset: 10,
+                        size: (file_content.len() - 10) as u64,
+                        finished: false,
+                    },
+                );
+                parts
+            })
+            .is_resumable(false)
+            .build()
+            .unwrap();
+
+        // Download should abort due to not resumable conflict
+        let result = dlm
+            .download(
+                instruction,
+                |conflict| {
+                    assert_eq!(conflict, Conflict::NotResumable);
+                    ConflictResolution::Abort
+                },
+                |_| SaveConflictResolution::ReplaceAndContinue,
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(OdlError::DownloadAbortedDuetoConflict {
+                conflict: Conflict::NotResumable
+            })
+        ));
+
+        // Ensure HEAD mock was hit, GET mocks may not be hit
+        head_mock.assert_async().await;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_download_manager_multipart_not_resumable_restart_download()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Prepare test data
+        let file_content = b"NonResumableMultipartFile";
+        let part = &file_content[..];
+
+        // Start mock server
+        let mut server = Server::new_async().await;
+        let url = server.url();
+
+        // HEAD request returns file info, but not resumable (no accept-ranges)
+        let head_mock = server
+            .mock("HEAD", "/nonresumablefile_restart")
+            .with_status(200)
+            .with_header("content-length", &file_content.len().to_string())
+            .with_header("etag", "nonresumableetag")
+            .with_header("last-modified", "Fri, 23 Oct 2015 07:28:00 GMT")
+            .create_async()
+            .await;
+
+        // GET request for the whole file (single part, since not resumable)
+        let get_mock = server
+            .mock("GET", "/nonresumablefile_restart")
+            .match_header(
+                "range",
+                Matcher::Exact(format!("bytes=0-{}", file_content.len() - 1)),
+            )
+            .with_status(206)
+            .with_body(part)
+            .create_async()
+            .await;
+
+        // Build DownloadManager with 2 connections (will be forced to 1) and separate download/save dirs
+        let tmp_download_dir = tempfile::tempdir()?;
+        let tmp_save_dir = tempfile::tempdir()?;
+        let dlm = DownloadManagerBuilder::default()
+            .download_dir(tmp_download_dir.path().to_path_buf())
+            .max_connections(2)
+            .build()
+            .unwrap();
+
+        // Evaluate to get Download instruction
+        let instruction = dlm
+            .evaluate(
+                Url::parse(&format!("{}/nonresumablefile_restart", url)).unwrap(),
+                None,
+            )
+            .await?;
+
+        // Patch the instruction to simulate 2 parts, but not resumable
+        let instruction = DownloadBuilder::default()
+            .download_dir(instruction.download_dir().clone())
+            .save_dir(tmp_save_dir.path().to_path_buf())
+            .filename(instruction.filename().to_string())
+            .url(instruction.url().clone())
+            .size(Some(file_content.len() as u64))
+            .max_connections(2)
+            .parts({
+                let mut parts = std::collections::HashMap::new();
+                parts.insert(
+                    "part1".to_string(),
+                    PartDetails {
+                        ulid: "part1".to_string(),
+                        offset: 0,
+                        size: 10,
+                        finished: false,
+                    },
+                );
+                parts.insert(
+                    "part2".to_string(),
+                    PartDetails {
+                        ulid: "part2".to_string(),
+                        offset: 10,
+                        size: (file_content.len() - 10) as u64,
+                        finished: false,
+                    },
+                );
+                parts
+            })
+            .is_resumable(false)
+            .build()
+            .unwrap();
+
+        // Download should restart and succeed with a single connection
+        let final_path = dlm
+            .download(
+                instruction,
+                |conflict| {
+                    assert_eq!(conflict, Conflict::NotResumable);
+                    ConflictResolution::Restart
+                },
+                |_| SaveConflictResolution::ReplaceAndContinue,
+            )
+            .await?;
+
+        // Check file content
+        let result = fs::read(&final_path).await?;
+        assert_eq!(result, file_content);
+
+        // Ensure mocks were hit
+        head_mock.assert_async().await;
+        get_mock.assert_async().await;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_download_manager_zero_byte_single_part_download()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Prepare test data: empty file
+        let file_content = b"";
+
+        // Start mock server
+        let mut server = Server::new_async().await;
+        let url = server.url();
+
+        // HEAD request returns file info for 0 bytes
+        let head_mock = server
+            .mock("HEAD", "/zerofile")
+            .with_status(200)
+            .with_header("content-length", "0")
+            .with_header("accept-ranges", "bytes")
+            .with_header("etag", "zeroetag")
+            .with_header("last-modified", "Sat, 24 Oct 2015 07:28:00 GMT")
+            .create_async()
+            .await;
+
+        // Build DownloadManager with 1 connection and separate download/save dirs
+        let tmp_download_dir = tempfile::tempdir()?;
+        let tmp_save_dir = tempfile::tempdir()?;
+        let dlm = DownloadManagerBuilder::default()
+            .download_dir(tmp_download_dir.path().to_path_buf())
+            .max_connections(1)
+            .build()
+            .unwrap();
+
+        // Evaluate to get Download instruction
+        let instruction = dlm
+            .evaluate(Url::parse(&format!("{}/zerofile", url)).unwrap(), None)
+            .await?;
+
+        // Patch the instruction to simulate 1 part of 0 bytes
+        let instruction = DownloadBuilder::default()
+            .download_dir(instruction.download_dir().clone())
+            .save_dir(tmp_save_dir.path().to_path_buf())
+            .filename(instruction.filename().to_string())
+            .url(instruction.url().clone())
+            .size(Some(0))
+            .max_connections(1)
+            .parts({
+                let mut parts = std::collections::HashMap::new();
+                parts.insert(
+                    "part1".to_string(),
+                    PartDetails {
+                        ulid: "part1".to_string(),
+                        offset: 0,
+                        size: 0,
+                        finished: false,
+                    },
+                );
+                parts
+            })
+            .is_resumable(true)
+            .build()
+            .unwrap();
+
+        // Download and concatenate
+        let final_path = dlm
+            .download(
+                instruction,
+                |_| ConflictResolution::Abort,
+                |_| SaveConflictResolution::ReplaceAndContinue,
+            )
+            .await?;
+
+        // Check file content
+        let result = fs::read(&final_path).await?;
+        assert_eq!(result, file_content);
+
+        // Ensure mocks were hit
+        head_mock.assert_async().await;
+
+        Ok(())
+    }
+}
