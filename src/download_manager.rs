@@ -237,27 +237,26 @@ impl DownloadManager {
         CR: Fn(Conflict) -> ConflictResolution,
         SCR: Fn(SaveConflict) -> SaveConflictResolution,
     {
-        let metadata_path = instruction.metadata_path();
-        let metadata_temp_path = instruction.metadata_temp_path();
+        tokio::fs::create_dir_all(instruction.download_dir()).await?;
 
         DownloadManager::recover_metadata(&instruction).await?;
 
-        let disk_metadata: Result<DownloadMetadata, std::io::Error> =
-            read_delimited_message_from_path::<DownloadMetadata, PathBuf>(&metadata_path).await;
-        let mut metadata: DownloadMetadata = if let Ok(mut disk_metadata) = disk_metadata {
-            disk_metadata.is_resumable = instruction.is_resumable(); // always update resumability
-            disk_metadata
-        } else {
-            if let Err(e) = disk_metadata {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    // Create a directory for the download if it doesn't exist
-                    let file_name = instruction.filename();
-                    let target_dir = self.download_dir.join(&file_name);
-                    std::fs::create_dir_all(&target_dir)?;
-                }
+        let mut metadata: DownloadMetadata = match read_delimited_message_from_path::<
+            DownloadMetadata,
+            PathBuf,
+        >(&instruction.metadata_path())
+        .await
+        {
+            Ok(mut disk_metadata) => {
+                disk_metadata.is_resumable = instruction.is_resumable(); // always update resumability
+                disk_metadata
             }
-            let metadata = instruction.as_metadata();
-            metadata
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    return Err(OdlError::StdIoError { e });
+                }
+                instruction.as_metadata()
+            }
         };
 
         if !metadata.finished {
@@ -306,7 +305,12 @@ impl DownloadManager {
 
             // write metadata changes, if any back to disk
             let encoded = metadata.encode_length_delimited_to_vec();
-            atomic_write(metadata_path.clone(), metadata_temp_path.clone(), &encoded).await?;
+            atomic_write(
+                instruction.metadata_path(),
+                instruction.metadata_temp_path(),
+                &encoded,
+            )
+            .await?;
 
             let mut to_download = Vec::new();
 
@@ -362,7 +366,12 @@ impl DownloadManager {
 
             // Write metadata after checking parts, since we may have some changes
             let encoded = metadata.encode_length_delimited_to_vec();
-            atomic_write(metadata_path.clone(), metadata_temp_path.clone(), &encoded).await?;
+            atomic_write(
+                instruction.metadata_path(),
+                instruction.metadata_temp_path(),
+                &encoded,
+            )
+            .await?;
 
             // Download all parts: first part serial, rest in parallel if first succeeds
             // Downloads count should be according to max_connections of metadata
@@ -468,7 +477,12 @@ impl DownloadManager {
                     .into_inner();
                 mdata.finished = true;
                 let encoded = mdata.encode_length_delimited_to_vec();
-                atomic_write(metadata_path.clone(), metadata_temp_path.clone(), &encoded).await?;
+                atomic_write(
+                    instruction.metadata_path(),
+                    instruction.metadata_temp_path(),
+                    &encoded,
+                )
+                .await?;
                 metadata = mdata;
             }
         }
@@ -491,8 +505,8 @@ impl DownloadManager {
                             metadata.filename = filename;
                             let encoded = metadata.encode_length_delimited_to_vec();
                             atomic_write(
-                                metadata_path.clone(),
-                                metadata_temp_path.clone(),
+                                instruction.metadata_path(),
+                                instruction.metadata_temp_path(),
                                 &encoded,
                             )
                             .await?;
