@@ -4,7 +4,7 @@ use thiserror::Error;
 use tokio::time::error::Elapsed;
 use tokio::{sync::AcquireError, task::JoinError};
 
-use crate::conflict::{Conflict, SaveConflict};
+use crate::conflict::{SaveConflict, ServerConflict};
 
 #[derive(Error, Debug)]
 pub enum OdlError {
@@ -41,7 +41,7 @@ pub enum OdlError {
     #[error("Error while acquiring lock for metadata")]
     LockfileInUse,
     #[error("Download aborted due to conflict: {conflict:?}")]
-    DownloadAbortedDuetoConflict { conflict: Conflict },
+    DownloadAbortedDuetoConflict { conflict: ServerConflict },
     #[error("Download save aborted due to conflict: {conflict:?}")]
     DownloadSaveAbortedDuetoConflict { conflict: SaveConflict },
     #[error("Other error: {message:?}")]

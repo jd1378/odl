@@ -14,11 +14,12 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
 use tokio::{io::AsyncWriteExt, sync::Mutex};
 
+use crate::conflict::ConflictResolver;
 use crate::credentials::Credentials;
 use crate::fs_utils::{atomic_replace, set_file_mtime_async};
 use crate::response_info::ResponseInfo;
 use crate::{
-    conflict::{Conflict, ConflictResolution, SaveConflict, SaveConflictResolution},
+    conflict::{SaveConflict, SaveConflictResolution, ServerConflict, ServerConflictResolution},
     download::Download,
     download_metadata::{DownloadMetadata, PartDetails},
     error::OdlError,
@@ -165,15 +166,13 @@ impl DownloadManager {
         return Ok(instruction);
     }
 
-    pub async fn download<CR, SCR>(
+    pub async fn download<CR>(
         self: &Self,
         instruction: Download,
-        conflict_resolver: CR,
-        save_conflict_resolver: SCR,
+        conflict_resolver: &CR,
     ) -> Result<PathBuf, OdlError>
     where
-        CR: Fn(Conflict) -> ConflictResolution,
-        SCR: Fn(SaveConflict) -> SaveConflictResolution,
+        CR: ConflictResolver,
     {
         tokio::fs::create_dir_all(instruction.download_dir()).await?;
         match tokio::fs::OpenOptions::new()
@@ -189,9 +188,7 @@ impl DownloadManager {
                     return Err(OdlError::LockfileInUse);
                 }
 
-                let result = self
-                    .process_download(instruction, conflict_resolver, save_conflict_resolver)
-                    .await;
+                let result = self.process_download(instruction, conflict_resolver).await;
                 let _ = FileExt::unlock(&f);
                 result
             }
@@ -227,15 +224,13 @@ impl DownloadManager {
         Ok(())
     }
 
-    async fn process_download<CR, SCR>(
+    async fn process_download<CR>(
         self: &Self,
         instruction: Download,
-        conflict_resolver: CR,
-        save_conflict_resolver: SCR,
+        conflict_resolver: &CR,
     ) -> Result<PathBuf, OdlError>
     where
-        CR: Fn(Conflict) -> ConflictResolution,
-        SCR: Fn(SaveConflict) -> SaveConflictResolution,
+        CR: ConflictResolver,
     {
         tokio::fs::create_dir_all(instruction.download_dir()).await?;
 
@@ -273,12 +268,13 @@ impl DownloadManager {
             }
 
             if is_server_file_changed {
-                let resolution = conflict_resolver(Conflict::ServerFileChanged);
-                if resolution == ConflictResolution::Abort {
+                let resolution =
+                    conflict_resolver.resolve_server_conflict(ServerConflict::FileChanged);
+                if resolution == ServerConflictResolution::Abort {
                     return Err(OdlError::DownloadAbortedDuetoConflict {
-                        conflict: Conflict::ServerFileChanged,
+                        conflict: ServerConflict::FileChanged,
                     });
-                } else if resolution == ConflictResolution::Restart {
+                } else if resolution == ServerConflictResolution::Restart {
                     metadata.last_etag = instruction.etag().clone();
                     metadata.last_modified = instruction.last_modified();
                     metadata.size = instruction.size();
@@ -288,12 +284,13 @@ impl DownloadManager {
                 }
             }
             if !metadata.is_resumable {
-                let resolution = conflict_resolver(Conflict::NotResumable);
-                if resolution == ConflictResolution::Abort {
+                let resolution =
+                    conflict_resolver.resolve_server_conflict(ServerConflict::NotResumable);
+                if resolution == ServerConflictResolution::Abort {
                     return Err(OdlError::DownloadAbortedDuetoConflict {
-                        conflict: Conflict::NotResumable,
+                        conflict: ServerConflict::NotResumable,
                     });
-                } else if resolution == ConflictResolution::Restart {
+                } else if resolution == ServerConflictResolution::Restart {
                     metadata.last_etag = instruction.etag().clone();
                     metadata.last_modified = instruction.last_modified();
                     metadata.size = instruction.size();
@@ -491,7 +488,7 @@ impl DownloadManager {
         tokio::fs::create_dir_all(instruction.save_dir()).await?;
         let mut final_path = instruction.save_dir().join(&metadata.filename);
         if tokio::fs::try_exists(&final_path).await.unwrap_or(false) {
-            let resolution = save_conflict_resolver(SaveConflict::FinalFileExists);
+            let resolution = conflict_resolver.resolve_save_conflict(SaveConflict::FinalFileExists);
             match resolution {
                 SaveConflictResolution::ReplaceAndContinue => {
                     // Remove the existing file before proceeding
@@ -664,6 +661,17 @@ mod tests {
     use std::collections::HashMap;
     use tokio::fs;
 
+    struct AlwaysAbortResolver;
+    impl ConflictResolver for AlwaysAbortResolver {
+        fn resolve_server_conflict(&self, _: ServerConflict) -> ServerConflictResolution {
+            ServerConflictResolution::Abort
+        }
+
+        fn resolve_save_conflict(&self, _: SaveConflict) -> SaveConflictResolution {
+            SaveConflictResolution::ReplaceAndContinue
+        }
+    }
+
     #[tokio::test]
     async fn test_download_manager_multipart_download() -> Result<(), Box<dyn std::error::Error>> {
         // Prepare test data
@@ -754,14 +762,9 @@ mod tests {
             .build()
             .unwrap();
 
+        let resolver = AlwaysAbortResolver {};
         // Download and concatenate
-        let final_path = dlm
-            .download(
-                instruction,
-                |_| ConflictResolution::Abort,
-                |_| SaveConflictResolution::ReplaceAndContinue,
-            )
-            .await?;
+        let final_path = dlm.download(instruction, &resolver).await?;
 
         // Check file content
         let result = fs::read(&final_path).await?;
@@ -847,14 +850,9 @@ mod tests {
             .build()
             .unwrap();
 
+        let resolver = AlwaysAbortResolver {};
         // Download and concatenate
-        let final_path = dlm
-            .download(
-                instruction,
-                |_| ConflictResolution::Abort,
-                |_| SaveConflictResolution::ReplaceAndContinue,
-            )
-            .await?;
+        let final_path = dlm.download(instruction, &resolver).await?;
 
         // Check file content
         let result = fs::read(&final_path).await?;
@@ -938,22 +936,29 @@ mod tests {
             .build()
             .unwrap();
 
+        struct AssertTestResolver;
+        impl ConflictResolver for AssertTestResolver {
+            fn resolve_server_conflict(
+                &self,
+                conflict: ServerConflict,
+            ) -> ServerConflictResolution {
+                assert_eq!(conflict, ServerConflict::NotResumable);
+                ServerConflictResolution::Abort
+            }
+
+            fn resolve_save_conflict(&self, _: SaveConflict) -> SaveConflictResolution {
+                SaveConflictResolution::ReplaceAndContinue
+            }
+        }
+
+        let resolver = AssertTestResolver {};
         // Download should abort due to not resumable conflict
-        let result = dlm
-            .download(
-                instruction,
-                |conflict| {
-                    assert_eq!(conflict, Conflict::NotResumable);
-                    ConflictResolution::Abort
-                },
-                |_| SaveConflictResolution::ReplaceAndContinue,
-            )
-            .await;
+        let result = dlm.download(instruction, &resolver).await;
 
         assert!(matches!(
             result,
             Err(OdlError::DownloadAbortedDuetoConflict {
-                conflict: Conflict::NotResumable
+                conflict: ServerConflict::NotResumable
             })
         ));
 
@@ -1047,17 +1052,25 @@ mod tests {
             .build()
             .unwrap();
 
+        struct AssertTestResolver;
+        impl ConflictResolver for AssertTestResolver {
+            fn resolve_server_conflict(
+                &self,
+                conflict: ServerConflict,
+            ) -> ServerConflictResolution {
+                assert_eq!(conflict, ServerConflict::NotResumable);
+                ServerConflictResolution::Restart
+            }
+
+            fn resolve_save_conflict(&self, _: SaveConflict) -> SaveConflictResolution {
+                SaveConflictResolution::ReplaceAndContinue
+            }
+        }
+
+        let resolver = AssertTestResolver {};
+
         // Download should restart and succeed with a single connection
-        let final_path = dlm
-            .download(
-                instruction,
-                |conflict| {
-                    assert_eq!(conflict, Conflict::NotResumable);
-                    ConflictResolution::Restart
-                },
-                |_| SaveConflictResolution::ReplaceAndContinue,
-            )
-            .await?;
+        let final_path = dlm.download(instruction, &resolver).await?;
 
         // Check file content
         let result = fs::read(&final_path).await?;
@@ -1130,14 +1143,9 @@ mod tests {
             .build()
             .unwrap();
 
+        let resolver = AlwaysAbortResolver {};
         // Download and concatenate
-        let final_path = dlm
-            .download(
-                instruction,
-                |_| ConflictResolution::Abort,
-                |_| SaveConflictResolution::ReplaceAndContinue,
-            )
-            .await?;
+        let final_path = dlm.download(instruction, &resolver).await?;
 
         // Check file content
         let result = fs::read(&final_path).await?;

@@ -3,9 +3,9 @@ use reqwest::Url;
 use crate::credentials::Credentials;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Conflict {
+pub enum ServerConflict {
     /// File changed on server. Either of "size", "etag", "last-modified" headers have been changed
-    ServerFileChanged,
+    FileChanged,
     /// File is the same probably but server does not support `range` requests
     NotResumable,
     /// The original url no longer works
@@ -15,7 +15,7 @@ pub enum Conflict {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConflictResolution {
+pub enum ServerConflictResolution {
     /// Valid for all cases
     Abort,
     /// Valid for [Conflict::ServerFileChanged], [Conflict::NotResumable]
@@ -49,4 +49,9 @@ pub enum SaveConflictResolution {
     AddNumberToNameAndContinue,
     /// Valid for: [SaveConflict::SameDownloadFinished]
     ProceedToFinish,
+}
+
+pub trait ConflictResolver: Send + Sync {
+    fn resolve_server_conflict(&self, conflict: ServerConflict) -> ServerConflictResolution;
+    fn resolve_save_conflict(&self, conflict: SaveConflict) -> SaveConflictResolution;
 }
