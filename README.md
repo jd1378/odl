@@ -16,6 +16,10 @@ open source flexible download library and cli intended to be fast, reliable and 
 | 🏷️ Server-sent file names         | Uses server-provided file names when available, otherwise falls back to the URL's last segment |
 | 🧪 Thoroughly tested                              | Extensive tests with mock servers and diverse download scenarios                              |
 
+## Roadmap
+
+- Open source multi-platform desktop application based on ODL
+
 ## Credits
 
 Inspired by:
