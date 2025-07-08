@@ -298,8 +298,51 @@ impl ResponseInfo {
             }
         }
 
-        // Repr-Digest (RFC 9530, e.g. "sha-256=:base64value:, sha-512=:base64value:")
-        if let Some(val) = self.response_headers.get("Repr-Digest") {
+        // Prefer Content-Digest (RFC 9530) over Repr-Digest if present
+        if let Some(val) = self.response_headers.get("Content-Digest") {
+            if let Ok(s) = val.to_str() {
+                for part in s.split(',') {
+                    let part = part.trim();
+                    if let Some((alg, value)) = part.split_once('=') {
+                        let value = value.trim();
+                        // Content-Digest values are surrounded by colons, e.g. ":base64value:"
+                        let value = value.trim_matches(':');
+                        match alg.trim().to_ascii_lowercase().as_str() {
+                            "sha-512" => {
+                                hashes.push(HashDigest::SHA512(
+                                    value.to_string(),
+                                    crate::hash::HashEncoding::Base64,
+                                ));
+                                return hashes;
+                            }
+                            "sha-384" => {
+                                hashes.push(HashDigest::SHA384(
+                                    value.to_string(),
+                                    crate::hash::HashEncoding::Base64,
+                                ));
+                                return hashes;
+                            }
+                            "sha-256" => {
+                                hashes.push(HashDigest::SHA256(
+                                    value.to_string(),
+                                    crate::hash::HashEncoding::Base64,
+                                ));
+                                return hashes;
+                            }
+                            "sha" | "sha1" | "sha-1" => hashes.push(HashDigest::SHA1(
+                                value.to_string(),
+                                crate::hash::HashEncoding::Base64,
+                            )),
+                            "md5" => hashes.push(HashDigest::MD5(
+                                value.to_string(),
+                                crate::hash::HashEncoding::Base64,
+                            )),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        } else if let Some(val) = self.response_headers.get("Repr-Digest") {
             if let Ok(s) = val.to_str() {
                 for part in s.split(',') {
                     let part = part.trim();
