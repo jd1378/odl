@@ -9,7 +9,7 @@ open source flexible download library and cli intended to be fast, reliable and 
 | ⚡ Multi-part downloads                            | Configurable parallel connections for faster downloads                                        |
 | 🔄 Automatic resume support                       | Seamlessly continue interrupted downloads (if server supports range requests)                  |
 | 📝 Conflict resolution                            | Handles file changes and existing files intelligently (configurable)                                         |
-| 🛡️ Crash resistant                               | Minimizes data loss during unexpected interruptions                                           |
+| 🛡️ Crash resilient                               | Minimizes data loss during unexpected interruptions                                           |
 | 🌐 Custom HTTP headers & proxy support            | Flexible networking options for advanced use cases                                            |
 | 🔁 Retry logic                                   | Automatic retries with configurable backoff on failures                                       |
 | 🕒 Preserve modification times (optional)         | Optionally keeps server file modification timestamps                                          |
