@@ -59,10 +59,6 @@ pub struct DownloadManager {
 }
 
 impl DownloadManager {
-    const METADATA_FILENAME: &'static str = "metadata.pb";
-    const METADATA_TEMP_FILENAME: &'static str = "metadata.pb.temp";
-    const LOCK_FILENAME: &'static str = "odl.lock";
-
     pub fn wait_between_retries(self: &Self) -> Duration {
         return self.wait_between_retries;
     }
@@ -184,7 +180,7 @@ impl DownloadManager {
             .read(true)
             .write(true)
             .create(true)
-            .open(instruction.download_dir().join(Self::LOCK_FILENAME))
+            .open(instruction.lockfile_path())
             .await
         {
             Ok(f) => {
@@ -205,6 +201,32 @@ impl DownloadManager {
         }
     }
 
+    async fn recover_metadata(instruction: &Download) -> Result<(), OdlError> {
+        let metadata_temp_path = instruction.metadata_temp_path();
+
+        // Attempt to recover from an interrupted metadata write
+        match read_delimited_message_from_path::<DownloadMetadata, PathBuf>(&metadata_temp_path)
+            .await
+        {
+            Ok(_) => {
+                // If temp metadata is valid, atomically replace the main metadata file
+                atomic_replace(metadata_temp_path, instruction.metadata_path()).await?;
+            }
+            Err(_) => {
+                // If temp metadata is invalid or unreadable, remove it if it exists
+                if tokio::fs::try_exists(&metadata_temp_path)
+                    .await
+                    .unwrap_or(false)
+                {
+                    // successful removal is important at this point
+                    tokio::fs::remove_file(&metadata_temp_path).await?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     async fn process_download<CR, SCR>(
         self: &Self,
         instruction: Download,
@@ -215,26 +237,10 @@ impl DownloadManager {
         CR: Fn(Conflict) -> ConflictResolution,
         SCR: Fn(SaveConflict) -> SaveConflictResolution,
     {
-        let metadata_path = instruction.download_dir().join(Self::METADATA_FILENAME);
-        let metadata_temp_path = instruction
-            .download_dir()
-            .join(Self::METADATA_TEMP_FILENAME);
+        let metadata_path = instruction.metadata_path();
+        let metadata_temp_path = instruction.metadata_temp_path();
 
-        // recover from metadata write crash
-        if let Ok(_) =
-            read_delimited_message_from_path::<DownloadMetadata, PathBuf>(&metadata_temp_path).await
-        {
-            // Move unfinished atomic write (temp metadata) to current metadata if not broken
-            atomic_replace(metadata_temp_path.clone(), metadata_path.clone()).await?;
-        } else {
-            // If temp metadata exists but is unreadable/broken, delete it
-            if tokio::fs::try_exists(&metadata_temp_path)
-                .await
-                .unwrap_or(false)
-            {
-                let _ = tokio::fs::remove_file(&metadata_temp_path).await;
-            }
-        }
+        DownloadManager::recover_metadata(&instruction).await?;
 
         let disk_metadata: Result<DownloadMetadata, std::io::Error> =
             read_delimited_message_from_path::<DownloadMetadata, PathBuf>(&metadata_path).await;

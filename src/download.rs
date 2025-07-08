@@ -73,9 +73,24 @@ pub struct Download {
 
 impl Download {
     // Getters for Download fields
+    const METADATA_FILENAME: &'static str = "metadata.pb";
+    const METADATA_TEMP_FILENAME: &'static str = "metadata.pb.temp";
+    const LOCK_FILENAME: &'static str = "odl.lock";
 
     pub fn download_dir(&self) -> &path::PathBuf {
         &self.download_dir
+    }
+
+    pub fn lockfile_path(&self) -> path::PathBuf {
+        self.download_dir.join(Self::LOCK_FILENAME)
+    }
+
+    pub fn metadata_path(&self) -> path::PathBuf {
+        self.download_dir.join(Self::METADATA_FILENAME)
+    }
+
+    pub fn metadata_temp_path(&self) -> path::PathBuf {
+        self.download_dir.join(Self::METADATA_TEMP_FILENAME)
     }
 
     pub fn url(&self) -> &Url {
