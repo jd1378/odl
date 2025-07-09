@@ -81,6 +81,10 @@ impl Download {
         &self.download_dir
     }
 
+    pub fn part_path(&self, ulid: &str) -> path::PathBuf {
+        self.download_dir.join(format!("{}.part", ulid))
+    }
+
     pub fn set_download_dir(&mut self, path: PathBuf) {
         self.download_dir = path
     }

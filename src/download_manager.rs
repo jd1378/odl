@@ -379,6 +379,41 @@ impl DownloadManager {
         Ok(metadata)
     }
 
+    async fn assemble_final_file(
+        &self,
+        metadata: &DownloadMetadata,
+        instruction: &Download,
+    ) -> Result<PathBuf, OdlError> {
+        let final_path = instruction.save_dir().join(&metadata.filename);
+        let mut final_file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&final_path)
+            .await?;
+        let mut sorted_parts: Vec<&PartDetails> = metadata.parts.values().collect();
+        sorted_parts.sort_by_key(|p| p.offset);
+        for p in sorted_parts.iter() {
+            let part_path = instruction.part_path(&p.ulid);
+            let mut part_file = tokio::fs::File::open(&part_path).await?;
+            tokio::io::copy(&mut part_file, &mut final_file).await?;
+        }
+
+        if metadata.use_server_time {
+            if let Some(last_modified) = metadata.last_modified {
+                if let Err(e) = set_file_mtime_async(&final_path, last_modified).await {
+                    tracing::error!(
+                        "Failed to set file mtime for {}: {}",
+                        final_path.display(),
+                        e
+                    );
+                }
+            }
+        }
+
+        return Ok(final_path);
+    }
+
     async fn process_download<CR>(
         self: &Self,
         instruction: Download,
@@ -413,7 +448,7 @@ impl DownloadManager {
 
             // get file stats in parallel
             let stats_futures = unfinished_ulids.into_iter().map(|ulid: String| {
-                let part_path = instruction.download_dir().join(format!("{}.part", ulid));
+                let part_path = instruction.part_path(&ulid);
                 async move {
                     let file = tokio::fs::OpenOptions::new()
                         .create(true)
@@ -481,7 +516,7 @@ impl DownloadManager {
                     let metadata_mutex = Arc::clone(&metadata_mutex);
                     let url = instruction.url().clone();
                     let ulid = part.ulid.clone();
-                    let part_path = instruction.download_dir().join(format!("{}.part", ulid));
+                    let part_path = instruction.part_path(&ulid);
                     let part_details = part;
                     let client: Arc<ClientWithMiddleware> = Arc::clone(&client);
                     let first_push = first_iter.clone();
@@ -572,35 +607,9 @@ impl DownloadManager {
             }
         }
 
-        let final_path = instruction.save_dir().join(&metadata.filename);
-        // We are finished downloading now, concatenate parts at final path
-        let mut final_file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&final_path)
-            .await?;
-        let mut sorted_parts: Vec<&PartDetails> = metadata.parts.values().collect();
-        sorted_parts.sort_by_key(|p| p.offset);
-        for p in sorted_parts.iter() {
-            let part_path = instruction.download_dir().join(format!("{}.part", p.ulid));
-            let mut part_file = tokio::fs::File::open(&part_path).await?;
-            tokio::io::copy(&mut part_file, &mut final_file).await?;
-        }
+        let final_path =
+            DownloadManager::assemble_final_file(&self, &mut metadata, &instruction).await?;
 
-        if metadata.use_server_time {
-            if let Some(last_modified) = metadata.last_modified {
-                if let Err(e) = set_file_mtime_async(&final_path, last_modified).await {
-                    tracing::error!(
-                        "Failed to set file mtime for {}: {}",
-                        final_path.display(),
-                        e
-                    );
-                }
-            }
-        }
-
-        // Remove all part files
         Self::remove_all_parts(&instruction.download_dir()).await;
 
         Ok(final_path)
