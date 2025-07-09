@@ -43,10 +43,12 @@ pub struct DownloadManager {
     /// Number of maximum connections.
     #[builder(default = 6)]
     max_connections: u64,
-    /// Number of maximum retries after which a download is considered failed.
+    /// Number of maximum retries after which a download is considered failed. After third retry it increases exponentially.
+    /// For example the time for max_retries=6 and wait_between_retries=500ms will be:
+    /// 500ms, 500ms, 500ms, 1000ms, 2000ms, 4000ms
     #[builder(default = 3)]
     max_retries: u32,
-    /// Amount of time to wait between retries.
+    /// Amount of time to wait between retries. After third retry it increases exponentially.
     #[builder(default = Duration::from_millis(500))]
     wait_between_retries: Duration,
     /// Custom HTTP headers.
