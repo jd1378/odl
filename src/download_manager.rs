@@ -100,6 +100,86 @@ impl DownloadManager {
         self.use_server_time = value
     }
 
+    pub async fn evaluate<CR>(
+        self: &Self,
+        url: Url,
+        credentials: Option<Credentials>,
+        conflict_resolver: &CR,
+    ) -> Result<Download, OdlError>
+    where
+        CR: SaveConflictResolver,
+    {
+        let client = self.get_client(None)?;
+
+        let mut req = client
+            .head(url)
+            // we request hash just in case server implements and responds
+            // we will use this later for checking the final file against
+            .header(
+                "Want-Repr-Digest",
+                "sha-512=9, sha-384=8, sha-256=7, sha-1=1, md5=1",
+            )
+            .header(
+                "Want-Content-Digest",
+                "sha-512=9, sha-384=8, sha-256=7, sha-1=1, md5=1",
+            );
+        if let Some(creds) = &credentials {
+            req = req.basic_auth(creds.username(), creds.password());
+        }
+
+        let resp = req.send().await?;
+        let info = ResponseInfo::from(resp);
+        // TODO: fix save_dir based on detected file type category
+        let instruction = Download::from_response_info(
+            &self.download_dir,
+            Path::new("./").to_path_buf(),
+            info,
+            self.max_connections,
+            self.use_server_time,
+            credentials,
+            self.proxy.clone(),
+        );
+
+        let instruction =
+            DownloadManager::resolve_save_conflicts(instruction, conflict_resolver).await?;
+
+        return Ok(instruction);
+    }
+
+    pub async fn download<CR>(
+        self: &Self,
+        instruction: Download,
+        conflict_resolver: &CR,
+    ) -> Result<PathBuf, OdlError>
+    where
+        CR: ServerConflictResolver,
+    {
+        // we want to know issues about directory creation very early.
+        tokio::fs::create_dir_all(instruction.download_dir()).await?;
+
+        match tokio::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(instruction.lockfile_path())
+            .await
+        {
+            Ok(f) => {
+                let f = f.into_std().await;
+                if let Err(_) = f.try_lock_exclusive() {
+                    return Err(OdlError::LockfileInUse);
+                }
+
+                let result = self.process_download(instruction, conflict_resolver).await;
+                let _ = FileExt::unlock(&f);
+                result
+            }
+            Err(e) => {
+                return Err(OdlError::StdIoError { e });
+            }
+        }
+    }
+
     fn get_client(
         self: &Self,
         instructions: Option<&Download>,
@@ -193,86 +273,6 @@ impl DownloadManager {
         }
 
         Ok(instruction)
-    }
-
-    pub async fn evaluate<CR>(
-        self: &Self,
-        url: Url,
-        credentials: Option<Credentials>,
-        conflict_resolver: &CR,
-    ) -> Result<Download, OdlError>
-    where
-        CR: SaveConflictResolver,
-    {
-        let client = self.get_client(None)?;
-
-        let mut req = client
-            .head(url)
-            // we request hash just in case server implements and responds
-            // we will use this later for checking the final file against
-            .header(
-                "Want-Repr-Digest",
-                "sha-512=9, sha-384=8, sha-256=7, sha-1=1, md5=1",
-            )
-            .header(
-                "Want-Content-Digest",
-                "sha-512=9, sha-384=8, sha-256=7, sha-1=1, md5=1",
-            );
-        if let Some(creds) = &credentials {
-            req = req.basic_auth(creds.username(), creds.password());
-        }
-
-        let resp = req.send().await?;
-        let info = ResponseInfo::from(resp);
-        // TODO: fix save_dir based on detected file type category
-        let instruction = Download::from_response_info(
-            &self.download_dir,
-            Path::new("./").to_path_buf(),
-            info,
-            self.max_connections,
-            self.use_server_time,
-            credentials,
-            self.proxy.clone(),
-        );
-
-        let instruction =
-            DownloadManager::resolve_save_conflicts(instruction, conflict_resolver).await?;
-
-        return Ok(instruction);
-    }
-
-    pub async fn download<CR>(
-        self: &Self,
-        instruction: Download,
-        conflict_resolver: &CR,
-    ) -> Result<PathBuf, OdlError>
-    where
-        CR: ServerConflictResolver,
-    {
-        // we want to know issues about directory creation very early.
-        tokio::fs::create_dir_all(instruction.download_dir()).await?;
-
-        match tokio::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(instruction.lockfile_path())
-            .await
-        {
-            Ok(f) => {
-                let f = f.into_std().await;
-                if let Err(_) = f.try_lock_exclusive() {
-                    return Err(OdlError::LockfileInUse);
-                }
-
-                let result = self.process_download(instruction, conflict_resolver).await;
-                let _ = FileExt::unlock(&f);
-                result
-            }
-            Err(e) => {
-                return Err(OdlError::StdIoError { e });
-            }
-        }
     }
 
     /// Attempt to recover from an interrupted metadata write.
