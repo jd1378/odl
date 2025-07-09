@@ -387,16 +387,15 @@ impl DownloadManager {
     where
         CR: ServerConflictResolver,
     {
-        // early directory creation check
+        // early directory creation check to fail fast
         tokio::fs::create_dir_all(instruction.save_dir()).await?;
 
-        // step 1
         DownloadManager::recover_metadata(&instruction).await?;
 
-        // step 2
         let mut metadata =
             DownloadManager::resolve_server_conflicts(&instruction, conflict_resolver).await?;
 
+        // we skip over download parts if we already finished downloading
         if !metadata.finished {
             let mut to_download = Vec::new();
 
