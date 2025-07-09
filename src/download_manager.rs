@@ -425,7 +425,7 @@ impl DownloadManager {
                     })?;
                 let file = tokio::fs::File::open(&final_path).await?;
                 let reader = BufReader::new(file);
-                let actual = HashDigest::from_async_reader(reader, &expected)
+                let actual = HashDigest::from_reader(reader, &expected)
                     .await
                     .map_err(|e| OdlError::StdIoError { e })?;
 
