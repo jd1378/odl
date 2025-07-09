@@ -441,6 +441,8 @@ impl DownloadManager {
         let stats_futures = unfinished_ulids.into_iter().map(|ulid: String| {
             let part_path = instruction.part_path(&ulid);
             async move {
+                // we eagerly create part files if they don't exist
+                // otherwise it does nothing and just gets the size
                 let file = tokio::fs::OpenOptions::new()
                     .create(true)
                     .write(true)
