@@ -230,7 +230,9 @@ impl DownloadManager {
         }
 
         if let Some(conflict) = conflict {
-            let resolution = conflict_resolver.resolve_save_conflict(conflict.clone());
+            let resolution = conflict_resolver
+                .resolve_save_conflict(conflict.clone())
+                .await;
             match resolution {
                 SaveConflictResolution::Abort => {
                     return Err(OdlError::DownloadSaveAbortedDuetoConflict { conflict });
@@ -357,7 +359,9 @@ impl DownloadManager {
             }
 
             if let Some(conflict) = conflict {
-                let resolution = conflict_resolver.resolve_server_conflict(conflict.clone());
+                let resolution = conflict_resolver
+                    .resolve_server_conflict(conflict.clone())
+                    .await;
                 if resolution == ServerConflictResolution::Abort {
                     return Err(OdlError::DownloadAbortedDuetoConflict { conflict });
                 } else if resolution == ServerConflictResolution::Restart {
@@ -766,20 +770,25 @@ mod tests {
     use super::*;
     use crate::download::DownloadBuilder;
     use crate::download_metadata::PartDetails;
+    use async_trait::async_trait;
     use mockito::Matcher;
     use mockito::Server;
     use std::collections::HashMap;
     use tokio::fs;
 
     struct AlwaysAbortResolver;
+
+    #[async_trait]
     impl ServerConflictResolver for AlwaysAbortResolver {
-        fn resolve_server_conflict(&self, _: ServerConflict) -> ServerConflictResolution {
+        async fn resolve_server_conflict(&self, _: ServerConflict) -> ServerConflictResolution {
             ServerConflictResolution::Abort
         }
     }
     struct AlwaysReplaceResolver;
+
+    #[async_trait]
     impl SaveConflictResolver for AlwaysReplaceResolver {
-        fn resolve_save_conflict(&self, _: SaveConflict) -> SaveConflictResolution {
+        async fn resolve_save_conflict(&self, _: SaveConflict) -> SaveConflictResolution {
             SaveConflictResolution::ReplaceAndContinue
         }
     }
@@ -1061,8 +1070,9 @@ mod tests {
             .unwrap();
 
         struct AssertTestResolver;
+        #[async_trait]
         impl ServerConflictResolver for AssertTestResolver {
-            fn resolve_server_conflict(
+            async fn resolve_server_conflict(
                 &self,
                 conflict: ServerConflict,
             ) -> ServerConflictResolution {
@@ -1175,8 +1185,9 @@ mod tests {
             .unwrap();
 
         struct AssertTestResolver;
+        #[async_trait]
         impl ServerConflictResolver for AssertTestResolver {
-            fn resolve_server_conflict(
+            async fn resolve_server_conflict(
                 &self,
                 conflict: ServerConflict,
             ) -> ServerConflictResolution {

@@ -38,6 +38,7 @@ md-5 = "0.10.6"
 base64 = "0.22.1"
 rand = "0.9.1"
 tracing = "0.1.41"
+async-trait = "0.1.88"
 
 [dev-dependencies]
 reqwest = { version = "0.12.19", default-features = false, features = ["http2", "gzip", "brotli", "native-tls", "socks", "stream", "blocking"] }

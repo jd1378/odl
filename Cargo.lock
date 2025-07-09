@@ -1413,6 +1413,7 @@ version = "0.1.0"
 dependencies = [
  "any_ascii",
  "async-channel",
+ "async-trait",
  "atomicwrites",
  "base64",
  "chrono",

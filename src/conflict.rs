@@ -1,3 +1,5 @@
+use async_trait::async_trait;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerConflict {
     /// File changed on server. Either of "size", "etag", "last-modified" headers have been changed
@@ -38,10 +40,12 @@ pub enum SaveConflictResolution {
     AddNumberToNameAndContinue,
 }
 
+#[async_trait]
 pub trait ServerConflictResolver: Send + Sync {
-    fn resolve_server_conflict(&self, conflict: ServerConflict) -> ServerConflictResolution;
+    async fn resolve_server_conflict(&self, conflict: ServerConflict) -> ServerConflictResolution;
 }
 
+#[async_trait]
 pub trait SaveConflictResolver: Send + Sync {
-    fn resolve_save_conflict(&self, conflict: SaveConflict) -> SaveConflictResolution;
+    async fn resolve_save_conflict(&self, conflict: SaveConflict) -> SaveConflictResolution;
 }
