@@ -44,6 +44,8 @@ pub enum OdlError {
     DownloadAbortedDuetoConflict { conflict: ServerConflict },
     #[error("Download save aborted due to conflict: {conflict:?}")]
     DownloadSaveAbortedDuetoConflict { conflict: SaveConflict },
+    #[error("Checksum mismatch: expected `{expected}`, got `{actual}`")]
+    ChecksumMismatch { expected: String, actual: String },
     #[error("Other error: {message:?}")]
     Other {
         message: String,

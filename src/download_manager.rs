@@ -9,14 +9,14 @@ use reqwest::{
 };
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use reqwest_retry::RetryTransientMiddleware;
-use std::path::Path;
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{path::Path, path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
-use tokio::{io::AsyncWriteExt, sync::Mutex};
+use tokio::{io::AsyncWriteExt, io::BufReader, sync::Mutex};
 
 use crate::conflict::{SaveConflictResolver, ServerConflictResolver};
 use crate::credentials::Credentials;
 use crate::fs_utils::{atomic_replace, set_file_mtime_async};
+use crate::hash::HashDigest;
 use crate::response_info::ResponseInfo;
 use crate::{
     conflict::{SaveConflict, SaveConflictResolution, ServerConflict, ServerConflictResolution},
@@ -411,6 +411,29 @@ impl DownloadManager {
                         final_path.display(),
                         e
                     );
+                }
+            }
+        }
+
+        if !metadata.checksums.is_empty() {
+            // Drop the mutable reference to final_file so we can re-open it for reading
+            drop(final_file);
+            for checksum in &metadata.checksums {
+                let expected =
+                    HashDigest::try_from(checksum).map_err(|e| OdlError::MetadataError {
+                        message: format!("Invalid checksum in metadata: {}", e),
+                    })?;
+                let file = tokio::fs::File::open(&final_path).await?;
+                let reader = BufReader::new(file);
+                let actual = HashDigest::from_async_reader(reader, &expected)
+                    .await
+                    .map_err(|e| OdlError::StdIoError { e })?;
+
+                if actual != expected {
+                    return Err(OdlError::ChecksumMismatch {
+                        expected: format!("{:?}", expected),
+                        actual: format!("{:?}", actual),
+                    });
                 }
             }
         }
