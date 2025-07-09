@@ -224,8 +224,10 @@ impl DownloadManager {
         }
 
         let final_path = instruction.save_dir().join(instruction.filename());
-        if tokio::fs::try_exists(&final_path).await.unwrap_or(false) {
-            conflict = Some(SaveConflict::FinalFileExists);
+        if conflict.is_none() {
+            if tokio::fs::try_exists(&final_path).await.unwrap_or(false) {
+                conflict = Some(SaveConflict::FinalFileExists);
+            }
         }
 
         if let Some(conflict) = conflict {
@@ -259,14 +261,17 @@ impl DownloadManager {
                     }
                 }
                 SaveConflictResolution::AddNumberToNameAndContinue => {
-                    // Change the final path
-                    match is_filename_unique(&final_path).await? {
-                        IsUnique::SuggestedAlternative(filename) => {
-                            instruction.set_filename(filename);
+                    // in either of cases we need to change the filename
+                    // we just need to know which path to use to determine the new file name
+                    let result = match conflict {
+                        SaveConflict::SameDownloadExists => {
+                            is_filename_unique(&instruction.download_dir()).await?
                         }
-                        IsUnique::Yes => {
-                            // do nothing
-                        }
+                        SaveConflict::FinalFileExists => is_filename_unique(&final_path).await?,
+                    };
+
+                    if let IsUnique::SuggestedAlternative(filename) = result {
+                        instruction.set_filename(filename);
                     }
                 }
             }
