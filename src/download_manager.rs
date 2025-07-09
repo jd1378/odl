@@ -330,6 +330,7 @@ impl DownloadManager {
                 disk_metadata.requires_auth = instruction.requires_auth();
                 disk_metadata.requires_basic_auth = instruction.requires_basic_auth();
                 disk_metadata.use_server_time = instruction.use_server_time();
+                disk_metadata.save_dir = instruction.save_dir().to_string_lossy().into_owned();
                 disk_metadata
             }
             Err(e) => {
