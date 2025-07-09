@@ -76,13 +76,15 @@ impl Download {
     const METADATA_FILENAME: &'static str = "metadata.pb";
     const METADATA_TEMP_FILENAME: &'static str = "metadata.pb.temp";
     const LOCK_FILENAME: &'static str = "odl.lock";
+    pub const PART_EXTENSION: &'static str = "part";
 
     pub fn download_dir(&self) -> &path::PathBuf {
         &self.download_dir
     }
 
     pub fn part_path(&self, ulid: &str) -> path::PathBuf {
-        self.download_dir.join(format!("{}.part", ulid))
+        self.download_dir
+            .join(format!("{}.{}", ulid, Self::PART_EXTENSION))
     }
 
     pub fn set_download_dir(&mut self, path: PathBuf) {

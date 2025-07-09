@@ -140,8 +140,7 @@ impl DownloadManager {
             self.proxy.clone(),
         );
 
-        let instruction =
-            DownloadManager::resolve_save_conflicts(instruction, conflict_resolver).await?;
+        let instruction = Self::resolve_save_conflicts(instruction, conflict_resolver).await?;
 
         return Ok(instruction);
     }
@@ -365,7 +364,7 @@ impl DownloadManager {
                     metadata.last_etag = instruction.etag().clone();
                     metadata.last_modified = instruction.last_modified();
                     metadata.size = instruction.size();
-                    DownloadManager::remove_all_parts(instruction.download_dir()).await;
+                    Self::remove_all_parts(instruction.download_dir()).await;
                     metadata.parts =
                         Download::determine_parts(metadata.size, metadata.max_connections);
                     metadata.checksums = new_checksums;
@@ -386,7 +385,6 @@ impl DownloadManager {
     }
 
     async fn assemble_final_file(
-        &self,
         metadata: &DownloadMetadata,
         instruction: &Download,
     ) -> Result<PathBuf, OdlError> {
@@ -492,6 +490,99 @@ impl DownloadManager {
         Ok(to_download)
     }
 
+    /// Attempts to download a list of parts
+    async fn download_parts(
+        &self,
+        parts: Vec<PartDetails>,
+        instruction: &Download,
+        metadata: &Arc<Mutex<DownloadMetadata>>,
+    ) -> Result<(), OdlError> {
+        // reqwest is thread-safe, no need for mutex
+        let client = Arc::new(self.get_client(Some(&instruction))?);
+        // we will add permits once we confirm everything is okay on first download
+        let semaphore = Arc::new(Semaphore::new(1));
+        let mut first_iter = true;
+        let first_permit = semaphore.acquire().await?;
+
+        let mut futures = FuturesOrdered::new();
+
+        for part in parts.into_iter() {
+            let semaphore = semaphore.clone();
+            let metadata = Arc::clone(&metadata);
+            let url = instruction.url().clone();
+            let ulid = part.ulid.clone();
+            let part_path = instruction.part_path(&ulid);
+            let part_details = part;
+            let client: Arc<ClientWithMiddleware> = Arc::clone(&client);
+            let first_push = first_iter.clone();
+            first_iter = false;
+
+            futures.push_back(tokio::spawn(async move {
+                let _permit = if !first_push {
+                    Some(semaphore.acquire().await?)
+                } else {
+                    None
+                };
+                // Dummy progress callback, replace as needed
+                let progress_callback = |_downloaded: u64| {};
+                let started_callback = || {
+                    if first_push {
+                        let metadata = Arc::clone(&metadata);
+                        let semaphore: Arc<Semaphore> = Arc::clone(&semaphore);
+                        tokio::spawn(async move {
+                            let mdata = metadata.lock().await;
+                            if mdata.max_connections - 1 > 0 {
+                                semaphore
+                                    .add_permits(mdata.max_connections.try_into().unwrap_or(1));
+                            }
+                        });
+                    }
+                };
+                let res = Self::download_part(
+                    &client,
+                    &url,
+                    Some(&part_details),
+                    &part_path,
+                    started_callback,
+                    progress_callback,
+                )
+                .await;
+
+                // Mark part as finished and update metadata safely, but as soon as possible
+                if res.is_ok() {
+                    let mut mdata = metadata.lock().await;
+                    if let Some(part) = mdata.parts.get_mut(&ulid) {
+                        part.finished = true;
+                    } else {
+                        return Err(OdlError::MetadataError {
+                            message: format!("Part with ulid {} not found in metadata", ulid),
+                        });
+                    }
+                }
+                drop(_permit);
+                res
+            }));
+        }
+
+        // Wait for first future that finishes
+        // If it was not successful, close the semaphore and return the error
+        if let Some(res) = futures.next().await {
+            if let Err(e) = res? {
+                // If the first download fails, prevent further downloads and return the error
+                semaphore.close();
+                return Err(e);
+            }
+        }
+        drop(first_permit);
+
+        // Wait for all downloads to finish
+        while let Some(result) = futures.next().await {
+            result??;
+        }
+
+        Ok(())
+    }
+
     async fn process_download<CR>(
         self: &Self,
         instruction: Download,
@@ -503,18 +594,14 @@ impl DownloadManager {
         // early directory creation check to fail fast
         tokio::fs::create_dir_all(instruction.save_dir()).await?;
 
-        DownloadManager::recover_metadata(&instruction).await?;
+        Self::recover_metadata(&instruction).await?;
 
-        let mut metadata =
-            DownloadManager::resolve_server_conflicts(&instruction, conflict_resolver).await?;
+        let mut metadata = Self::resolve_server_conflicts(&instruction, conflict_resolver).await?;
 
         // we skip over download parts if we already finished downloading
         if !metadata.finished {
-            let to_download = DownloadManager::get_unfinished_parts_and_update_status(
-                &mut metadata,
-                &instruction,
-            )
-            .await?;
+            let to_download =
+                Self::get_unfinished_parts_and_update_status(&mut metadata, &instruction).await?;
 
             // Download all parts: first part serial, rest in parallel if first succeeds
             // Downloads count should be according to max_connections of metadata
@@ -522,95 +609,10 @@ impl DownloadManager {
                 // Mutex for safe access across threads
                 // We need this because downloads can happen in parallel and may finish at any point in time
                 // we want to safely write the metadata in case any of them finish at the same time
-                let metadata_mutex = Arc::new(Mutex::new(metadata));
+                let metadata_mutex = Arc::new(Mutex::new(metadata)); // metadata is moved here until we put it back
 
-                // reqwest is thread-safe
-                let client = Arc::new(self.get_client(Some(&instruction))?);
-
-                // we will add permits once we confirm everything is okay on first download
-                let semaphore = Arc::new(Semaphore::new(1));
-                let mut first_iter = true;
-                let first_permit = semaphore.acquire().await?;
-
-                let mut futures = FuturesOrdered::new();
-
-                for part in to_download.into_iter() {
-                    let semaphore = semaphore.clone();
-                    let metadata_mutex = Arc::clone(&metadata_mutex);
-                    let url = instruction.url().clone();
-                    let ulid = part.ulid.clone();
-                    let part_path = instruction.part_path(&ulid);
-                    let part_details = part;
-                    let client: Arc<ClientWithMiddleware> = Arc::clone(&client);
-                    let first_push = first_iter.clone();
-                    first_iter = false;
-
-                    futures.push_back(tokio::spawn(async move {
-                        let _permit = if !first_push {
-                            Some(semaphore.acquire().await?)
-                        } else {
-                            None
-                        };
-                        // Dummy progress callback, replace as needed
-                        let progress_callback = |_downloaded: u64| {};
-                        let started_callback = || {
-                            if first_push {
-                                let metadata = Arc::clone(&metadata_mutex);
-                                let semaphore: Arc<Semaphore> = Arc::clone(&semaphore);
-                                tokio::spawn(async move {
-                                    let mdata = metadata.lock().await;
-                                    if mdata.max_connections - 1 > 0 {
-                                        semaphore.add_permits(
-                                            mdata.max_connections.try_into().unwrap_or(1),
-                                        );
-                                    }
-                                });
-                            }
-                        };
-                        let res = DownloadManager::download_part(
-                            &client,
-                            &url,
-                            Some(&part_details),
-                            &part_path,
-                            started_callback,
-                            progress_callback,
-                        )
-                        .await;
-
-                        // Mark part as finished and update metadata safely, but as soon as possible
-                        if res.is_ok() {
-                            let mut mdata = metadata_mutex.lock().await;
-                            if let Some(part) = mdata.parts.get_mut(&ulid) {
-                                part.finished = true;
-                            } else {
-                                return Err(OdlError::MetadataError {
-                                    message: format!(
-                                        "Part with ulid {} not found in metadata",
-                                        ulid
-                                    ),
-                                });
-                            }
-                        }
-                        drop(_permit);
-                        res
-                    }));
-                }
-
-                // Wait for first future that finishes
-                // If it was not successful, close the semaphore and return the error
-                if let Some(res) = futures.next().await {
-                    if let Err(e) = res? {
-                        // If the first download fails, prevent further downloads and return the error
-                        semaphore.close();
-                        return Err(e);
-                    }
-                }
-                drop(first_permit);
-
-                // Wait for all downloads to finish
-                while let Some(result) = futures.next().await {
-                    result??;
-                }
+                self.download_parts(to_download, &instruction, &metadata_mutex)
+                    .await?;
 
                 // Move metadata back from mutex to metadata variable
                 let mut mdata = Arc::try_unwrap(metadata_mutex)
@@ -618,6 +620,7 @@ impl DownloadManager {
                         message: "Failed to unwrap Arc for metadata".to_string(),
                     })?
                     .into_inner();
+
                 mdata.finished = true;
                 let encoded = mdata.encode_length_delimited_to_vec();
                 atomic_write(
@@ -630,14 +633,14 @@ impl DownloadManager {
             }
         }
 
-        let final_path =
-            DownloadManager::assemble_final_file(&self, &mut metadata, &instruction).await?;
+        let final_path = Self::assemble_final_file(&mut metadata, &instruction).await?;
 
         Self::remove_all_parts(&instruction.download_dir()).await;
 
         Ok(final_path)
     }
 
+    /// Attempts to download a single part
     async fn download_part<S, F>(
         client: &ClientWithMiddleware,
         url: &Url,
@@ -698,6 +701,7 @@ impl DownloadManager {
         Ok(())
     }
 
+    /// removes all .part files on disk
     async fn remove_all_parts(download_dir: &PathBuf) {
         // Remove all .part files in the download directory
         // Effectively resetting the download progress
@@ -705,7 +709,7 @@ impl DownloadManager {
             while let Ok(Some(entry)) = entries.next_entry().await {
                 let path = entry.path();
                 if let Some(ext) = path.extension() {
-                    if ext == "part" {
+                    if ext == Download::PART_EXTENSION {
                         let _ = tokio::fs::remove_file(&path).await;
                     }
                 }
