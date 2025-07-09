@@ -81,6 +81,10 @@ impl Download {
         &self.download_dir
     }
 
+    pub fn set_download_dir(&mut self, path: PathBuf) {
+        self.download_dir = path
+    }
+
     pub fn lockfile_path(&self) -> path::PathBuf {
         self.download_dir.join(Self::LOCK_FILENAME)
     }
@@ -101,8 +105,16 @@ impl Download {
         self.is_resumable
     }
 
+    pub fn use_server_time(&self) -> bool {
+        self.use_server_time
+    }
+
     pub fn filename(&self) -> &str {
         &self.filename
+    }
+
+    pub fn set_filename(&mut self, filename: String) {
+        self.filename = filename;
     }
 
     pub fn save_dir(&self) -> &path::PathBuf {

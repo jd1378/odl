@@ -14,7 +14,7 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
 use tokio::{io::AsyncWriteExt, sync::Mutex};
 
-use crate::conflict::ConflictResolver;
+use crate::conflict::{SaveConflictResolver, ServerConflictResolver};
 use crate::credentials::Credentials;
 use crate::fs_utils::{atomic_replace, set_file_mtime_async};
 use crate::response_info::ResponseInfo;
@@ -127,11 +127,83 @@ impl DownloadManager {
             .build())
     }
 
-    pub async fn evaluate(
+    /// Checks for common storage conflicts before the download begins
+    async fn resolve_save_conflicts<CR>(
+        mut instruction: Download,
+        conflict_resolver: &CR,
+    ) -> Result<Download, OdlError>
+    where
+        CR: SaveConflictResolver,
+    {
+        let mut conflict: Option<SaveConflict> = None;
+        if tokio::fs::try_exists(instruction.download_dir())
+            .await
+            .unwrap_or(false)
+        {
+            conflict = Some(SaveConflict::SameDownloadExists);
+        }
+
+        let final_path = instruction.save_dir().join(instruction.filename());
+        if tokio::fs::try_exists(&final_path).await.unwrap_or(false) {
+            conflict = Some(SaveConflict::FinalFileExists);
+        }
+
+        if let Some(conflict) = conflict {
+            let resolution = conflict_resolver.resolve_save_conflict(conflict.clone());
+            match resolution {
+                SaveConflictResolution::Abort => {
+                    return Err(OdlError::DownloadSaveAbortedDuetoConflict { conflict });
+                }
+                SaveConflictResolution::ReplaceAndContinue => {
+                    match conflict {
+                        SaveConflict::SameDownloadExists => {
+                            if let Some(download_dir) = instruction.download_dir().to_str() {
+                                if download_dir == "/" {
+                                    return Err(OdlError::Other {
+                                        message:
+                                            "Refusing to remove root directory as download_dir"
+                                                .to_string(),
+                                        origin: Box::new(std::io::Error::new(
+                                            std::io::ErrorKind::Other,
+                                            "download_dir is root",
+                                        )),
+                                    });
+                                }
+                            }
+                            // remove the metadata and parts, effectively replacing it
+                            tokio::fs::remove_dir_all(instruction.download_dir()).await?;
+                        }
+                        SaveConflict::FinalFileExists => {
+                            // Do nothing here, it will be truncated and written into at the end of download if we do nothing
+                        }
+                    }
+                }
+                SaveConflictResolution::AddNumberToNameAndContinue => {
+                    // Change the final path
+                    match is_filename_unique(&final_path).await? {
+                        IsUnique::SuggestedAlternative(filename) => {
+                            instruction.set_filename(filename);
+                        }
+                        IsUnique::Yes => {
+                            // do nothing
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(instruction)
+    }
+
+    pub async fn evaluate<CR>(
         self: &Self,
         url: Url,
         credentials: Option<Credentials>,
-    ) -> Result<Download, OdlError> {
+        conflict_resolver: &CR,
+    ) -> Result<Download, OdlError>
+    where
+        CR: SaveConflictResolver,
+    {
         let client = self.get_client(None)?;
 
         let mut req = client
@@ -163,6 +235,9 @@ impl DownloadManager {
             self.proxy.clone(),
         );
 
+        let instruction =
+            DownloadManager::resolve_save_conflicts(instruction, conflict_resolver).await?;
+
         return Ok(instruction);
     }
 
@@ -172,9 +247,11 @@ impl DownloadManager {
         conflict_resolver: &CR,
     ) -> Result<PathBuf, OdlError>
     where
-        CR: ConflictResolver,
+        CR: ServerConflictResolver,
     {
+        // we want to know issues about directory creation very early.
         tokio::fs::create_dir_all(instruction.download_dir()).await?;
+
         match tokio::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -198,10 +275,10 @@ impl DownloadManager {
         }
     }
 
+    /// Attempt to recover from an interrupted metadata write.
     async fn recover_metadata(instruction: &Download) -> Result<(), OdlError> {
         let metadata_temp_path = instruction.metadata_temp_path();
 
-        // Attempt to recover from an interrupted metadata write
         match read_delimited_message_from_path::<DownloadMetadata, PathBuf>(&metadata_temp_path)
             .await
         {
@@ -224,18 +301,16 @@ impl DownloadManager {
         Ok(())
     }
 
-    async fn process_download<CR>(
-        self: &Self,
-        instruction: Download,
+    /// Checks for common conflicts between new instruction and metadata on disk
+    /// and attemps to resolve them before the download starts.
+    /// writes the updated metadata to disk and returns it
+    async fn resolve_server_conflicts<CR>(
+        instruction: &Download,
         conflict_resolver: &CR,
-    ) -> Result<PathBuf, OdlError>
+    ) -> Result<DownloadMetadata, OdlError>
     where
-        CR: ConflictResolver,
+        CR: ServerConflictResolver,
     {
-        tokio::fs::create_dir_all(instruction.download_dir()).await?;
-
-        DownloadManager::recover_metadata(&instruction).await?;
-
         let mut metadata: DownloadMetadata = match read_delimited_message_from_path::<
             DownloadMetadata,
             PathBuf,
@@ -243,7 +318,13 @@ impl DownloadManager {
         .await
         {
             Ok(mut disk_metadata) => {
-                disk_metadata.is_resumable = instruction.is_resumable(); // always update resumability
+                // update disk_metadata from instruction
+                disk_metadata.is_resumable = instruction.is_resumable();
+                disk_metadata.filename = instruction.filename().to_string();
+                disk_metadata.max_connections = instruction.max_connections();
+                disk_metadata.requires_auth = instruction.requires_auth();
+                disk_metadata.requires_basic_auth = instruction.requires_basic_auth();
+                disk_metadata.use_server_time = instruction.use_server_time();
                 disk_metadata
             }
             Err(e) => {
@@ -256,40 +337,24 @@ impl DownloadManager {
 
         if !metadata.finished {
             // Do possible corruption checks between new download instructions and the metadata on disk
-            let mut is_server_file_changed = false;
-            if metadata.last_etag != *instruction.etag() {
-                is_server_file_changed = true;
-            }
-            if metadata.last_modified != instruction.last_modified() {
-                is_server_file_changed = true;
-            }
-            if metadata.size != instruction.size() {
-                is_server_file_changed = true;
-            }
+            let new_checksums = instruction.as_metadata().checksums;
+            let mut conflict: Option<ServerConflict> = None;
 
-            if is_server_file_changed {
-                let resolution =
-                    conflict_resolver.resolve_server_conflict(ServerConflict::FileChanged);
-                if resolution == ServerConflictResolution::Abort {
-                    return Err(OdlError::DownloadAbortedDuetoConflict {
-                        conflict: ServerConflict::FileChanged,
-                    });
-                } else if resolution == ServerConflictResolution::Restart {
-                    metadata.last_etag = instruction.etag().clone();
-                    metadata.last_modified = instruction.last_modified();
-                    metadata.size = instruction.size();
-                    DownloadManager::remove_all_parts(instruction.download_dir()).await;
-                    metadata.parts =
-                        Download::determine_parts(metadata.size, metadata.max_connections);
-                }
-            }
+            // Since resolution of either of issues is restarting the download, we just need to check one.
             if !metadata.is_resumable {
-                let resolution =
-                    conflict_resolver.resolve_server_conflict(ServerConflict::NotResumable);
+                conflict = Some(ServerConflict::NotResumable)
+            } else if metadata.last_etag != *instruction.etag()
+                || metadata.last_modified != instruction.last_modified()
+                || metadata.size != instruction.size()
+                || metadata.checksums != new_checksums
+            {
+                conflict = Some(ServerConflict::FileChanged);
+            }
+
+            if let Some(conflict) = conflict {
+                let resolution = conflict_resolver.resolve_server_conflict(conflict.clone());
                 if resolution == ServerConflictResolution::Abort {
-                    return Err(OdlError::DownloadAbortedDuetoConflict {
-                        conflict: ServerConflict::NotResumable,
-                    });
+                    return Err(OdlError::DownloadAbortedDuetoConflict { conflict });
                 } else if resolution == ServerConflictResolution::Restart {
                     metadata.last_etag = instruction.etag().clone();
                     metadata.last_modified = instruction.last_modified();
@@ -297,18 +362,42 @@ impl DownloadManager {
                     DownloadManager::remove_all_parts(instruction.download_dir()).await;
                     metadata.parts =
                         Download::determine_parts(metadata.size, metadata.max_connections);
+                    metadata.checksums = new_checksums;
                 }
             }
+        }
 
-            // write metadata changes, if any back to disk
-            let encoded = metadata.encode_length_delimited_to_vec();
-            atomic_write(
-                instruction.metadata_path(),
-                instruction.metadata_temp_path(),
-                &encoded,
-            )
-            .await?;
+        // write metadata changes back to disk, if any
+        let encoded = metadata.encode_length_delimited_to_vec();
+        atomic_write(
+            instruction.metadata_path(),
+            instruction.metadata_temp_path(),
+            &encoded,
+        )
+        .await?;
 
+        Ok(metadata)
+    }
+
+    async fn process_download<CR>(
+        self: &Self,
+        instruction: Download,
+        conflict_resolver: &CR,
+    ) -> Result<PathBuf, OdlError>
+    where
+        CR: ServerConflictResolver,
+    {
+        // early directory creation check
+        tokio::fs::create_dir_all(instruction.save_dir()).await?;
+
+        // step 1
+        DownloadManager::recover_metadata(&instruction).await?;
+
+        // step 2
+        let mut metadata =
+            DownloadManager::resolve_server_conflicts(&instruction, conflict_resolver).await?;
+
+        if !metadata.finished {
             let mut to_download = Vec::new();
 
             // Collect all unfinished part ulids
@@ -484,45 +573,8 @@ impl DownloadManager {
             }
         }
 
-        // We are finished downloading now, concatenate parts
-        tokio::fs::create_dir_all(instruction.save_dir()).await?;
-        let mut final_path = instruction.save_dir().join(&metadata.filename);
-        if tokio::fs::try_exists(&final_path).await.unwrap_or(false) {
-            let resolution = conflict_resolver.resolve_save_conflict(SaveConflict::FinalFileExists);
-            match resolution {
-                SaveConflictResolution::ReplaceAndContinue => {
-                    // Remove the existing file before proceeding
-                    tokio::fs::remove_file(&final_path).await?;
-                }
-                SaveConflictResolution::AddNumberToNameAndContinue => {
-                    // Change the final path and write metadata to disk
-                    let new_final_path = is_filename_unique(&final_path).await?;
-                    match new_final_path {
-                        IsUnique::SuggestedAlternative(filename) => {
-                            metadata.filename = filename;
-                            let encoded = metadata.encode_length_delimited_to_vec();
-                            atomic_write(
-                                instruction.metadata_path(),
-                                instruction.metadata_temp_path(),
-                                &encoded,
-                            )
-                            .await?;
-                            final_path = instruction.save_dir().join(&metadata.filename);
-                        }
-                        _ => {
-                            // do nothing
-                        }
-                    }
-                }
-                _ => {
-                    return Err(OdlError::DownloadSaveAbortedDuetoConflict {
-                        conflict: SaveConflict::FinalFileExists,
-                    });
-                }
-            }
-        }
-
-        // Concat parts at final path
+        let final_path = instruction.save_dir().join(&metadata.filename);
+        // We are finished downloading now, concatenate parts at final path
         let mut final_file = tokio::fs::OpenOptions::new()
             .create(true)
             .write(true)
@@ -662,11 +714,13 @@ mod tests {
     use tokio::fs;
 
     struct AlwaysAbortResolver;
-    impl ConflictResolver for AlwaysAbortResolver {
+    impl ServerConflictResolver for AlwaysAbortResolver {
         fn resolve_server_conflict(&self, _: ServerConflict) -> ServerConflictResolution {
             ServerConflictResolution::Abort
         }
-
+    }
+    struct AlwaysReplaceResolver;
+    impl SaveConflictResolver for AlwaysReplaceResolver {
         fn resolve_save_conflict(&self, _: SaveConflict) -> SaveConflictResolution {
             SaveConflictResolution::ReplaceAndContinue
         }
@@ -724,8 +778,13 @@ mod tests {
             .unwrap();
 
         // Evaluate to get Download instruction
+        let save_resolver = AlwaysReplaceResolver {};
         let instruction = dlm
-            .evaluate(Url::parse(&format!("{}/testfile", url)).unwrap(), None)
+            .evaluate(
+                Url::parse(&format!("{}/testfile", url)).unwrap(),
+                None,
+                &save_resolver,
+            )
             .await?;
 
         // Patch the instruction to simulate 2 parts
@@ -822,8 +881,13 @@ mod tests {
             .unwrap();
 
         // Evaluate to get Download instruction
+        let save_resolver = AlwaysReplaceResolver {};
         let instruction = dlm
-            .evaluate(Url::parse(&format!("{}/singlefile", url)).unwrap(), None)
+            .evaluate(
+                Url::parse(&format!("{}/singlefile", url)).unwrap(),
+                None,
+                &save_resolver,
+            )
             .await?;
         // Patch the instruction to simulate 1 part
         let instruction = DownloadBuilder::default()
@@ -895,10 +959,12 @@ mod tests {
             .unwrap();
 
         // Evaluate to get Download instruction
+        let save_resolver = AlwaysReplaceResolver {};
         let instruction = dlm
             .evaluate(
                 Url::parse(&format!("{}/nonresumablefile", url)).unwrap(),
                 None,
+                &save_resolver,
             )
             .await?;
 
@@ -937,17 +1003,13 @@ mod tests {
             .unwrap();
 
         struct AssertTestResolver;
-        impl ConflictResolver for AssertTestResolver {
+        impl ServerConflictResolver for AssertTestResolver {
             fn resolve_server_conflict(
                 &self,
                 conflict: ServerConflict,
             ) -> ServerConflictResolution {
                 assert_eq!(conflict, ServerConflict::NotResumable);
                 ServerConflictResolution::Abort
-            }
-
-            fn resolve_save_conflict(&self, _: SaveConflict) -> SaveConflictResolution {
-                SaveConflictResolution::ReplaceAndContinue
             }
         }
 
@@ -1011,10 +1073,12 @@ mod tests {
             .unwrap();
 
         // Evaluate to get Download instruction
+        let save_resolver = AlwaysReplaceResolver {};
         let instruction = dlm
             .evaluate(
                 Url::parse(&format!("{}/nonresumablefile_restart", url)).unwrap(),
                 None,
+                &save_resolver,
             )
             .await?;
 
@@ -1053,17 +1117,13 @@ mod tests {
             .unwrap();
 
         struct AssertTestResolver;
-        impl ConflictResolver for AssertTestResolver {
+        impl ServerConflictResolver for AssertTestResolver {
             fn resolve_server_conflict(
                 &self,
                 conflict: ServerConflict,
             ) -> ServerConflictResolution {
                 assert_eq!(conflict, ServerConflict::NotResumable);
                 ServerConflictResolution::Restart
-            }
-
-            fn resolve_save_conflict(&self, _: SaveConflict) -> SaveConflictResolution {
-                SaveConflictResolution::ReplaceAndContinue
             }
         }
 
@@ -1114,8 +1174,13 @@ mod tests {
             .unwrap();
 
         // Evaluate to get Download instruction
+        let save_resolver = AlwaysReplaceResolver {};
         let instruction = dlm
-            .evaluate(Url::parse(&format!("{}/zerofile", url)).unwrap(), None)
+            .evaluate(
+                Url::parse(&format!("{}/zerofile", url)).unwrap(),
+                None,
+                &save_resolver,
+            )
             .await?;
 
         // Patch the instruction to simulate 1 part of 0 bytes

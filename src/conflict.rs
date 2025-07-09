@@ -1,7 +1,3 @@
-use reqwest::Url;
-
-use crate::credentials::Credentials;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerConflict {
     /// File changed on server. Either of "size", "etag", "last-modified" headers have been changed
@@ -18,40 +14,34 @@ pub enum ServerConflict {
 pub enum ServerConflictResolution {
     /// Valid for all cases
     Abort,
-    /// Valid for [Conflict::ServerFileChanged], [Conflict::NotResumable]
+    /// Valid for [ServerConflict::FileChanged], [ServerConflict::NotResumable]
     Restart,
-    /// Valid for [Conflict::FileNotFound]
-    RestartWithUrl { url: Url },
-    /// valid for [Conflict::CredentialsInvalid]
-    RetryWithCredentials { credentials: Credentials },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SaveConflict {
     /// Happens when a download is about to begin, but
     /// we find that we already have the same download structure
-    /// already in place in download dir and Unfinished
-    SameDownloadPending,
-    /// Happens when a download is about to begin, but
-    /// we find that we already have the same download structure
-    /// already in place in download dir and It's finished
-    SameDownloadFinished,
+    /// already in place in download dir
+    SameDownloadExists,
     /// Happens when a file already exists at the selected path for final concatenated file
     FinalFileExists,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SaveConflictResolution {
+    /// Valid for all cases
     Abort,
-    /// Valid for: [SaveConflict::SameDownloadPending], [SaveConflict::SameDownloadFinished], [SaveConflict::FinalFileExists]
+    /// Valid for: [SaveConflict::SameDownloadExists], [SaveConflict::FinalFileExists]
     ReplaceAndContinue,
-    /// Valid for: [SaveConflict::SameDownloadPending], [SaveConflict::SameDownloadFinished], [SaveConflict::FinalFileExists]
+    /// Valid for: [SaveConflict::SameDownloadExists], [SaveConflict::FinalFileExists]
     AddNumberToNameAndContinue,
-    /// Valid for: [SaveConflict::SameDownloadFinished]
-    ProceedToFinish,
 }
 
-pub trait ConflictResolver: Send + Sync {
+pub trait ServerConflictResolver: Send + Sync {
     fn resolve_server_conflict(&self, conflict: ServerConflict) -> ServerConflictResolution;
+}
+
+pub trait SaveConflictResolver: Send + Sync {
     fn resolve_save_conflict(&self, conflict: SaveConflict) -> SaveConflictResolution;
 }
