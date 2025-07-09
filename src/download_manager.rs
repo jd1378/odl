@@ -420,6 +420,76 @@ impl DownloadManager {
         return Ok(final_path);
     }
 
+    async fn get_unfinished_parts_and_update_status(
+        metadata: &mut DownloadMetadata,
+        instruction: &Download,
+    ) -> Result<Vec<PartDetails>, OdlError> {
+        let mut to_download: Vec<PartDetails> = Vec::new();
+        // Collect all unfinished part ulids
+        let unfinished_ulids: Vec<String> = metadata
+            .parts
+            .iter()
+            .filter_map(|(_, p)| {
+                if !p.finished {
+                    return Some(p.ulid.clone());
+                }
+                return None;
+            })
+            .collect();
+
+        // get file stats in parallel
+        let stats_futures = unfinished_ulids.into_iter().map(|ulid: String| {
+            let part_path = instruction.part_path(&ulid);
+            async move {
+                let file = tokio::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .open(part_path)
+                    .await?;
+                let metadata = file.metadata().await?;
+                Ok::<(String, u64), std::io::Error>((ulid, metadata.len()))
+            }
+        });
+        let stats_results = join_all(stats_futures).await;
+
+        let mut changed = false;
+        for stat_result in stats_results.into_iter() {
+            match stat_result {
+                Ok((ulid, size)) => {
+                    if let Some(part) = metadata.parts.get_mut(&ulid) {
+                        if size == part.size {
+                            part.finished = true;
+                            changed = true;
+                        } else {
+                            to_download.push(part.clone());
+                        }
+                    } else {
+                        return Err(OdlError::MetadataError {
+                            message: format!("Part with ulid {} not found in metadata", ulid),
+                        });
+                    }
+                }
+                Err(e) => {
+                    return Err(OdlError::MetadataError {
+                        message: format!("Failed to read size of part file: {}", e.to_string()),
+                    });
+                }
+            }
+        }
+
+        if changed {
+            let encoded = metadata.encode_length_delimited_to_vec();
+            atomic_write(
+                instruction.metadata_path(),
+                instruction.metadata_temp_path(),
+                &encoded,
+            )
+            .await?;
+        }
+
+        Ok(to_download)
+    }
+
     async fn process_download<CR>(
         self: &Self,
         instruction: Download,
@@ -438,64 +508,9 @@ impl DownloadManager {
 
         // we skip over download parts if we already finished downloading
         if !metadata.finished {
-            let mut to_download = Vec::new();
-
-            // Collect all unfinished part ulids
-            let unfinished_ulids: Vec<String> = metadata
-                .parts
-                .iter()
-                .filter_map(|(_, p)| {
-                    if !p.finished {
-                        return Some(p.ulid.clone());
-                    }
-                    return None;
-                })
-                .collect();
-
-            // get file stats in parallel
-            let stats_futures = unfinished_ulids.into_iter().map(|ulid: String| {
-                let part_path = instruction.part_path(&ulid);
-                async move {
-                    let file = tokio::fs::OpenOptions::new()
-                        .create(true)
-                        .write(true)
-                        .open(part_path)
-                        .await?;
-                    let metadata = file.metadata().await?;
-                    Ok::<(String, u64), std::io::Error>((ulid, metadata.len()))
-                }
-            });
-            let stats_results = join_all(stats_futures).await;
-
-            for stat_result in stats_results.into_iter() {
-                match stat_result {
-                    Ok((ulid, size)) => {
-                        if let Some(part) = metadata.parts.get_mut(&ulid) {
-                            if size == part.size {
-                                part.finished = true;
-                            } else {
-                                to_download.push(part.clone());
-                            }
-                        } else {
-                            return Err(OdlError::MetadataError {
-                                message: format!("Part with ulid {} not found in metadata", ulid),
-                            });
-                        }
-                    }
-                    Err(e) => {
-                        return Err(OdlError::MetadataError {
-                            message: format!("Failed to read size of part file: {}", e.to_string()),
-                        });
-                    }
-                }
-            }
-
-            // Write metadata after checking parts, since we may have some changes
-            let encoded = metadata.encode_length_delimited_to_vec();
-            atomic_write(
-                instruction.metadata_path(),
-                instruction.metadata_temp_path(),
-                &encoded,
+            let to_download = DownloadManager::get_unfinished_parts_and_update_status(
+                &mut metadata,
+                &instruction,
             )
             .await?;
 
