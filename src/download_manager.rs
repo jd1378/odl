@@ -10,6 +10,7 @@ use reqwest::{
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use reqwest_retry::RetryTransientMiddleware;
 use std::{path::Path, path::PathBuf, sync::Arc, time::Duration};
+use tokio::io::BufWriter;
 use tokio::sync::Semaphore;
 use tokio::{io::AsyncWriteExt, io::BufReader, sync::Mutex};
 
@@ -393,12 +394,13 @@ impl DownloadManager {
         instruction: &Download,
     ) -> Result<PathBuf, OdlError> {
         let final_path = instruction.save_dir().join(&metadata.filename);
-        let mut final_file = tokio::fs::OpenOptions::new()
+        let final_file = tokio::fs::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
             .open(&final_path)
             .await?;
+        let mut final_file = BufWriter::new(final_file);
         let mut sorted_parts: Vec<&PartDetails> = metadata.parts.values().collect();
         sorted_parts.sort_by_key(|p| p.offset);
         for p in sorted_parts.iter() {
@@ -680,11 +682,12 @@ impl DownloadManager {
         S: FnOnce() + Send,
         F: FnMut(u64) + Send,
     {
-        let mut file = tokio::fs::OpenOptions::new()
+        let file = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(part_path)
             .await?;
+        let mut file = BufWriter::new(file);
 
         let mut req = client.get(url.clone());
         if let Some(part) = part_details {
