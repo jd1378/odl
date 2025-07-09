@@ -125,6 +125,10 @@ impl Download {
         &self.save_dir
     }
 
+    pub fn set_save_dir(&mut self, path: PathBuf) {
+        self.save_dir = path
+    }
+
     pub fn size(&self) -> Option<u64> {
         self.size
     }
