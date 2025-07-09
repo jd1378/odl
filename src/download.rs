@@ -341,6 +341,9 @@ impl DownloadBuilder {
         if self.download_dir.is_none() {
             return Err(DownloadBuilderError::MissingDownloadDir);
         }
+        if self.save_dir.is_none() {
+            return Err(DownloadBuilderError::MissingSaveDir);
+        }
         if self.url.is_none() {
             return Err(DownloadBuilderError::MissingUrl);
         }
@@ -361,6 +364,8 @@ impl DownloadBuilder {
 pub enum DownloadBuilderError {
     #[error("download_dir is required")]
     MissingDownloadDir,
+    #[error("save_dir is required")]
+    MissingSaveDir,
     #[error("url is required")]
     MissingUrl,
     #[error("filename is required")]
