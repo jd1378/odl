@@ -1,6 +1,5 @@
 use derive_builder::Builder;
 use fs2::FileExt;
-use futures::future::join_all;
 use futures::stream::{FuturesOrdered, StreamExt};
 use prost::Message;
 use reqwest::{
@@ -449,78 +448,6 @@ impl DownloadManager {
         return Ok(final_path);
     }
 
-    async fn get_unfinished_parts_and_update_status(
-        metadata: &mut DownloadMetadata,
-        instruction: &Download,
-    ) -> Result<Vec<PartDetails>, OdlError> {
-        let mut to_download: Vec<PartDetails> = Vec::new();
-        // Collect all unfinished part ulids
-        let unfinished_ulids: Vec<String> = metadata
-            .parts
-            .iter()
-            .filter_map(|(_, p)| {
-                if !p.finished {
-                    return Some(p.ulid.clone());
-                }
-                return None;
-            })
-            .collect();
-
-        // get file stats in parallel
-        let stats_futures = unfinished_ulids.into_iter().map(|ulid: String| {
-            let part_path = instruction.part_path(&ulid);
-            async move {
-                // we eagerly create part files if they don't exist
-                // otherwise it does nothing and just gets the size
-                let file = tokio::fs::OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .open(part_path)
-                    .await?;
-                let metadata = file.metadata().await?;
-                Ok::<(String, u64), std::io::Error>((ulid, metadata.len()))
-            }
-        });
-        let stats_results = join_all(stats_futures).await;
-
-        let mut changed = false;
-        for stat_result in stats_results.into_iter() {
-            match stat_result {
-                Ok((ulid, size)) => {
-                    if let Some(part) = metadata.parts.get_mut(&ulid) {
-                        if size == part.size {
-                            part.finished = true;
-                            changed = true;
-                        } else {
-                            to_download.push(part.clone());
-                        }
-                    } else {
-                        return Err(OdlError::MetadataError {
-                            message: format!("Part with ulid {} not found in metadata", ulid),
-                        });
-                    }
-                }
-                Err(e) => {
-                    return Err(OdlError::MetadataError {
-                        message: format!("Failed to read size of part file: {}", e.to_string()),
-                    });
-                }
-            }
-        }
-
-        if changed {
-            let encoded = metadata.encode_length_delimited_to_vec();
-            atomic_write(
-                instruction.metadata_path(),
-                instruction.metadata_temp_path(),
-                &encoded,
-            )
-            .await?;
-        }
-
-        Ok(to_download)
-    }
-
     /// Attempts to download a list of parts
     async fn download_parts(
         &self,
@@ -631,8 +558,16 @@ impl DownloadManager {
 
         // we skip over download parts if we already finished downloading
         if !metadata.finished {
-            let to_download =
-                Self::get_unfinished_parts_and_update_status(&mut metadata, &instruction).await?;
+            let to_download = metadata
+                .parts
+                .iter()
+                .filter_map(|(_, p)| {
+                    if !p.finished {
+                        return Some(p.clone());
+                    }
+                    return None;
+                })
+                .collect::<Vec<PartDetails>>();
 
             // Download all parts: first part serial, rest in parallel if first succeeds
             // Downloads count should be according to max_connections of metadata
@@ -684,16 +619,40 @@ impl DownloadManager {
         S: FnOnce() + Send,
         F: FnMut(u64) + Send,
     {
+        let current_size = match tokio::fs::metadata(part_path).await {
+            Ok(meta) => meta.len(),
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    0
+                } else {
+                    return Err(OdlError::StdIoError { e });
+                }
+            }
+        };
+
+        // we want to create the file anyway, it may be 0 bytes.
         let file = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(part_path)
             .await?;
+
+        // If file already fully downloaded, skip
+        if let Some(part) = part_details {
+            if current_size >= part.size {
+                return Ok(());
+            }
+        }
+
         let mut file = BufWriter::new(file);
 
         let mut req = client.get(url.clone());
         if let Some(part) = part_details {
-            let range_header = format!("bytes={}-{}", part.offset, part.offset + part.size - 1);
+            let range_header = format!(
+                "bytes={}-{}",
+                part.offset + current_size,
+                part.offset + part.size - 1
+            );
             req = req.header(
                 RANGE,
                 HeaderValue::from_str(&range_header).map_err(|e| OdlError::Other {
@@ -779,6 +738,7 @@ mod tests {
     use mockito::Matcher;
     use mockito::Server;
     use std::collections::HashMap;
+    use tempfile::tempdir;
     use tokio::fs;
 
     struct AlwaysAbortResolver;
@@ -1292,6 +1252,93 @@ mod tests {
 
         // Ensure mocks were hit
         head_mock.assert_async().await;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_download_part_resumes_with_correct_range()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Prepare test data
+        let file_content = b"PartialDownloadTestFile";
+        let part_offset = 0;
+        let part_size = file_content.len() as u64;
+        let already_downloaded = 7; // Simulate 7 bytes already downloaded
+
+        // Start mock server
+        let mut server = Server::new_async().await;
+        let url = server.url();
+
+        // The server should receive a range request starting after already_downloaded bytes
+        let expected_range = format!(
+            "bytes={}-{}",
+            part_offset + already_downloaded,
+            part_offset + part_size - 1
+        );
+
+        let get_mock = server
+            .mock("GET", "/partialfile")
+            .match_header("range", Matcher::Exact(expected_range.clone()))
+            .with_status(206)
+            .with_body(&file_content[already_downloaded as usize..])
+            .create_async()
+            .await;
+
+        // Prepare a temp file with already_downloaded bytes written
+        let tmp_dir = tempdir()?;
+        let part_path = tmp_dir.path().join("part1.part");
+        {
+            let mut f = tokio::fs::File::create(&part_path).await?;
+            f.write_all(&file_content[..already_downloaded as usize])
+                .await?;
+        }
+
+        // Build a minimal ClientWithMiddleware
+        let client = reqwest::Client::builder().build()?;
+        let client = ClientBuilder::new(client)
+            .with(RetryTransientMiddleware::new_with_policy(
+                FixedThenExponentialRetry {
+                    max_n_retries: 1,
+                    wait_time: Duration::from_millis(10),
+                    n_fixed_retries: 1,
+                },
+            ))
+            .build();
+
+        // Prepare PartDetails
+        let part_details = PartDetails {
+            ulid: "part1".to_string(),
+            offset: part_offset,
+            size: part_size,
+            finished: false,
+        };
+
+        // Call download_part
+        let url = Url::parse(&format!("{}/partialfile", url)).unwrap();
+        let mut started_called = false;
+        let mut progress_called = false;
+        DownloadManager::download_part(
+            &client,
+            &url,
+            Some(&part_details),
+            &part_path,
+            || {
+                started_called = true;
+            },
+            |_downloaded| {
+                progress_called = true;
+            },
+        )
+        .await?;
+
+        // Check file content: should be the full file_content
+        let result = tokio::fs::read(&part_path).await?;
+        assert_eq!(result, file_content);
+
+        // Ensure mock was hit
+        get_mock.assert_async().await;
+        assert!(started_called, "started_callback should be called");
+        assert!(progress_called, "progress_callback should be called");
 
         Ok(())
     }
