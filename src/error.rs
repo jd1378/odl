@@ -3,7 +3,10 @@ use std::error::Error;
 use thiserror::Error;
 use tokio::{sync::AcquireError, task::JoinError};
 
-use crate::conflict::{SaveConflict, ServerConflict};
+use crate::{
+    conflict::{SaveConflict, ServerConflict},
+    download_manager::DownloadManagerBuilderError,
+};
 
 #[derive(Error, Debug)]
 pub enum NetworkError {
@@ -15,8 +18,8 @@ pub enum NetworkError {
     ResponseBody,
     #[error("Response status not success: {status_code:?}")]
     Status { status_code: u16 },
-    #[error("Network error: {msg:?}")]
-    Other { msg: String },
+    #[error("Network error: {message:?}")]
+    Other { message: String },
 }
 
 #[derive(Error, Debug)]
@@ -25,6 +28,18 @@ pub enum ConflictError {
     Save { conflict: SaveConflict },
     #[error("Download aborted due to conflict: {conflict:?}")]
     Server { conflict: ServerConflict },
+    #[error("Checksum mismatch: expected `{expected:?}`, got `{actual:?}`")]
+    ChecksumMismatch { expected: String, actual: String },
+}
+
+#[derive(Error, Debug)]
+pub enum MetadataError {
+    #[error("Error while acquiring lock for metadata")]
+    LockfileInUse,
+    #[error("Error while decoding metadata: {e:?}")]
+    MetadataDecodeError { e: DecodeError },
+    #[error("Unexpected error in odl related metadata: {message:?}")]
+    Other { message: String },
 }
 
 #[derive(Error, Debug)]
@@ -37,26 +52,18 @@ pub enum OdlError {
     EmptyInputFile,
     #[error("URL decode error: {message:?}")]
     UrlDecodeError { message: String },
-    #[error("Standard I/O error: {e}")]
+    #[error("Standard I/O error: {e:?}")]
     StdIoError { e: std::io::Error },
-    #[error("Task error: {e}")]
+    #[error("Task error: {e:?}")]
     TaskError { e: JoinError },
-    #[error("Channel error: {e}")]
+    #[error("Channel error: {e:?}")]
     ChannelError { e: async_channel::RecvError },
-    #[error("CLI argument error: {message:?}")]
-    CliArgumentError { message: String },
-    #[error("CLI argument error: {e}")]
-    ClapError { e: clap::Error },
-    #[error("Program interrupted")]
-    ProgramInterrupted,
-    #[error("Unexpected error in odl related metadata: {message:?}")]
-    MetadataError { message: String },
-    #[error("Error while decoding metadata: {e}")]
-    MetadataDecodeError { e: DecodeError },
-    #[error("Error while acquiring lock for metadata")]
-    LockfileInUse,
-    #[error("Checksum mismatch: expected `{expected}`, got `{actual}`")]
-    ChecksumMismatch { expected: String, actual: String },
+    #[error("Error: {message:?}")]
+    CliError { message: String },
+    #[error(transparent)]
+    DownloadManagerBuilderError(#[from] DownloadManagerBuilderError),
+    #[error(transparent)]
+    MetadataError(#[from] MetadataError),
     #[error("Other error: {message:?}")]
     Other {
         message: String,
@@ -91,7 +98,9 @@ impl From<reqwest::Error> for OdlError {
             }
         }
 
-        Self::Network(NetworkError::Other { msg: e.to_string() })
+        Self::Network(NetworkError::Other {
+            message: e.to_string(),
+        })
     }
 }
 
@@ -110,12 +119,6 @@ impl From<JoinError> for OdlError {
 impl From<async_channel::RecvError> for OdlError {
     fn from(e: async_channel::RecvError) -> Self {
         Self::ChannelError { e }
-    }
-}
-
-impl From<clap::Error> for OdlError {
-    fn from(e: clap::Error) -> Self {
-        Self::ClapError { e }
     }
 }
 
@@ -142,7 +145,7 @@ impl From<reqwest_middleware::Error> for OdlError {
 
 impl From<prost::DecodeError> for OdlError {
     fn from(e: prost::DecodeError) -> Self {
-        OdlError::MetadataDecodeError { e }
+        OdlError::MetadataError(MetadataError::MetadataDecodeError { e })
     }
 }
 

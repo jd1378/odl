@@ -11,7 +11,6 @@ use tokio::io::BufWriter;
 use tokio::sync::Semaphore;
 use tokio::{io::AsyncWriteExt, io::BufReader, sync::Mutex};
 
-use crate::fs_utils::{atomic_replace, set_file_mtime_async};
 use crate::hash::HashDigest;
 use crate::response_info::ResponseInfo;
 use crate::{
@@ -29,6 +28,10 @@ use crate::{
     error::ConflictError,
 };
 use crate::{credentials::Credentials, user_agents::random_user_agent};
+use crate::{
+    error::MetadataError,
+    fs_utils::{atomic_replace, set_file_mtime_async},
+};
 
 #[derive(Builder, Debug)]
 #[builder(build_fn(validate = "Self::validate"))]
@@ -41,9 +44,19 @@ pub struct DownloadManager {
             }))]
     download_dir: PathBuf,
 
-    /// Number of maximum connections.
-    #[builder(default = 6)]
+    /// Max connections that download manager can make in parallel for a single file
+    #[builder(default = 4)]
     max_connections: u64,
+
+    /// The maximum number of files that the download manager can download in parallel.
+    ///
+    /// This controls the overall concurrency of downloads. For example, if set to 4, up to 4 files
+    /// will be downloaded at the same time, regardless of how many connections are used for each file.
+    ///
+    /// Note: For controlling how many parts of a single file can be downloaded concurrently,
+    /// see the `max_connections` option.
+    #[builder(default = 3)]
+    max_concurrent_downloads: u64,
 
     /// Number of maximum retries after which a download is considered failed. After third retry it increases exponentially.
     /// For example the time for max_retries=6 and wait_between_retries=500ms will be:
@@ -87,6 +100,14 @@ impl DownloadManager {
 
     pub fn set_max_connections(self: &mut Self, value: u64) {
         self.max_connections = if value > 0 { value } else { 1 }
+    }
+
+    pub fn max_concurrent_downloads(self: &Self) -> u64 {
+        return self.max_concurrent_downloads;
+    }
+
+    pub fn set_max_concurrent_downloads(self: &mut Self, value: u64) {
+        self.max_concurrent_downloads = if value > 0 { value } else { 1 }
     }
 
     pub fn max_retries(self: &Self) -> u64 {
@@ -215,7 +236,7 @@ impl DownloadManager {
             Ok(f) => {
                 let f = f.into_std().await;
                 if let Err(_) = f.try_lock_exclusive() {
-                    return Err(OdlError::LockfileInUse);
+                    return Err(OdlError::MetadataError(MetadataError::LockfileInUse));
                 }
 
                 let result = self.process_download(instruction, conflict_resolver).await;
@@ -472,10 +493,11 @@ impl DownloadManager {
             // Drop the mutable reference to final_file so we can re-open it for reading
             drop(final_file);
             for checksum in &metadata.checksums {
-                let expected =
-                    HashDigest::try_from(checksum).map_err(|e| OdlError::MetadataError {
+                let expected = HashDigest::try_from(checksum).map_err(|e| {
+                    OdlError::MetadataError(MetadataError::Other {
                         message: format!("Invalid checksum in metadata: {}", e),
-                    })?;
+                    })
+                })?;
                 let file = tokio::fs::File::open(&final_path).await?;
                 let reader = BufReader::new(file);
                 let actual = HashDigest::from_reader(reader, &expected)
@@ -483,10 +505,10 @@ impl DownloadManager {
                     .map_err(|e| OdlError::StdIoError { e })?;
 
                 if actual != expected {
-                    return Err(OdlError::ChecksumMismatch {
+                    return Err(OdlError::Conflict(ConflictError::ChecksumMismatch {
                         expected: format!("{:?}", expected),
                         actual: format!("{:?}", actual),
-                    });
+                    }));
                 }
             }
         }
@@ -564,9 +586,9 @@ impl DownloadManager {
                     if let Some(part) = mdata.parts.get_mut(&ulid) {
                         part.finished = true;
                     } else {
-                        return Err(OdlError::MetadataError {
+                        return Err(OdlError::MetadataError(MetadataError::Other {
                             message: format!("Part with ulid {} not found in metadata", ulid),
-                        });
+                        }));
                     }
                 }
                 drop(_permit);
@@ -634,8 +656,10 @@ impl DownloadManager {
 
                 // Move metadata back from mutex to metadata variable
                 let mut mdata = Arc::try_unwrap(metadata_mutex)
-                    .map_err(|_| OdlError::MetadataError {
-                        message: "Failed to unwrap Arc for metadata".to_string(),
+                    .map_err(|_| {
+                        OdlError::MetadataError(MetadataError::Other {
+                            message: "Failed to unwrap Arc for metadata".to_string(),
+                        })
                     })?
                     .into_inner();
 

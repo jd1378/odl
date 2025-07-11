@@ -1,7 +1,7 @@
 use crate::{
     credentials::Credentials,
     download_metadata::{DownloadMetadata, FileChecksum, PartDetails},
-    error::DownloadParseError,
+    error::MetadataError,
     fs_utils,
     hash::HashDigest,
     response_info::ResponseInfo,
@@ -189,8 +189,8 @@ impl Download {
     pub fn from_metadata(
         download_dir: path::PathBuf,
         metadata: DownloadMetadata,
-    ) -> Result<Download, DownloadParseError> {
-        let url = Url::parse(&metadata.url).map_err(|e| DownloadParseError::InvalidUrl {
+    ) -> Result<Download, MetadataError> {
+        let url = Url::parse(&metadata.url).map_err(|e| MetadataError::Other {
             message: e.to_string(),
         })?;
 
