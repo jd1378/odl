@@ -28,14 +28,6 @@ pub struct FixedThenExponentialRetry {
 }
 
 impl FixedThenExponentialRetry {
-    pub fn new(max_n_retries: u32, wait_time: Duration, n_fixed_retries: u32) -> Self {
-        Self {
-            max_n_retries,
-            wait_time,
-            n_fixed_retries,
-        }
-    }
-
     fn too_many_attempts(&self, n_past_retries: u32) -> bool {
         n_past_retries >= self.max_n_retries
     }
@@ -83,13 +75,6 @@ pub struct FixedRetry {
 }
 
 impl FixedRetry {
-    pub fn new(max_n_retries: u32, wait_time: Duration) -> Self {
-        Self {
-            max_n_retries,
-            wait_time,
-        }
-    }
-
     fn too_many_attempts(&self, n_past_retries: u32) -> bool {
         n_past_retries >= self.max_n_retries
     }
