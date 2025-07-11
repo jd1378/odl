@@ -1,25 +1,30 @@
 use prost::DecodeError;
 use std::error::Error;
 use thiserror::Error;
-use tokio::time::error::Elapsed;
 use tokio::{sync::AcquireError, task::JoinError};
 
 use crate::conflict::{SaveConflict, ServerConflict};
 
 #[derive(Error, Debug)]
+pub enum NetworkError {
+    #[error("Connect error")]
+    Connect,
+    #[error("Connection timeout")]
+    Timeout,
+    #[error("Response body error")]
+    ResponseBody,
+    #[error("Response status not success: {status_code:?}")]
+    Status { status_code: u16 },
+    #[error("Network error: {msg:?}")]
+    Other { msg: String },
+}
+
+#[derive(Error, Debug)]
 pub enum OdlError {
+    #[error(transparent)]
+    Network(#[from] NetworkError),
     #[error("The input file is empty")]
     EmptyInputFile,
-    #[error("Connection closed")]
-    ConnectionClosed,
-    #[error("Connection timeout")]
-    ConnectionTimeout,
-    #[error("Response body error")]
-    ResponseBodyError,
-    #[error("Deadline elapsed timeout")]
-    DeadLineElapsedTimeout,
-    #[error("Response status not success: {status_code:?}")]
-    ResponseStatusNotSuccess { status_code: String },
     #[error("URL decode error: {message:?}")]
     UrlDecodeError { message: String },
     #[error("Standard I/O error: {e}")]
@@ -55,43 +60,38 @@ pub enum OdlError {
 
 impl From<reqwest::Error> for OdlError {
     fn from(e: reqwest::Error) -> Self {
-        match e.status() {
-            Some(status) if !status.is_success() => {
-                return Self::ResponseStatusNotSuccess {
-                    status_code: status.to_string(),
-                };
+        if let Some(status) = e.status() {
+            if !status.is_success() {
+                return Self::Network(NetworkError::Status {
+                    status_code: status.as_u16(),
+                });
             }
-            _ => {}
+        }
+        if e.is_timeout() {
+            return OdlError::Network(NetworkError::Timeout);
         }
 
-        match e.source().and_then(|s| s.downcast_ref::<std::io::Error>()) {
-            Some(io_err) if io_err.kind() == std::io::ErrorKind::TimedOut => {
-                return Self::ConnectionTimeout;
-            }
-            _ => {}
+        if e.is_body() {
+            return OdlError::Network(NetworkError::ResponseBody);
         }
 
-        match e.is_timeout() {
-            true => Self::ConnectionTimeout,
-            false if e.is_body() => Self::ResponseBodyError,
-            false if e.is_connect() => Self::ConnectionClosed,
-            _ => Self::Other {
-                message: e.to_string(),
-                origin: Box::new(e),
-            },
+        if e.is_connect() {
+            return OdlError::Network(NetworkError::Connect);
         }
+
+        if let Some(io_err) = e.source().and_then(|s| s.downcast_ref::<std::io::Error>()) {
+            if io_err.kind() == std::io::ErrorKind::TimedOut {
+                return OdlError::Network(NetworkError::Timeout);
+            }
+        }
+
+        Self::Network(NetworkError::Other { msg: e.to_string() })
     }
 }
 
 impl From<std::io::Error> for OdlError {
     fn from(e: std::io::Error) -> Self {
         Self::StdIoError { e }
-    }
-}
-
-impl From<Elapsed> for OdlError {
-    fn from(_: Elapsed) -> Self {
-        Self::DeadLineElapsedTimeout
     }
 }
 
