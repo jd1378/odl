@@ -22,9 +22,10 @@ message DownloadMetadata {
   repeated FileChecksum checksums = 9;
   bool requires_auth = 10;
   bool requires_basic_auth = 11;
-  uint64 max_connections = 12;
-  map<string, PartDetails> parts = 13; // ulid -> PartDetails
-  bool finished = 14;
+  map<string, string> headers = 12;
+  uint64 max_connections = 13;
+  map<string, PartDetails> parts = 14; // ulid -> PartDetails
+  bool finished = 15;
 }
 
 message PartDetails {

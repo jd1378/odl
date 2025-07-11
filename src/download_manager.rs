@@ -3,11 +3,9 @@ use fs2::FileExt;
 use futures::stream::{FuturesOrdered, StreamExt};
 use prost::Message;
 use reqwest::{
-    Proxy, Url,
+    Client, Proxy, Url,
     header::{HeaderMap, HeaderValue, RANGE},
 };
-use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
-use reqwest_retry::RetryTransientMiddleware;
 use std::{path::Path, path::PathBuf, sync::Arc, time::Duration};
 use tokio::io::BufWriter;
 use tokio::sync::Semaphore;
@@ -26,7 +24,7 @@ use crate::{
     fs_utils::{
         self, IsUnique, atomic_write, is_filename_unique, read_delimited_message_from_path,
     },
-    retry_policies::FixedThenExponentialRetry,
+    retry_policies::{FixedRetry, FixedThenExponentialRetry},
 };
 
 #[derive(Builder, Debug)]
@@ -140,6 +138,7 @@ impl DownloadManager {
             self.use_server_time,
             credentials,
             self.proxy.clone(),
+            self.headers.clone(),
         );
 
         let instruction = Self::resolve_save_conflicts(instruction, conflict_resolver).await?;
@@ -181,15 +180,7 @@ impl DownloadManager {
         }
     }
 
-    fn get_client(
-        self: &Self,
-        instructions: Option<&Download>,
-    ) -> Result<ClientWithMiddleware, OdlError> {
-        let retry_policy = FixedThenExponentialRetry {
-            max_n_retries: self.max_retries,
-            wait_time: self.wait_between_retries,
-            n_fixed_retries: 3,
-        };
+    fn get_client(self: &Self, instructions: Option<&Download>) -> Result<Client, OdlError> {
         let mut client = reqwest::Client::builder();
         if let Some(proxy) = &self.proxy {
             client = client.proxy(proxy.clone());
@@ -201,11 +192,12 @@ impl DownloadManager {
             if let Some(proxy) = download.proxy() {
                 client = client.proxy(proxy.clone());
             }
-        }
 
-        Ok(ClientBuilder::new(client.build()?)
-            .with(RetryTransientMiddleware::new_with_policy(retry_policy))
-            .build())
+            if let Some(headers) = download.headers() {
+                client = client.default_headers(headers.clone());
+            }
+        }
+        Ok(client.build()?)
     }
 
     /// Checks for common storage conflicts before the download begins
@@ -471,7 +463,7 @@ impl DownloadManager {
             let ulid = part.ulid.clone();
             let part_path = instruction.part_path(&ulid);
             let part_details = part;
-            let client: Arc<ClientWithMiddleware> = Arc::clone(&client);
+            let client: Arc<Client> = Arc::clone(&client);
             let first_push = first_iter.clone();
             first_iter = false;
 
@@ -608,7 +600,7 @@ impl DownloadManager {
 
     /// Attempts to download a single part
     async fn download_part<S, F>(
-        client: &ClientWithMiddleware,
+        client: &Client,
         url: &Url,
         part_details: Option<&PartDetails>,
         part_path: &PathBuf,
@@ -1295,15 +1287,6 @@ mod tests {
 
         // Build a minimal ClientWithMiddleware
         let client = reqwest::Client::builder().build()?;
-        let client = ClientBuilder::new(client)
-            .with(RetryTransientMiddleware::new_with_policy(
-                FixedThenExponentialRetry {
-                    max_n_retries: 1,
-                    wait_time: Duration::from_millis(10),
-                    n_fixed_retries: 1,
-                },
-            ))
-            .build();
 
         // Prepare PartDetails
         let part_details = PartDetails {

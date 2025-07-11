@@ -8,10 +8,14 @@ use crate::{
 };
 use chrono::{DateTime, Utc};
 use derive_builder::{Builder, UninitializedFieldError};
-use reqwest::{Proxy, Url};
+use reqwest::{
+    Proxy, Url,
+    header::{HeaderMap, HeaderName, HeaderValue},
+};
 use std::{
     collections::HashMap,
     path::{self, PathBuf},
+    str::FromStr,
 };
 use thiserror::Error;
 use tokio::sync::Semaphore;
@@ -59,6 +63,8 @@ pub struct Download {
     /// proxy to use, if provided
     #[builder(default = None)]
     proxy: Option<Proxy>,
+    #[builder(default = None)]
+    headers: Option<HeaderMap>,
     /// Preferred number of connections for this download.
     /// This will determine the initial number of parts, which will not be decreased after determination,
     /// even if the max_connections is decreased.
@@ -164,6 +170,10 @@ impl Download {
         &self.proxy
     }
 
+    pub fn headers(&self) -> &Option<HeaderMap> {
+        &self.headers
+    }
+
     pub fn max_connections(&self) -> u64 {
         self.max_connections
     }
@@ -204,6 +214,19 @@ impl Download {
             requires_auth: metadata.requires_auth,
             requires_basic_auth: metadata.requires_basic_auth,
             proxy: None,
+            headers: if metadata.headers.is_empty() {
+                None
+            } else {
+                let mut map = HeaderMap::new();
+                for (k, v) in metadata.headers {
+                    if let (Ok(header_name), Ok(header_value)) =
+                        (HeaderName::from_str(&k), HeaderValue::from_str(&v))
+                    {
+                        map.insert(header_name, header_value);
+                    }
+                }
+                Some(map)
+            },
             max_connections: metadata.max_connections,
             parts: metadata.parts,
             finished: metadata.finished,
@@ -227,6 +250,15 @@ impl Download {
                 .collect::<Vec<FileChecksum>>(),
             requires_auth: self.requires_auth,
             requires_basic_auth: self.requires_basic_auth,
+            headers: self
+                .headers
+                .as_ref()
+                .map(|h| {
+                    h.iter()
+                        .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+                        .collect()
+                })
+                .unwrap_or_else(HashMap::new),
             max_connections: self.max_connections,
             parts: self.parts.clone(),
             finished: self.finished,
@@ -241,6 +273,7 @@ impl Download {
         use_server_time: bool,
         credentials: Option<Credentials>,
         proxy: Option<Proxy>,
+        headers: Option<HeaderMap>,
     ) -> Download {
         let filename = fs_utils::cleanup_filename(response_info.extract_filename().as_str());
         Self {
@@ -258,6 +291,7 @@ impl Download {
             requires_auth: response_info.requires_auth(),
             requires_basic_auth: response_info.requires_basic_auth(),
             proxy,
+            headers,
             max_connections,
             parts: Download::determine_parts(
                 response_info.total_length(),
