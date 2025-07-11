@@ -11,7 +11,6 @@ use tokio::io::BufWriter;
 use tokio::sync::Semaphore;
 use tokio::{io::AsyncWriteExt, io::BufReader, sync::Mutex};
 
-use crate::conflict::{SaveConflictResolver, ServerConflictResolver};
 use crate::credentials::Credentials;
 use crate::fs_utils::{atomic_replace, set_file_mtime_async};
 use crate::hash::HashDigest;
@@ -25,6 +24,10 @@ use crate::{
         self, IsUnique, atomic_write, is_filename_unique, read_delimited_message_from_path,
     },
     retry_policies::{FixedRetry, FixedThenExponentialRetry},
+};
+use crate::{
+    conflict::{SaveConflictResolver, ServerConflictResolver},
+    error::ConflictError,
 };
 
 #[derive(Builder, Debug)]
@@ -229,7 +232,7 @@ impl DownloadManager {
                 .await;
             match resolution {
                 SaveConflictResolution::Abort => {
-                    return Err(OdlError::DownloadSaveAbortedDuetoConflict { conflict });
+                    return Err(OdlError::Conflict(ConflictError::Save { conflict }));
                 }
                 SaveConflictResolution::ReplaceAndContinue => {
                     match conflict {
@@ -357,7 +360,7 @@ impl DownloadManager {
                     .resolve_server_conflict(conflict.clone())
                     .await;
                 if resolution == ServerConflictResolution::Abort {
-                    return Err(OdlError::DownloadAbortedDuetoConflict { conflict });
+                    return Err(OdlError::Conflict(ConflictError::Server { conflict }));
                 } else if resolution == ServerConflictResolution::Restart {
                     metadata.last_etag = instruction.etag().clone();
                     metadata.last_modified = instruction.last_modified();
@@ -1044,9 +1047,9 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(OdlError::DownloadAbortedDuetoConflict {
+            Err(OdlError::Conflict(ConflictError::Server {
                 conflict: ServerConflict::NotResumable
-            })
+            }))
         ));
 
         // Ensure HEAD mock was hit, GET mocks may not be hit

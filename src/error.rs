@@ -20,9 +20,19 @@ pub enum NetworkError {
 }
 
 #[derive(Error, Debug)]
+pub enum ConflictError {
+    #[error("Download save aborted due to conflict: {conflict:?}")]
+    Save { conflict: SaveConflict },
+    #[error("Download aborted due to conflict: {conflict:?}")]
+    Server { conflict: ServerConflict },
+}
+
+#[derive(Error, Debug)]
 pub enum OdlError {
     #[error(transparent)]
     Network(#[from] NetworkError),
+    #[error(transparent)]
+    Conflict(#[from] ConflictError),
     #[error("The input file is empty")]
     EmptyInputFile,
     #[error("URL decode error: {message:?}")]
@@ -45,10 +55,6 @@ pub enum OdlError {
     MetadataDecodeError { e: DecodeError },
     #[error("Error while acquiring lock for metadata")]
     LockfileInUse,
-    #[error("Download aborted due to conflict: {conflict:?}")]
-    DownloadAbortedDuetoConflict { conflict: ServerConflict },
-    #[error("Download save aborted due to conflict: {conflict:?}")]
-    DownloadSaveAbortedDuetoConflict { conflict: SaveConflict },
     #[error("Checksum mismatch: expected `{expected}`, got `{actual}`")]
     ChecksumMismatch { expected: String, actual: String },
     #[error("Other error: {message:?}")]
