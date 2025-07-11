@@ -4,14 +4,13 @@ use futures::stream::{FuturesOrdered, StreamExt};
 use prost::Message;
 use reqwest::{
     Client, Proxy, Url,
-    header::{HeaderMap, HeaderValue, RANGE},
+    header::{HeaderMap, HeaderValue, RANGE, USER_AGENT},
 };
 use std::{path::Path, path::PathBuf, sync::Arc, time::Duration};
 use tokio::io::BufWriter;
 use tokio::sync::Semaphore;
 use tokio::{io::AsyncWriteExt, io::BufReader, sync::Mutex};
 
-use crate::credentials::Credentials;
 use crate::fs_utils::{atomic_replace, set_file_mtime_async};
 use crate::hash::HashDigest;
 use crate::response_info::ResponseInfo;
@@ -29,6 +28,7 @@ use crate::{
     conflict::{SaveConflictResolver, ServerConflictResolver},
     error::ConflictError,
 };
+use crate::{credentials::Credentials, user_agents::random_user_agent};
 
 #[derive(Builder, Debug)]
 #[builder(build_fn(validate = "Self::validate"))]
@@ -40,29 +40,63 @@ pub struct DownloadManager {
                 tmp_dir
             }))]
     download_dir: PathBuf,
+
     /// Number of maximum connections.
     #[builder(default = 6)]
     max_connections: u64,
+
     /// Number of maximum retries after which a download is considered failed. After third retry it increases exponentially.
     /// For example the time for max_retries=6 and wait_between_retries=500ms will be:
     /// 500ms, 500ms, 500ms, 1000ms, 2000ms, 4000ms
     #[builder(default = 3)]
-    max_retries: u32,
+    max_retries: u64,
+
     /// Amount of time to wait between retries. After third retry it increases exponentially.
     #[builder(default = Duration::from_millis(500))]
     wait_between_retries: Duration,
+
     /// Custom HTTP headers.
     #[builder(default = None)]
     headers: Option<HeaderMap>,
+
+    /// Custom user agent. This option overrides `randomize_user_agent`
+    #[builder(default = None)]
+    user_agent: Option<String>,
+
+    /// Randomize user agent for each request.
+    #[builder(default = true)]
+    randomize_user_agent: bool,
+
     /// Custom request Proxy to use for downloads
     #[builder(default = None)]
     proxy: Option<Proxy>,
+
     /// Whether to use the last-modified sent by server when saving the file
     #[builder(default = false)]
     use_server_time: bool,
+
+    /// Should we accept invalid SSL certificates? Do not use unless you are absolutely sure of what you are doing.
+    #[builder(default = false)]
+    accept_invalid_certs: bool,
 }
 
 impl DownloadManager {
+    pub fn max_connections(self: &Self) -> u64 {
+        return self.max_connections;
+    }
+
+    pub fn set_max_connections(self: &mut Self, value: u64) {
+        self.max_connections = if value > 0 { value } else { 1 }
+    }
+
+    pub fn max_retries(self: &Self) -> u64 {
+        return self.max_retries;
+    }
+
+    pub fn set_max_retries(self: &mut Self, value: u64) {
+        self.max_retries = value
+    }
+
     pub fn wait_between_retries(self: &Self) -> Duration {
         return self.wait_between_retries;
     }
@@ -71,12 +105,20 @@ impl DownloadManager {
         self.wait_between_retries = value;
     }
 
-    pub fn max_connections(self: &Self) -> u64 {
-        return self.max_connections;
+    pub fn user_agent(self: &Self) -> &Option<String> {
+        return &self.user_agent;
     }
 
-    pub fn set_max_connections(self: &mut Self, value: u64) {
-        self.max_connections = if value > 0 { value } else { 1 }
+    pub fn set_user_agent(self: &mut Self, value: Option<String>) {
+        self.user_agent = value
+    }
+
+    pub fn random_user_agent(self: &Self) -> bool {
+        return self.randomize_user_agent;
+    }
+
+    pub fn set_random_user_agent(self: &mut Self, value: bool) {
+        self.randomize_user_agent = value
     }
 
     pub fn proxy(self: &Self) -> &Option<Proxy> {
@@ -87,20 +129,20 @@ impl DownloadManager {
         self.proxy = value
     }
 
-    pub fn max_retries(self: &Self) -> u32 {
-        return self.max_retries;
-    }
-
-    pub fn set_max_retries(self: &mut Self, value: u32) {
-        self.max_retries = value
-    }
-
     pub fn use_server_time(self: &Self) -> bool {
         return self.use_server_time;
     }
 
     pub fn set_use_server_time(self: &mut Self, value: bool) {
         self.use_server_time = value
+    }
+
+    pub fn accept_invalid_certs(self: &Self) -> bool {
+        return self.accept_invalid_certs;
+    }
+
+    pub fn set_accept_invalid_certs(self: &mut Self, value: bool) {
+        self.accept_invalid_certs = value
     }
 
     pub async fn evaluate<CR>(
@@ -128,6 +170,9 @@ impl DownloadManager {
             );
         if let Some(creds) = &credentials {
             req = req.basic_auth(creds.username(), creds.password());
+        }
+        if !self.user_agent.is_some() && self.randomize_user_agent {
+            req = req.header(USER_AGENT, random_user_agent());
         }
 
         let resp = req.send().await?;
@@ -199,6 +244,12 @@ impl DownloadManager {
             if let Some(headers) = download.headers() {
                 client = client.default_headers(headers.clone());
             }
+        }
+        if self.accept_invalid_certs {
+            client = client.danger_accept_invalid_certs(self.accept_invalid_certs)
+        }
+        if let Some(user_agent) = &self.user_agent {
+            client = client.user_agent(user_agent.clone());
         }
         Ok(client.build()?)
     }
@@ -451,7 +502,12 @@ impl DownloadManager {
         metadata: &Arc<Mutex<DownloadMetadata>>,
     ) -> Result<(), OdlError> {
         // reqwest is thread-safe, no need for mutex
-        let client = Arc::new(self.get_client(Some(&instruction))?);
+        let client: Arc<Client> = Arc::new(self.get_client(Some(&instruction))?);
+        let randomize_user_agent = if let Some(_) = self.user_agent {
+            false
+        } else {
+            self.randomize_user_agent
+        };
         // we will add permits once we confirm everything is okay on first download
         let semaphore = Arc::new(Semaphore::new(1));
         let mut first_iter = true;
@@ -493,6 +549,7 @@ impl DownloadManager {
                 };
                 let res = Self::download_part(
                     &client,
+                    randomize_user_agent,
                     &url,
                     Some(&part_details),
                     &part_path,
@@ -604,6 +661,7 @@ impl DownloadManager {
     /// Attempts to download a single part
     async fn download_part<S, F>(
         client: &Client,
+        randomize_user_agent: bool,
         url: &Url,
         part_details: Option<&PartDetails>,
         part_path: &PathBuf,
@@ -656,6 +714,9 @@ impl DownloadManager {
                     origin: Box::new(e),
                 })?,
             );
+        }
+        if randomize_user_agent {
+            req = req.header(USER_AGENT, random_user_agent())
         }
 
         let mut resp = req.send().await.map_err(OdlError::from)?;
@@ -1305,6 +1366,7 @@ mod tests {
         let mut progress_called = false;
         DownloadManager::download_part(
             &client,
+            false,
             &url,
             Some(&part_details),
             &part_path,
@@ -1325,6 +1387,189 @@ mod tests {
         get_mock.assert_async().await;
         assert!(started_called, "started_callback should be called");
         assert!(progress_called, "progress_callback should be called");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_download_manager_custom_user_agent() -> Result<(), Box<dyn std::error::Error>> {
+        // Prepare test data
+        let file_content = b"UserAgentTestFile";
+
+        // Start mock server
+        let mut server = Server::new_async().await;
+        let url = server.url();
+
+        // Expect a custom user agent header in HEAD and GET requests
+        let custom_ua = "MyCustomUserAgent/1.0";
+
+        let head_mock = server
+            .mock("HEAD", "/useragentfile")
+            .match_header("user-agent", Matcher::Exact(custom_ua.into()))
+            .with_status(200)
+            .with_header("content-length", &file_content.len().to_string())
+            .with_header("accept-ranges", "bytes")
+            .with_header("etag", "uaetag")
+            .with_header("last-modified", "Sun, 25 Oct 2015 07:28:00 GMT")
+            .create_async()
+            .await;
+
+        let get_mock = server
+            .mock("GET", "/useragentfile")
+            .match_header("user-agent", Matcher::Exact(custom_ua.into()))
+            .match_header(
+                "range",
+                Matcher::Exact(format!("bytes=0-{}", file_content.len() - 1)),
+            )
+            .with_status(206)
+            .with_body(file_content)
+            .create_async()
+            .await;
+
+        // Build DownloadManager with custom user agent
+        let tmp_download_dir = tempfile::tempdir()?;
+        let tmp_save_dir = tempfile::tempdir()?;
+        let dlm = DownloadManagerBuilder::default()
+            .download_dir(tmp_download_dir.path().to_path_buf())
+            .max_connections(1)
+            .user_agent(Some(custom_ua.to_string()))
+            .randomize_user_agent(false)
+            .build()
+            .unwrap();
+
+        // Evaluate to get Download instruction
+        let save_resolver = AlwaysReplaceResolver {};
+        let instruction = dlm
+            .evaluate(
+                Url::parse(&format!("{}/useragentfile", url)).unwrap(),
+                None,
+                &save_resolver,
+            )
+            .await?;
+
+        // Patch the instruction to simulate 1 part
+        let instruction = DownloadBuilder::default()
+            .download_dir(instruction.download_dir().clone())
+            .save_dir(tmp_save_dir.path().to_path_buf())
+            .filename(instruction.filename().to_string())
+            .url(instruction.url().clone())
+            .size(Some(file_content.len() as u64))
+            .max_connections(1)
+            .parts({
+                let mut parts = std::collections::HashMap::new();
+                parts.insert(
+                    "part1".to_string(),
+                    PartDetails {
+                        ulid: "part1".to_string(),
+                        offset: 0,
+                        size: file_content.len() as u64,
+                        finished: false,
+                    },
+                );
+                parts
+            })
+            .is_resumable(true)
+            .build()
+            .unwrap();
+
+        let resolver = AlwaysAbortResolver {};
+        let final_path = dlm.download(instruction, &resolver).await?;
+
+        let result = tokio::fs::read(&final_path).await?;
+        assert_eq!(result, file_content);
+
+        head_mock.assert_async().await;
+        get_mock.assert_async().await;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_download_manager_random_user_agent() -> Result<(), Box<dyn std::error::Error>> {
+        // Prepare test data
+        let file_content = b"RandomUserAgentTestFile";
+
+        // Start mock server
+        let mut server = Server::new_async().await;
+        let url = server.url();
+
+        // Accept any user agent, but ensure it's not the default reqwest one
+        let head_mock = server
+            .mock("HEAD", "/randomua")
+            .match_header("user-agent", Matcher::Any)
+            .with_status(200)
+            .with_header("content-length", &file_content.len().to_string())
+            .with_header("accept-ranges", "bytes")
+            .with_header("etag", "randomuaetag")
+            .with_header("last-modified", "Mon, 26 Oct 2015 07:28:00 GMT")
+            .create_async()
+            .await;
+
+        let get_mock = server
+            .mock("GET", "/randomua")
+            .match_header("user-agent", Matcher::Any)
+            .match_header(
+                "range",
+                Matcher::Exact(format!("bytes=0-{}", file_content.len() - 1)),
+            )
+            .with_status(206)
+            .with_body(file_content)
+            .create_async()
+            .await;
+
+        // Build DownloadManager with randomize_user_agent = true and no custom user agent
+        let tmp_download_dir = tempfile::tempdir()?;
+        let tmp_save_dir = tempfile::tempdir()?;
+        let dlm = DownloadManagerBuilder::default()
+            .download_dir(tmp_download_dir.path().to_path_buf())
+            .max_connections(1)
+            .randomize_user_agent(true)
+            .build()
+            .unwrap();
+
+        // Evaluate to get Download instruction
+        let save_resolver = AlwaysReplaceResolver {};
+        let instruction = dlm
+            .evaluate(
+                Url::parse(&format!("{}/randomua", url)).unwrap(),
+                None,
+                &save_resolver,
+            )
+            .await?;
+
+        // Patch the instruction to simulate 1 part
+        let instruction = DownloadBuilder::default()
+            .download_dir(instruction.download_dir().clone())
+            .save_dir(tmp_save_dir.path().to_path_buf())
+            .filename(instruction.filename().to_string())
+            .url(instruction.url().clone())
+            .size(Some(file_content.len() as u64))
+            .max_connections(1)
+            .parts({
+                let mut parts = std::collections::HashMap::new();
+                parts.insert(
+                    "part1".to_string(),
+                    PartDetails {
+                        ulid: "part1".to_string(),
+                        offset: 0,
+                        size: file_content.len() as u64,
+                        finished: false,
+                    },
+                );
+                parts
+            })
+            .is_resumable(true)
+            .build()
+            .unwrap();
+
+        let resolver = AlwaysAbortResolver {};
+        let final_path = dlm.download(instruction, &resolver).await?;
+
+        let result = tokio::fs::read(&final_path).await?;
+        assert_eq!(result, file_content);
+
+        head_mock.assert_async().await;
+        get_mock.assert_async().await;
 
         Ok(())
     }
