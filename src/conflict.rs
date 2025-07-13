@@ -1,5 +1,7 @@
 use async_trait::async_trait;
 
+use crate::download::Download;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerConflict {
     /// File changed on server. Either of "size", "etag", "last-modified" headers have been changed
@@ -13,10 +15,14 @@ pub enum ServerConflict {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ServerConflictResolution {
-    /// Valid for all cases
+pub enum FileChangedResolution {
     Abort,
-    /// Valid for [ServerConflict::FileChanged], [ServerConflict::NotResumable]
+    Restart,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotResumableResolution {
+    Abort,
     Restart,
 }
 
@@ -31,21 +37,29 @@ pub enum SaveConflict {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SaveConflictResolution {
-    /// Valid for all cases
+pub enum SameDownloadExistsResolution {
     Abort,
-    /// Valid for: [SaveConflict::SameDownloadExists], [SaveConflict::FinalFileExists]
+    AddNumberToNameAndContinue,
+    /// Try to resume the download.
+    /// This can lead to a ServerConflict if file has been changed since the download was started.
+    Resume,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FinalFileExistsResolution {
+    Abort,
     ReplaceAndContinue,
-    /// Valid for: [SaveConflict::SameDownloadExists], [SaveConflict::FinalFileExists]
     AddNumberToNameAndContinue,
 }
 
 #[async_trait]
 pub trait ServerConflictResolver: Send + Sync {
-    async fn resolve_server_conflict(&self, conflict: ServerConflict) -> ServerConflictResolution;
+    async fn resolve_file_changed(&self, instruction: &Download) -> FileChangedResolution;
+    async fn resolve_not_resumable(&self, instruction: &Download) -> NotResumableResolution;
 }
 
 #[async_trait]
 pub trait SaveConflictResolver: Send + Sync {
-    async fn resolve_save_conflict(&self, conflict: SaveConflict) -> SaveConflictResolution;
+    async fn same_download_exists(&self, instruction: &Download) -> SameDownloadExistsResolution;
+    async fn final_file_exists(&self, instruction: &Download) -> FinalFileExistsResolution;
 }

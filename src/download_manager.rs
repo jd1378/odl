@@ -11,10 +11,15 @@ use tokio::io::BufWriter;
 use tokio::sync::Semaphore;
 use tokio::{io::AsyncWriteExt, io::BufReader, sync::Mutex};
 
-use crate::hash::HashDigest;
-use crate::response_info::ResponseInfo;
 use crate::{
-    conflict::{SaveConflict, SaveConflictResolution, ServerConflict, ServerConflictResolution},
+    conflict::SameDownloadExistsResolution, download_metadata::FileChecksum, hash::HashDigest,
+};
+use crate::{
+    conflict::{FileChangedResolution, NotResumableResolution},
+    response_info::ResponseInfo,
+};
+use crate::{
+    conflict::{SaveConflict, ServerConflict},
     download::Download,
     download_metadata::{DownloadMetadata, PartDetails},
     error::OdlError,
@@ -283,65 +288,61 @@ impl DownloadManager {
     where
         CR: SaveConflictResolver,
     {
-        let mut conflict: Option<SaveConflict> = None;
         if tokio::fs::try_exists(instruction.download_dir())
             .await
             .unwrap_or(false)
         {
-            conflict = Some(SaveConflict::SameDownloadExists);
-        }
-
-        let final_path = instruction.save_dir().join(instruction.filename());
-        if conflict.is_none() {
-            if tokio::fs::try_exists(&final_path).await.unwrap_or(false) {
-                conflict = Some(SaveConflict::FinalFileExists);
+            let resolution: SameDownloadExistsResolution = SameDownloadExistsResolution::Resume;
+            match resolution {
+                SameDownloadExistsResolution::Abort => {
+                    return Err(OdlError::Conflict(ConflictError::Save {
+                        conflict: SaveConflict::SameDownloadExists,
+                    }));
+                }
+                SameDownloadExistsResolution::AddNumberToNameAndContinue => {
+                    let result = is_filename_unique(&instruction.download_dir()).await?;
+                    if let IsUnique::SuggestedAlternative(filename) = result {
+                        instruction.set_filename(filename);
+                    }
+                }
+                SameDownloadExistsResolution::Resume => {
+                    // do nothing and continue
+                }
             }
         }
 
-        if let Some(conflict) = conflict {
-            let resolution = conflict_resolver
-                .resolve_save_conflict(conflict.clone())
-                .await;
-            match resolution {
-                SaveConflictResolution::Abort => {
-                    return Err(OdlError::Conflict(ConflictError::Save { conflict }));
+        let final_path = instruction.save_dir().join(instruction.filename());
+
+        // This can still happen even if AddNumberToNameAndContinue solution is used previously
+        // But it does not happen often in that case.
+        if tokio::fs::try_exists(&final_path).await.unwrap_or(false) {
+            match conflict_resolver.final_file_exists(&instruction).await {
+                crate::conflict::FinalFileExistsResolution::Abort => {
+                    return Err(OdlError::Conflict(ConflictError::Save {
+                        conflict: SaveConflict::FinalFileExists,
+                    }));
                 }
-                SaveConflictResolution::ReplaceAndContinue => {
-                    match conflict {
-                        SaveConflict::SameDownloadExists => {
-                            if let Some(download_dir) = instruction.download_dir().to_str() {
-                                if download_dir == "/" {
-                                    return Err(OdlError::Other {
-                                        message:
-                                            "Refusing to remove root directory as download_dir"
-                                                .to_string(),
-                                        origin: Box::new(std::io::Error::new(
-                                            std::io::ErrorKind::Other,
-                                            "download_dir is root",
-                                        )),
-                                    });
-                                }
+                crate::conflict::FinalFileExistsResolution::ReplaceAndContinue => {
+                    // We try to safely remove files, so just in case that
+                    // the download_dir is not selected correctly, we don't end up
+                    // deleting the wrong files.
+                    let _ = tokio::fs::remove_file(instruction.metadata_path()).await;
+                    let _ = tokio::fs::remove_file(instruction.metadata_temp_path()).await;
+                    let mut entries = tokio::fs::read_dir(instruction.download_dir()).await?;
+                    while let Some(entry) = entries.next_entry().await? {
+                        let path = entry.path();
+                        if let Some(ext) = path.extension() {
+                            if ext == Download::PART_EXTENSION {
+                                tokio::fs::remove_file(&path).await?;
                             }
-                            // remove the metadata and parts, effectively replacing it
-                            tokio::fs::remove_dir_all(instruction.download_dir()).await?;
-                        }
-                        SaveConflict::FinalFileExists => {
-                            // Do nothing here, it will be truncated and written into at the end of download if we do nothing
                         }
                     }
                 }
-                SaveConflictResolution::AddNumberToNameAndContinue => {
-                    // in either of cases we need to change the filename
-                    // we just need to know which path to use to determine the new file name
-                    let result = match conflict {
-                        SaveConflict::SameDownloadExists => {
-                            is_filename_unique(&instruction.download_dir()).await?
-                        }
-                        SaveConflict::FinalFileExists => is_filename_unique(&final_path).await?,
-                    };
-
-                    if let IsUnique::SuggestedAlternative(filename) = result {
-                        instruction.set_filename(filename);
+                crate::conflict::FinalFileExistsResolution::AddNumberToNameAndContinue => {
+                    if let IsUnique::SuggestedAlternative(new_name) =
+                        is_filename_unique(&final_path).await?
+                    {
+                        instruction.set_filename(new_name);
                     }
                 }
             }
@@ -374,6 +375,19 @@ impl DownloadManager {
         }
 
         Ok(())
+    }
+
+    async fn apply_restart_state_to_metadata(
+        metadata: &mut DownloadMetadata,
+        new_download: &Download,
+        new_checksums: Vec<FileChecksum>,
+    ) {
+        metadata.last_etag = new_download.etag().to_owned();
+        metadata.last_modified = new_download.last_modified();
+        metadata.size = new_download.size();
+        Self::remove_all_parts(new_download.download_dir()).await;
+        metadata.parts = Download::determine_parts(metadata.size, metadata.max_connections);
+        metadata.checksums = new_checksums;
     }
 
     /// Checks for common conflicts between new instruction and metadata on disk
@@ -428,19 +442,40 @@ impl DownloadManager {
             }
 
             if let Some(conflict) = conflict {
-                let resolution = conflict_resolver
-                    .resolve_server_conflict(conflict.clone())
-                    .await;
-                if resolution == ServerConflictResolution::Abort {
-                    return Err(OdlError::Conflict(ConflictError::Server { conflict }));
-                } else if resolution == ServerConflictResolution::Restart {
-                    metadata.last_etag = instruction.etag().clone();
-                    metadata.last_modified = instruction.last_modified();
-                    metadata.size = instruction.size();
-                    Self::remove_all_parts(instruction.download_dir()).await;
-                    metadata.parts =
-                        Download::determine_parts(metadata.size, metadata.max_connections);
-                    metadata.checksums = new_checksums;
+                match conflict {
+                    ServerConflict::FileChanged => {
+                        match conflict_resolver.resolve_file_changed(&instruction).await {
+                            FileChangedResolution::Abort => {
+                                return Err(OdlError::Conflict(ConflictError::Server { conflict }));
+                            }
+                            FileChangedResolution::Restart => {
+                                Self::apply_restart_state_to_metadata(
+                                    &mut metadata,
+                                    instruction,
+                                    new_checksums,
+                                )
+                                .await
+                            }
+                        }
+                    }
+                    ServerConflict::NotResumable => {
+                        match conflict_resolver.resolve_not_resumable(&instruction).await {
+                            NotResumableResolution::Abort => {
+                                return Err(OdlError::Conflict(ConflictError::Server { conflict }));
+                            }
+                            NotResumableResolution::Restart => {
+                                Self::apply_restart_state_to_metadata(
+                                    &mut metadata,
+                                    instruction,
+                                    new_checksums,
+                                )
+                                .await
+                            }
+                        }
+                    }
+                    ServerConflict::UrlBroken | ServerConflict::CredentialsInvalid => {
+                        return Err(OdlError::Conflict(ConflictError::Server { conflict }));
+                    }
                 }
             }
         }
@@ -825,16 +860,28 @@ mod tests {
 
     #[async_trait]
     impl ServerConflictResolver for AlwaysAbortResolver {
-        async fn resolve_server_conflict(&self, _: ServerConflict) -> ServerConflictResolution {
-            ServerConflictResolution::Abort
+        async fn resolve_file_changed(&self, _: &Download) -> FileChangedResolution {
+            FileChangedResolution::Abort
+        }
+        async fn resolve_not_resumable(&self, _: &Download) -> NotResumableResolution {
+            NotResumableResolution::Abort
         }
     }
     struct AlwaysReplaceResolver;
 
     #[async_trait]
     impl SaveConflictResolver for AlwaysReplaceResolver {
-        async fn resolve_save_conflict(&self, _: SaveConflict) -> SaveConflictResolution {
-            SaveConflictResolution::ReplaceAndContinue
+        async fn final_file_exists(
+            &self,
+            _: &Download,
+        ) -> crate::conflict::FinalFileExistsResolution {
+            crate::conflict::FinalFileExistsResolution::ReplaceAndContinue
+        }
+        async fn same_download_exists(
+            &self,
+            _: &Download,
+        ) -> crate::conflict::SameDownloadExistsResolution {
+            crate::conflict::SameDownloadExistsResolution::Resume
         }
     }
 
@@ -1117,12 +1164,12 @@ mod tests {
         struct AssertTestResolver;
         #[async_trait]
         impl ServerConflictResolver for AssertTestResolver {
-            async fn resolve_server_conflict(
-                &self,
-                conflict: ServerConflict,
-            ) -> ServerConflictResolution {
-                assert_eq!(conflict, ServerConflict::NotResumable);
-                ServerConflictResolution::Abort
+            async fn resolve_file_changed(&self, _: &Download) -> FileChangedResolution {
+                FileChangedResolution::Abort
+            }
+            async fn resolve_not_resumable(&self, _: &Download) -> NotResumableResolution {
+                assert!(true, "NotResumable conflict should be triggered");
+                NotResumableResolution::Abort
             }
         }
 
@@ -1232,12 +1279,12 @@ mod tests {
         struct AssertTestResolver;
         #[async_trait]
         impl ServerConflictResolver for AssertTestResolver {
-            async fn resolve_server_conflict(
-                &self,
-                conflict: ServerConflict,
-            ) -> ServerConflictResolution {
-                assert_eq!(conflict, ServerConflict::NotResumable);
-                ServerConflictResolution::Restart
+            async fn resolve_file_changed(&self, _: &Download) -> FileChangedResolution {
+                FileChangedResolution::Restart
+            }
+            async fn resolve_not_resumable(&self, _: &Download) -> NotResumableResolution {
+                assert!(true, "NotResumable conflict should be triggered");
+                NotResumableResolution::Restart
             }
         }
 
