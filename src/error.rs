@@ -52,8 +52,11 @@ pub enum OdlError {
     EmptyInputFile,
     #[error("URL decode error: {message:?}")]
     UrlDecodeError { message: String },
-    #[error("Standard I/O error: {e:?}")]
-    StdIoError { e: std::io::Error },
+    #[error("Standard I/O error: {e:?} {extra_info:?}")]
+    StdIoError {
+        e: std::io::Error,
+        extra_info: Option<String>,
+    },
     #[error("Error: {message:?}")]
     CliError { message: String },
     #[error(transparent)]
@@ -102,7 +105,10 @@ impl From<reqwest::Error> for OdlError {
 
 impl From<std::io::Error> for OdlError {
     fn from(e: std::io::Error) -> Self {
-        Self::StdIoError { e }
+        Self::StdIoError {
+            e,
+            extra_info: None,
+        }
     }
 }
 

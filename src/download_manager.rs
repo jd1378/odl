@@ -274,7 +274,13 @@ impl DownloadManager {
                 result
             }
             Err(e) => {
-                return Err(OdlError::StdIoError { e });
+                return Err(OdlError::StdIoError {
+                    e,
+                    extra_info: Some(format!(
+                        "Failed to open lockfile for exclusive locking at {}",
+                        instruction.lockfile_path().display(),
+                    )),
+                });
             }
         }
     }
@@ -481,7 +487,13 @@ impl DownloadManager {
             }
             Err(e) => {
                 if e.kind() != std::io::ErrorKind::NotFound {
-                    return Err(OdlError::StdIoError { e });
+                    return Err(OdlError::StdIoError {
+                        e,
+                        extra_info: Some(format!(
+                            "Failed to read metadata for download at {}",
+                            instruction.metadata_path().display(),
+                        )),
+                    });
                 }
                 instruction.as_metadata()
             }
@@ -599,7 +611,13 @@ impl DownloadManager {
                 let reader = BufReader::new(file);
                 let actual = HashDigest::from_reader(reader, &expected)
                     .await
-                    .map_err(|e| OdlError::StdIoError { e })?;
+                    .map_err(|e| OdlError::StdIoError {
+                        e,
+                        extra_info: Some(format!(
+                            "Failed to open file for calculating checksum at {}",
+                            final_path.display(),
+                        )),
+                    })?;
 
                 if actual != expected {
                     return Err(OdlError::Conflict(ConflictError::ChecksumMismatch {
@@ -795,7 +813,13 @@ impl DownloadManager {
                 if e.kind() == std::io::ErrorKind::NotFound {
                     0
                 } else {
-                    return Err(OdlError::StdIoError { e });
+                    return Err(OdlError::StdIoError {
+                        e,
+                        extra_info: Some(format!(
+                            "Failed to get file size for download part at {}",
+                            part_path.display(),
+                        )),
+                    });
                 }
             }
         };
