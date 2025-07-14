@@ -1458,6 +1458,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-indicatif",
+ "tracing-subscriber",
  "ulid",
 ]
 
