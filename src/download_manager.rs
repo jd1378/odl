@@ -228,6 +228,11 @@ impl DownloadManager {
         let instruction = Self::resolve_save_conflicts(instruction, conflict_resolver).await?;
 
         Span::current().pb_set_message(instruction.filename());
+        if let Some(size) = instruction.size() {
+            Span::current().pb_set_length(size);
+        } else {
+            Span::current().pb_set_length(0);
+        }
 
         return Ok(instruction);
     }
@@ -321,11 +326,6 @@ impl DownloadManager {
         let instruction = self
             .evaluate(url, credentials, save_conflict_resolver)
             .await?;
-        if let Some(size) = instruction.size() {
-            Span::current().pb_set_length(size);
-        } else {
-            Span::current().pb_set_length(0);
-        }
         let result = self.download(instruction, server_conflict_resolver).await;
         drop(permit);
         result
@@ -760,7 +760,7 @@ impl DownloadManager {
             let client: Arc<Client> = Arc::clone(&client);
             let first_push = first_iter.clone();
             first_iter = false;
-
+            let aggregator_span = Span::current();
             let part_span = tracing::info_span!(parent: &Span::current(), "part");
 
             futures.push_back(tokio::spawn(
@@ -790,6 +790,7 @@ impl DownloadManager {
                         &part_details,
                         &part_path,
                         started_callback,
+                        aggregator_span,
                     )
                     .await;
 
@@ -905,6 +906,7 @@ impl DownloadManager {
         part: &PartDetails,
         part_path: &PathBuf,
         started_callback: S,
+        aggregator_span: Span,
     ) -> Result<(), OdlError>
     where
         S: FnOnce() + Send,
@@ -960,14 +962,18 @@ impl DownloadManager {
 
         let mut resp = req.send().await.map_err(OdlError::from)?;
 
-        Span::current().pb_set_length(part.size);
-        Span::current().pb_set_position(current_size);
+        let current_span = Span::current();
+        current_span.pb_set_length(part.size);
+        current_span.pb_set_position(current_size);
+        aggregator_span.pb_inc(current_size);
 
         // Read the first chunk
         match resp.chunk().await.map_err(OdlError::from)? {
             Some(b) => {
                 file.write_all(&b).await?;
-                Span::current().pb_inc(b.len() as u64);
+                let len = b.len() as u64;
+                current_span.pb_inc(len);
+                aggregator_span.pb_inc(len);
                 started_callback(); // Only called once, after first successful chunk
             }
             None => {
@@ -978,7 +984,9 @@ impl DownloadManager {
 
         // Read the rest of the chunks
         while let Some(b) = resp.chunk().await.map_err(OdlError::from)? {
-            Span::current().pb_inc(b.len() as u64);
+            let len = b.len() as u64;
+            current_span.pb_inc(len);
+            aggregator_span.pb_inc(len);
             file.write_all(&b).await?;
         }
 
@@ -1630,9 +1638,17 @@ mod tests {
         // Call download_part
         let url = Url::parse(&format!("{}/partialfile", url)).unwrap();
         let mut started_called = false;
-        DownloadManager::download_part(&client, false, &url, &part_details, &part_path, || {
-            started_called = true;
-        })
+        DownloadManager::download_part(
+            &client,
+            false,
+            &url,
+            &part_details,
+            &part_path,
+            || {
+                started_called = true;
+            },
+            Span::current(),
+        )
         .await?;
 
         // Check file content: should be the full file_content
