@@ -374,7 +374,8 @@ impl DownloadManager {
                     }
                 }
                 SameDownloadExistsResolution::Resume => {
-                    // do nothing and continue
+                    // do nothing and return
+                    return Ok(instruction);
                 }
             }
         }
