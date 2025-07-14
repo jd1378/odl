@@ -145,7 +145,7 @@ impl ResponseInfo {
             .unwrap_or(false)
     }
 
-    /// Parses the "Last-Modified" header from the response into a chrono::DateTime<Utc>.
+    /// Parses the "Last-Modified" header from the response into a unix timestamp.
     ///
     /// Returns None if the header is missing or cannot be parsed.
     pub fn parse_last_modified(&self) -> Option<i64> {
