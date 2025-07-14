@@ -951,6 +951,7 @@ impl DownloadManager {
         let mut resp = req.send().await.map_err(OdlError::from)?;
 
         Span::current().pb_set_length(part.size);
+        Span::current().pb_set_position(current_size);
 
         // Read the first chunk
         match resp.chunk().await.map_err(OdlError::from)? {
