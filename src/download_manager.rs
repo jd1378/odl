@@ -13,7 +13,7 @@ use std::{path::Path, path::PathBuf, sync::Arc, time::Duration};
 use tokio::io::BufWriter;
 use tokio::sync::Semaphore;
 use tokio::{io::AsyncWriteExt, io::BufReader, sync::Mutex};
-use tracing::{Span, instrument};
+use tracing::{Instrument, Span};
 use tracing_indicatif::span_ext::IndicatifSpanExt;
 
 use crate::{
@@ -180,7 +180,6 @@ impl DownloadManager {
         self.accept_invalid_certs = value
     }
 
-    #[instrument(skip(self, conflict_resolver))]
     pub async fn evaluate<CR>(
         self: &Self,
         url: Url,
@@ -190,6 +189,7 @@ impl DownloadManager {
     where
         CR: SaveConflictResolver,
     {
+        Span::current().pb_set_message("Evaluating");
         let client = self.get_client(None)?;
 
         let mut req = client
@@ -227,6 +227,8 @@ impl DownloadManager {
 
         let instruction = Self::resolve_save_conflicts(instruction, conflict_resolver).await?;
 
+        Span::current().pb_set_message(instruction.filename());
+
         return Ok(instruction);
     }
 
@@ -247,7 +249,6 @@ impl DownloadManager {
     }
 
     /// Immediately starts a download using the given instruction and conflict_resolver
-    #[instrument(skip(self, conflict_resolver))]
     pub async fn download<CR>(
         self: &Self,
         instruction: Download,
@@ -320,6 +321,11 @@ impl DownloadManager {
         let instruction = self
             .evaluate(url, credentials, save_conflict_resolver)
             .await?;
+        if let Some(size) = instruction.size() {
+            Span::current().pb_set_length(size);
+        } else {
+            Span::current().pb_set_length(0);
+        }
         let result = self.download(instruction, server_conflict_resolver).await;
         drop(permit);
         result
@@ -755,49 +761,54 @@ impl DownloadManager {
             let first_push = first_iter.clone();
             first_iter = false;
 
-            futures.push_back(tokio::spawn(async move {
-                let _permit = if !first_push {
-                    Some(semaphore.acquire().await?)
-                } else {
-                    None
-                };
-                let started_callback = || {
-                    if first_push {
-                        let metadata = Arc::clone(&metadata);
-                        let semaphore: Arc<Semaphore> = Arc::clone(&semaphore);
-                        tokio::spawn(async move {
-                            let mdata = metadata.lock().await;
-                            if mdata.max_connections - 1 > 0 {
-                                semaphore
-                                    .add_permits(mdata.max_connections.try_into().unwrap_or(1));
-                            }
-                        });
-                    }
-                };
-                let res = Self::download_part(
-                    &client,
-                    randomize_user_agent,
-                    &url,
-                    &part_details,
-                    &part_path,
-                    started_callback,
-                )
-                .await;
+            let part_span = tracing::info_span!(parent: &Span::current(), "part");
 
-                // Mark part as finished and update metadata safely, but as soon as possible
-                if res.is_ok() {
-                    let mut mdata = metadata.lock().await;
-                    if let Some(part) = mdata.parts.get_mut(&ulid) {
-                        part.finished = true;
+            futures.push_back(tokio::spawn(
+                async move {
+                    let _permit = if !first_push {
+                        Some(semaphore.acquire().await?)
                     } else {
-                        return Err(OdlError::MetadataError(MetadataError::Other {
-                            message: format!("Part with ulid {} not found in metadata", ulid),
-                        }));
+                        None
+                    };
+                    let started_callback = || {
+                        if first_push {
+                            let metadata = Arc::clone(&metadata);
+                            let semaphore: Arc<Semaphore> = Arc::clone(&semaphore);
+                            tokio::spawn(async move {
+                                let mdata = metadata.lock().await;
+                                if mdata.max_connections - 1 > 0 {
+                                    semaphore
+                                        .add_permits(mdata.max_connections.try_into().unwrap_or(1));
+                                }
+                            });
+                        }
+                    };
+                    let res = Self::download_part(
+                        &client,
+                        randomize_user_agent,
+                        &url,
+                        &part_details,
+                        &part_path,
+                        started_callback,
+                    )
+                    .await;
+
+                    // Mark part as finished and update metadata safely, but as soon as possible
+                    if res.is_ok() {
+                        let mut mdata = metadata.lock().await;
+                        if let Some(part) = mdata.parts.get_mut(&ulid) {
+                            part.finished = true;
+                        } else {
+                            return Err(OdlError::MetadataError(MetadataError::Other {
+                                message: format!("Part with ulid {} not found in metadata", ulid),
+                            }));
+                        }
                     }
+                    drop(_permit);
+                    res
                 }
-                drop(_permit);
-                res
-            }));
+                .instrument(part_span),
+            ));
         }
 
         // Wait for first future that finishes
@@ -887,7 +898,6 @@ impl DownloadManager {
     }
 
     /// Attempts to download a single part
-    #[instrument(skip(client, started_callback))]
     async fn download_part<S>(
         client: &Client,
         randomize_user_agent: bool,

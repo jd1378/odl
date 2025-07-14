@@ -2,7 +2,7 @@ use std::{path::PathBuf, time::Duration};
 
 use async_trait::async_trait;
 use clap::Parser;
-use indicatif::{ProgressState, ProgressStyle};
+use indicatif::ProgressStyle;
 use odl::{
     Download,
     conflict::{
@@ -17,8 +17,8 @@ use tokio::{self, io::AsyncBufReadExt};
 mod args;
 use args::Args;
 use futures::future::join_all;
-use tracing::instrument;
-use tracing_indicatif::IndicatifLayer;
+use tracing::{Instrument, info_span, instrument};
+use tracing_indicatif::{IndicatifLayer, span_ext::IndicatifSpanExt};
 use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,40 +64,19 @@ impl SaveConflictResolver for CliResolver {
     }
 }
 
-pub const CHARS_FADE_IN: &'static str = "█▓▒░  ";
-pub const TEMPLATE_BAR_WITH_POSITION: &'static str =
-    "{bar:40.blue} {pos:>}/{len} ({percent}%) eta {eta_precise:.blue}";
-
-fn elapsed_subsec(state: &ProgressState, writer: &mut dyn std::fmt::Write) {
-    let seconds = state.elapsed().as_secs();
-    let sub_seconds = (state.elapsed().as_millis() % 1000) / 100;
-    let _ = writer.write_str(&format!("{}.{}s", seconds, sub_seconds));
-}
+pub const PROGRESS_CHARS: &'static str = "█▇▆▅▄▃▂▁";
 
 #[tokio::main]
 async fn main() -> Result<(), OdlError> {
-    let args = Args::parse();
-    let indicatif_layer = IndicatifLayer::new().with_progress_style(
-        ProgressStyle::with_template(
-            "{color_start}{span_child_prefix} {span_name} -- {bar:40.blue} {pos:>}/{len} ({percent}%) eta {eta_precise:.blue}{color_end}",
+    let args: Args = Args::parse();
+    let child_style = ProgressStyle::with_template(
+            "{span_child_prefix}{spinner} {bar:40.cyan/blue} {percent:>3}% {decimal_bytes:<10} / {decimal_total_bytes:<10} {decimal_bytes_per_sec:<10}"
         )
-        .unwrap().with_key(
-            "elapsed_subsec",
-            elapsed_subsec,
-        ).with_key(
-            "color_start",
-            |state: &ProgressState, writer: &mut dyn std::fmt::Write| {
-                if state.elapsed() > Duration::from_secs(6) && state.len().is_some_and(|l| l > 0) && state.pos() == 0 {
-                    let _ = write!(writer, "\x1b[{}m", 3 + 30); 
-                }  
-            },
-        ).with_key(
-            "color_end",
-            |_: &ProgressState, writer: &mut dyn std::fmt::Write| {
-                let _ = write!(writer, "\x1b[0m");
-            },
-        )
-    ).with_span_child_prefix_symbol("↳ ").with_span_child_prefix_indent(" ");
+        .expect("templating progress bar should not fail").progress_chars(PROGRESS_CHARS);
+    let indicatif_layer = IndicatifLayer::new()
+        .with_progress_style(child_style)
+        .with_span_child_prefix_symbol("↳ ")
+        .with_span_child_prefix_indent(" ");
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
@@ -147,8 +126,19 @@ async fn main() -> Result<(), OdlError> {
     }
 
     let mut futures = Vec::new();
-    for url in urls.into_iter() { 
-        let fut = dlm.evaluate_and_download_queued(url, None, &resolver, &resolver);
+    for url in urls.into_iter() {
+        let parent_style = ProgressStyle::with_template(
+            "{spinner} {msg:!40}    {percent:>3}% {decimal_bytes:<10} / {decimal_total_bytes:<10} {decimal_bytes_per_sec:<10} eta {eta_precise} elapsed {elapsed}",
+        )
+        .expect("templating progress bar should not fail");
+        let download_span = info_span!("download", url = %url);
+        download_span.pb_set_style(&parent_style);
+        download_span.pb_set_message("Warming up");
+        download_span.pb_start();
+
+        let fut = dlm
+            .evaluate_and_download_queued(url, None, &resolver, &resolver)
+            .instrument(download_span);
         futures.push(fut);
     }
 
