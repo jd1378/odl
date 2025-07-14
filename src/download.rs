@@ -109,6 +109,10 @@ impl Download {
         self.download_dir.join(Self::METADATA_TEMP_FILENAME)
     }
 
+    pub fn final_file_path(&self) -> path::PathBuf {
+        self.save_dir.join(&self.filename)
+    }
+
     pub fn url(&self) -> &Url {
         &self.url
     }

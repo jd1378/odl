@@ -1,6 +1,9 @@
 use derive_builder::Builder;
 use fs2::FileExt;
-use futures::stream::{FuturesOrdered, StreamExt};
+use futures::{
+    future::join_all,
+    stream::{FuturesOrdered, StreamExt},
+};
 use prost::Message;
 use reqwest::{
     Client, Proxy, Url,
@@ -500,7 +503,59 @@ impl DownloadManager {
             }
         };
 
+        if metadata.finished {
+            let checksum_result: Result<(), OdlError> =
+                Self::check_final_file_checksum(&metadata, instruction, true).await;
+
+            match checksum_result {
+                Ok(_) => {
+                    // no need to do anything
+                }
+                Err(e) => {
+                    if let OdlError::StdIoError { e: io_err, .. } = e {
+                        if io_err.kind() == std::io::ErrorKind::NotFound {
+                            metadata.finished = false;
+                        } else {
+                            return Err(OdlError::StdIoError {
+                                e: io_err,
+                                extra_info: Some(format!(
+                                    "Failed to check final file checksum for {}",
+                                    instruction.final_file_path().display(),
+                                )),
+                            });
+                        }
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
         if !metadata.finished {
+            // Check if all finished parts actually exist on disk, otherwise mark them unfinished
+            let finished_parts: Vec<_> = metadata
+                .parts
+                .iter()
+                .filter(|(_, part)| part.finished)
+                .map(|(_, part)| {
+                    let ulid = part.ulid.clone();
+                    let path = instruction.part_path(&ulid);
+                    async move {
+                        let exists = tokio::fs::try_exists(&path).await.unwrap_or(false);
+                        (ulid, exists)
+                    }
+                })
+                .collect();
+
+            let results = join_all(finished_parts).await;
+            for (ulid, exists) in results {
+                if !exists {
+                    if let Some(part) = metadata.parts.get_mut(&ulid) {
+                        part.finished = false;
+                    }
+                }
+            }
+
             // Do possible corruption checks between new download instructions and the metadata on disk
             let new_checksums = instruction.as_metadata().checksums;
             let mut conflict: Option<ServerConflict> = None;
@@ -571,7 +626,7 @@ impl DownloadManager {
         metadata: &DownloadMetadata,
         instruction: &Download,
     ) -> Result<PathBuf, OdlError> {
-        let final_path = instruction.save_dir().join(&metadata.filename);
+        let final_path = instruction.final_file_path();
         let final_file = tokio::fs::OpenOptions::new()
             .create(true)
             .write(true)
@@ -599,9 +654,46 @@ impl DownloadManager {
             }
         }
 
+        Self::check_final_file_checksum(metadata, instruction, false).await?;
+
+        return Ok(final_path);
+    }
+
+    /// can return OdlError::StdIoError of file not found kind
+    async fn check_final_file_checksum(
+        metadata: &DownloadMetadata,
+        instruction: &Download,
+        remove_if_empty_and_size_unknown: bool,
+    ) -> Result<(), OdlError> {
+        let final_path = instruction.final_file_path();
+        // do a simple size check first anyway, if we know that
+        let actual_size = match tokio::fs::metadata(&final_path).await {
+            Ok(meta) => meta.len(),
+            Err(e) => {
+                return Err(OdlError::StdIoError {
+                    e,
+                    extra_info: Some(format!(
+                        "Failed to get file size for final file at {}",
+                        final_path.display(),
+                    )),
+                });
+            }
+        };
+        if let Some(size) = metadata.size {
+            if actual_size != size {
+                return Err(OdlError::Conflict(ConflictError::ChecksumMismatch {
+                    expected: format!("size={}", size),
+                    actual: format!("size={}", actual_size),
+                }));
+            }
+        } else if remove_if_empty_and_size_unknown && actual_size == 0 {
+            let _ = tokio::fs::remove_file(&final_path).await;
+            return Err(OdlError::Conflict(ConflictError::ChecksumMismatch {
+                expected: "size=unknown".to_string(),
+                actual: "size=0".to_string(),
+            }));
+        }
         if !metadata.checksums.is_empty() {
-            // Drop the mutable reference to final_file so we can re-open it for reading
-            drop(final_file);
             for checksum in &metadata.checksums {
                 let expected = HashDigest::try_from(checksum).map_err(|e| {
                     OdlError::MetadataError(MetadataError::Other {
@@ -628,8 +720,7 @@ impl DownloadManager {
                 }
             }
         }
-
-        return Ok(final_path);
+        Ok(())
     }
 
     /// Attempts to download a list of parts
