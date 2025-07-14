@@ -186,10 +186,7 @@ async fn main() -> Result<(), OdlError> {
     for url in urls.into_iter() {
         let dlm = &dlm;
         let resolver = &resolver;
-        let fut = async move {
-            let instruction = dlm.evaluate(url, None, resolver).await?;
-            dlm.download(instruction, resolver).await
-        };
+        let fut = dlm.evaluate_and_download_queued(url, None, resolver, resolver);
         futures.push(fut);
     }
 

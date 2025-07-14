@@ -39,7 +39,7 @@ use crate::{
 };
 
 #[derive(Builder, Debug)]
-#[builder(build_fn(validate = "Self::validate"))]
+#[builder(build_fn(validate = "Self::validate", private, name = "private_build"))]
 pub struct DownloadManager {
     /// Directory of where to keep files when downloading. This is where we keep track of our downloads.
     #[builder(default = fs_utils::get_odl_dir().unwrap_or_else(|| {
@@ -61,7 +61,7 @@ pub struct DownloadManager {
     /// Note: For controlling how many parts of a single file can be downloaded concurrently,
     /// see the `max_connections` option.
     #[builder(default = 3)]
-    max_concurrent_downloads: u64,
+    max_concurrent_downloads: usize,
 
     /// Number of maximum retries after which a download is considered failed. After third retry it increases exponentially.
     /// For example the time for max_retries=6 and wait_between_retries=500ms will be:
@@ -96,6 +96,10 @@ pub struct DownloadManager {
     /// Should we accept invalid SSL certificates? Do not use unless you are absolutely sure of what you are doing.
     #[builder(default = false)]
     accept_invalid_certs: bool,
+
+    /// Semaphore to limit concurrent downloads (not exposed in builder)
+    #[builder(setter(skip), default = "Arc::new(Semaphore::new(0))")]
+    semaphore: Arc<Semaphore>,
 }
 
 impl DownloadManager {
@@ -107,11 +111,11 @@ impl DownloadManager {
         self.max_connections = if value > 0 { value } else { 1 }
     }
 
-    pub fn max_concurrent_downloads(self: &Self) -> u64 {
+    pub fn max_concurrent_downloads(self: &Self) -> usize {
         return self.max_concurrent_downloads;
     }
 
-    pub fn set_max_concurrent_downloads(self: &mut Self, value: u64) {
+    pub fn set_max_concurrent_downloads(self: &mut Self, value: usize) {
         self.max_concurrent_downloads = if value > 0 { value } else { 1 }
     }
 
@@ -220,6 +224,23 @@ impl DownloadManager {
         return Ok(instruction);
     }
 
+    /// Like `evaluate`, but acquires a permit to respect `max_concurrent_downloads` before evaluating.
+    pub async fn evaluate_queued<CR>(
+        &self,
+        url: Url,
+        credentials: Option<Credentials>,
+        conflict_resolver: &CR,
+    ) -> Result<Download, OdlError>
+    where
+        CR: SaveConflictResolver,
+    {
+        let permit = self.semaphore.acquire().await?;
+        let result = self.evaluate(url, credentials, conflict_resolver).await;
+        drop(permit);
+        result
+    }
+
+    /// Immediately starts a download using the given instruction and conflict_resolver
     pub async fn download<CR>(
         self: &Self,
         instruction: Download,
@@ -252,6 +273,43 @@ impl DownloadManager {
                 return Err(OdlError::StdIoError { e });
             }
         }
+    }
+
+    /// Like `download`, but acquires a permit to respect `max_concurrent_downloads` before downloading.
+    pub async fn download_queued<CR>(
+        self: &Self,
+        instruction: Download,
+        conflict_resolver: &CR,
+    ) -> Result<PathBuf, OdlError>
+    where
+        CR: ServerConflictResolver,
+    {
+        let permit = self.semaphore.acquire().await?;
+        let result = self.download(instruction, conflict_resolver).await;
+        drop(permit);
+        result
+    }
+
+    /// Acquires a permit, evaluates the download, and immediately starts downloading.
+    /// Returns the final file path if successful.
+    pub async fn evaluate_and_download_queued<CR, SR>(
+        &self,
+        url: Url,
+        credentials: Option<Credentials>,
+        save_conflict_resolver: &CR,
+        server_conflict_resolver: &SR,
+    ) -> Result<PathBuf, OdlError>
+    where
+        CR: SaveConflictResolver,
+        SR: ServerConflictResolver,
+    {
+        let permit = self.semaphore.acquire().await?;
+        let instruction = self
+            .evaluate(url, credentials, save_conflict_resolver)
+            .await?;
+        let result = self.download(instruction, server_conflict_resolver).await;
+        drop(permit);
+        result
     }
 
     fn get_client(self: &Self, instructions: Option<&Download>) -> Result<Client, OdlError> {
@@ -826,6 +884,15 @@ impl DownloadManager {
 
 impl DownloadManagerBuilder {
     fn validate(&self) -> Result<(), DownloadManagerBuilderError> {
+        if self.max_concurrent_downloads.is_none()
+            || self
+                .max_concurrent_downloads
+                .is_some_and(|max| max <= 0 || max >= Semaphore::MAX_PERMITS)
+        {
+            return Err(DownloadManagerBuilderError::UninitializedField(
+                "max_concurrent_downloads",
+            ));
+        }
         if let Some(max_connections) = self.max_connections {
             if max_connections == 0 {
                 return Err(DownloadManagerBuilderError::UninitializedField(
@@ -841,6 +908,15 @@ impl DownloadManagerBuilder {
             }
         }
         Ok(())
+    }
+
+    pub fn build(&self) -> Result<DownloadManager, DownloadManagerBuilderError> {
+        let result = self.private_build()?;
+        result.semaphore.add_permits(
+            self.max_concurrent_downloads
+                .expect("max_concurrent_downloads cannot be None at this point"),
+        );
+        Ok(result)
     }
 }
 

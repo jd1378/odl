@@ -25,7 +25,7 @@ pub struct Args {
     /// Note: For controlling how many parts of a single file can be downloaded concurrently,
     /// see the `max_connections` option.
     #[arg(long, default_value_t = 3, value_name = "COUNT")]
-    pub max_concurrent_downloads: u64,
+    pub max_concurrent_downloads: usize,
 
     /// When `input` is a URL, this specifies the output file path.
     /// When `input` is a file containing URLs, this specifies the output directory for downloaded files.
