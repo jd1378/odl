@@ -16,4 +16,5 @@ pub mod proto {
     mod download_metadata_ext;
 }
 
+pub use download::Download;
 pub use proto::download_metadata;
