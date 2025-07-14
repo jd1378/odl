@@ -37,6 +37,8 @@ rand = "0.9.1"
 tracing = "0.1.41"
 async-trait = "0.1.88"
 percent-encoding = "2.3.1"
+indicatif = "0.18.0"
+tracing-indicatif = "0.3.11"
 
 [dev-dependencies]
 reqwest = { version = "0.12.19", default-features = false, features = ["http2", "gzip", "brotli", "native-tls", "socks", "stream", "blocking"] }

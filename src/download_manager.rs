@@ -10,6 +10,8 @@ use std::{path::Path, path::PathBuf, sync::Arc, time::Duration};
 use tokio::io::BufWriter;
 use tokio::sync::Semaphore;
 use tokio::{io::AsyncWriteExt, io::BufReader, sync::Mutex};
+use tracing::{Span, instrument};
+use tracing_indicatif::span_ext::IndicatifSpanExt;
 
 use crate::{
     conflict::SameDownloadExistsResolution, download_metadata::FileChecksum, hash::HashDigest,
@@ -175,6 +177,7 @@ impl DownloadManager {
         self.accept_invalid_certs = value
     }
 
+    #[instrument(skip(self, conflict_resolver))]
     pub async fn evaluate<CR>(
         self: &Self,
         url: Url,
@@ -241,6 +244,7 @@ impl DownloadManager {
     }
 
     /// Immediately starts a download using the given instruction and conflict_resolver
+    #[instrument(skip(self, conflict_resolver))]
     pub async fn download<CR>(
         self: &Self,
         instruction: Download,
@@ -647,8 +651,6 @@ impl DownloadManager {
                 } else {
                     None
                 };
-                // Dummy progress callback, replace as needed
-                let progress_callback = |_downloaded: u64| {};
                 let started_callback = || {
                     if first_push {
                         let metadata = Arc::clone(&metadata);
@@ -666,10 +668,9 @@ impl DownloadManager {
                     &client,
                     randomize_user_agent,
                     &url,
-                    Some(&part_details),
+                    &part_details,
                     &part_path,
                     started_callback,
-                    progress_callback,
                 )
                 .await;
 
@@ -776,18 +777,17 @@ impl DownloadManager {
     }
 
     /// Attempts to download a single part
-    async fn download_part<S, F>(
+    #[instrument(skip(client, started_callback))]
+    async fn download_part<S>(
         client: &Client,
         randomize_user_agent: bool,
         url: &Url,
-        part_details: Option<&PartDetails>,
+        part: &PartDetails,
         part_path: &PathBuf,
         started_callback: S,
-        mut progress_callback: F,
     ) -> Result<(), OdlError>
     where
         S: FnOnce() + Send,
-        F: FnMut(u64) + Send,
     {
         let current_size = match tokio::fs::metadata(part_path).await {
             Ok(meta) => meta.len(),
@@ -808,43 +808,39 @@ impl DownloadManager {
             .await?;
 
         // If file already fully downloaded, skip
-        if let Some(part) = part_details {
-            if current_size >= part.size {
-                return Ok(());
-            }
+        if current_size >= part.size {
+            return Ok(());
         }
 
         let mut file = BufWriter::new(file);
 
         let mut req = client.get(url.clone());
-        if let Some(part) = part_details {
-            let range_header = format!(
-                "bytes={}-{}",
-                part.offset + current_size,
-                part.offset + part.size - 1
-            );
-            req = req.header(
-                RANGE,
-                HeaderValue::from_str(&range_header).map_err(|e| OdlError::Other {
-                    message: "Internal Error: Invalid header value was used at download_part"
-                        .to_string(),
-                    origin: Box::new(e),
-                })?,
-            );
-        }
+        let range_header = format!(
+            "bytes={}-{}",
+            part.offset + current_size,
+            part.offset + part.size - 1
+        );
+        req = req.header(
+            RANGE,
+            HeaderValue::from_str(&range_header).map_err(|e| OdlError::Other {
+                message: "Internal Error: Invalid header value was used at download_part"
+                    .to_string(),
+                origin: Box::new(e),
+            })?,
+        );
         if randomize_user_agent {
             req = req.header(USER_AGENT, random_user_agent())
         }
 
         let mut resp = req.send().await.map_err(OdlError::from)?;
 
-        let mut downloaded: u64 = 0;
+        Span::current().pb_set_length(part.size);
+
         // Read the first chunk
         match resp.chunk().await.map_err(OdlError::from)? {
             Some(b) => {
-                downloaded += b.len() as u64;
                 file.write_all(&b).await?;
-                progress_callback(downloaded);
+                Span::current().pb_inc(b.len() as u64);
                 started_callback(); // Only called once, after first successful chunk
             }
             None => {
@@ -855,9 +851,8 @@ impl DownloadManager {
 
         // Read the rest of the chunks
         while let Some(b) = resp.chunk().await.map_err(OdlError::from)? {
-            downloaded += b.len() as u64;
+            Span::current().pb_inc(b.len() as u64);
             file.write_all(&b).await?;
-            progress_callback(downloaded);
         }
 
         file.flush().await?;
@@ -884,10 +879,9 @@ impl DownloadManager {
 
 impl DownloadManagerBuilder {
     fn validate(&self) -> Result<(), DownloadManagerBuilderError> {
-        if self.max_concurrent_downloads.is_none()
-            || self
-                .max_concurrent_downloads
-                .is_some_and(|max| max <= 0 || max >= Semaphore::MAX_PERMITS)
+        if self
+            .max_concurrent_downloads
+            .is_some_and(|max| max <= 0 || max >= Semaphore::MAX_PERMITS)
         {
             return Err(DownloadManagerBuilderError::UninitializedField(
                 "max_concurrent_downloads",
@@ -912,10 +906,9 @@ impl DownloadManagerBuilder {
 
     pub fn build(&self) -> Result<DownloadManager, DownloadManagerBuilderError> {
         let result = self.private_build()?;
-        result.semaphore.add_permits(
-            self.max_concurrent_downloads
-                .expect("max_concurrent_downloads cannot be None at this point"),
-        );
+        result
+            .semaphore
+            .add_permits(self.max_concurrent_downloads.unwrap_or(3));
         Ok(result)
     }
 }
@@ -1510,20 +1503,9 @@ mod tests {
         // Call download_part
         let url = Url::parse(&format!("{}/partialfile", url)).unwrap();
         let mut started_called = false;
-        let mut progress_called = false;
-        DownloadManager::download_part(
-            &client,
-            false,
-            &url,
-            Some(&part_details),
-            &part_path,
-            || {
-                started_called = true;
-            },
-            |_downloaded| {
-                progress_called = true;
-            },
-        )
+        DownloadManager::download_part(&client, false, &url, &part_details, &part_path, || {
+            started_called = true;
+        })
         .await?;
 
         // Check file content: should be the full file_content
@@ -1533,7 +1515,6 @@ mod tests {
         // Ensure mock was hit
         get_mock.assert_async().await;
         assert!(started_called, "started_callback should be called");
-        assert!(progress_called, "progress_callback should be called");
 
         Ok(())
     }
