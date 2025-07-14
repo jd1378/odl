@@ -54,10 +54,6 @@ pub enum OdlError {
     UrlDecodeError { message: String },
     #[error("Standard I/O error: {e:?}")]
     StdIoError { e: std::io::Error },
-    #[error("Task error: {e:?}")]
-    TaskError { e: JoinError },
-    #[error("Channel error: {e:?}")]
-    ChannelError { e: async_channel::RecvError },
     #[error("Error: {message:?}")]
     CliError { message: String },
     #[error(transparent)]
@@ -112,13 +108,10 @@ impl From<std::io::Error> for OdlError {
 
 impl From<JoinError> for OdlError {
     fn from(e: JoinError) -> Self {
-        Self::TaskError { e }
-    }
-}
-
-impl From<async_channel::RecvError> for OdlError {
-    fn from(e: async_channel::RecvError) -> Self {
-        Self::ChannelError { e }
+        Self::Other {
+            message: e.to_string(),
+            origin: Box::new(e),
+        }
     }
 }
 
