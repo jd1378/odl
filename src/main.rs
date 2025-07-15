@@ -1,4 +1,4 @@
-use std::{path::PathBuf, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use clap::Parser;
@@ -101,7 +101,21 @@ async fn main() -> Result<(), OdlError> {
         download_type = DownloadType::File(Box::new(path));
     }
 
-    let resolver = CliResolver { force: args.force };
+    let mut user_provided_filename: Option<String> = None;
+    let save_dir: PathBuf = if let Some(path) = args.output {
+        if let DownloadType::Url(_) = &download_type {
+            user_provided_filename = path
+                .file_name()
+                .map(|os_str| os_str.to_string_lossy().into_owned());
+            path.parent()
+                .expect("Failed to get output's parent directory")
+                .to_path_buf()
+        } else {
+            path
+        }
+    } else {
+        std::env::current_dir()?
+    };
 
     // todo: stream file, as processing a large file in advance is not a good idea
     let mut urls = Vec::new();
@@ -142,19 +156,38 @@ async fn main() -> Result<(), OdlError> {
                 let _ = write!(writer, "┌");
             }
         });
+
+    let dlm = Arc::new(dlm);
+
     for url in urls.into_iter() {
         let download_span = info_span!("download", url = %url);
         download_span.pb_set_style(&parent_style);
         download_span.pb_set_message("Warming up");
         download_span.pb_start();
+        let dlm = Arc::clone(&dlm);
+        let resolver = CliResolver { force: args.force };
+        let save_dir = save_dir.clone();
+        let user_provided_filename = user_provided_filename.clone();
 
-        let fut = dlm
-            .evaluate_and_download_queued(url, None, &resolver, &resolver)
-            .instrument(download_span);
-        futures.push(fut);
+        futures.push(
+            async move {
+                let permit = dlm
+                    .acquire_download_permit()
+                    .await
+                    .expect("didn't expect the semaphore to close at this point");
+                let mut instruction = dlm.evaluate(url, save_dir, None, &resolver).await?;
+                if let Some(filename) = user_provided_filename {
+                    instruction.set_filename(filename);
+                }
+                let result = dlm.download(instruction, &resolver).await;
+                drop(permit);
+                result
+            }
+            .instrument(download_span),
+        );
     }
 
-    let results: Vec<Result<_, OdlError>> = join_all(futures).await;
+    let results: Vec<Result<PathBuf, OdlError>> = join_all(futures).await;
     for res in results {
         if let Err(e) = res {
             eprintln!("Error: {}", e);
@@ -282,8 +315,16 @@ impl SaveConflictResolver for ForcedResolver {
 #[instrument(skip(dlm), name = "Downloading remote file containing links")]
 async fn download_remote_file(dlm: &DownloadManager, url: Url) -> Result<PathBuf, OdlError> {
     let resolver = ForcedResolver {};
+    // Create a temporary directory in the OS temp dir for saving the remote file
+    let tmpdir = tempfile::Builder::new()
+        .prefix("odl")
+        .tempdir()
+        .map_err(|e| OdlError::CliError {
+            message: format!("Failed to create temp dir: {e}"),
+        })?;
+    let save_dir = tmpdir.path().to_path_buf();
 
-    let instruction = dlm.evaluate(url, None, &resolver).await?;
+    let instruction = dlm.evaluate(url, save_dir, None, &resolver).await?;
 
     dlm.download(instruction, &resolver).await
 }

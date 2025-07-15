@@ -9,10 +9,10 @@ use reqwest::{
     Client, Proxy, Url,
     header::{HeaderMap, HeaderValue, RANGE, USER_AGENT},
 };
-use std::{path::Path, path::PathBuf, sync::Arc, time::Duration};
-use tokio::io::BufWriter;
-use tokio::sync::Semaphore;
+use std::{path::PathBuf, sync::Arc, time::Duration};
+use tokio::sync::{AcquireError, Semaphore};
 use tokio::{io::AsyncWriteExt, io::BufReader, sync::Mutex};
+use tokio::{io::BufWriter, sync::SemaphorePermit};
 use tracing::{Instrument, Span};
 use tracing_indicatif::span_ext::IndicatifSpanExt;
 
@@ -183,6 +183,7 @@ impl DownloadManager {
     pub async fn evaluate<CR>(
         self: &Self,
         url: Url,
+        save_dir: PathBuf,
         credentials: Option<Credentials>,
         conflict_resolver: &CR,
     ) -> Result<Download, OdlError>
@@ -214,11 +215,9 @@ impl DownloadManager {
 
         let resp = req.send().await?;
         let info = ResponseInfo::from(resp);
-        // TODO: fix save_dir based on detected file type category
-        let cwd = std::env::current_dir()?;
         let instruction = Download::from_response_info(
             &self.download_dir,
-            cwd,
+            save_dir,
             info,
             self.max_connections,
             self.use_server_time,
@@ -237,22 +236,6 @@ impl DownloadManager {
         }
 
         return Ok(instruction);
-    }
-
-    /// Like `evaluate`, but acquires a permit to respect `max_concurrent_downloads` before evaluating.
-    pub async fn evaluate_queued<CR>(
-        &self,
-        url: Url,
-        credentials: Option<Credentials>,
-        conflict_resolver: &CR,
-    ) -> Result<Download, OdlError>
-    where
-        CR: SaveConflictResolver,
-    {
-        let permit = self.semaphore.acquire().await?;
-        let result = self.evaluate(url, credentials, conflict_resolver).await;
-        drop(permit);
-        result
     }
 
     /// Immediately starts a download using the given instruction and conflict_resolver
@@ -296,41 +279,9 @@ impl DownloadManager {
         }
     }
 
-    /// Like `download`, but acquires a permit to respect `max_concurrent_downloads` before downloading.
-    pub async fn download_queued<CR>(
-        self: &Self,
-        instruction: Download,
-        conflict_resolver: &CR,
-    ) -> Result<PathBuf, OdlError>
-    where
-        CR: ServerConflictResolver,
-    {
-        let permit = self.semaphore.acquire().await?;
-        let result = self.download(instruction, conflict_resolver).await;
-        drop(permit);
-        result
-    }
-
-    /// Acquires a permit, evaluates the download, and immediately starts downloading.
-    /// Returns the final file path if successful.
-    pub async fn evaluate_and_download_queued<CR, SR>(
-        &self,
-        url: Url,
-        credentials: Option<Credentials>,
-        save_conflict_resolver: &CR,
-        server_conflict_resolver: &SR,
-    ) -> Result<PathBuf, OdlError>
-    where
-        CR: SaveConflictResolver,
-        SR: ServerConflictResolver,
-    {
-        let permit = self.semaphore.acquire().await?;
-        let instruction = self
-            .evaluate(url, credentials, save_conflict_resolver)
-            .await?;
-        let result = self.download(instruction, server_conflict_resolver).await;
-        drop(permit);
-        result
+    /// acquire a permit from this download manager's semaphore. Only up to `max_concurrent_downloads` are permitted at the same time.
+    pub async fn acquire_download_permit(&self) -> Result<SemaphorePermit<'_>, AcquireError> {
+        self.semaphore.acquire().await
     }
 
     fn get_client(self: &Self, instructions: Option<&Download>) -> Result<Client, OdlError> {
@@ -1184,6 +1135,7 @@ mod tests {
         let instruction = dlm
             .evaluate(
                 Url::parse(&format!("{}/testfile", url)).unwrap(),
+                tmp_save_dir.path().to_path_buf(),
                 None,
                 &save_resolver,
             )
@@ -1192,7 +1144,6 @@ mod tests {
         // Patch the instruction to simulate 2 parts
         let instruction = DownloadBuilder::default()
             .download_dir(instruction.download_dir().clone())
-            .save_dir(tmp_save_dir.path().to_path_buf())
             .filename(instruction.filename().to_string())
             .url(instruction.url().clone())
             .size(Some(file_content.len() as u64))
@@ -1287,6 +1238,7 @@ mod tests {
         let instruction = dlm
             .evaluate(
                 Url::parse(&format!("{}/singlefile", url)).unwrap(),
+                tmp_save_dir.path().to_path_buf(),
                 None,
                 &save_resolver,
             )
@@ -1294,7 +1246,6 @@ mod tests {
         // Patch the instruction to simulate 1 part
         let instruction = DownloadBuilder::default()
             .download_dir(instruction.download_dir().clone())
-            .save_dir(tmp_save_dir.path().to_path_buf())
             .filename(instruction.filename().to_string())
             .url(instruction.url().clone())
             .size(Some(file_content.len() as u64))
@@ -1365,6 +1316,7 @@ mod tests {
         let instruction = dlm
             .evaluate(
                 Url::parse(&format!("{}/nonresumablefile", url)).unwrap(),
+                tmp_save_dir.path().to_path_buf(),
                 None,
                 &save_resolver,
             )
@@ -1373,7 +1325,6 @@ mod tests {
         // Patch the instruction to simulate 2 parts, but not resumable
         let instruction = DownloadBuilder::default()
             .download_dir(instruction.download_dir().clone())
-            .save_dir(tmp_save_dir.path().to_path_buf())
             .filename(instruction.filename().to_string())
             .url(instruction.url().clone())
             .size(Some(file_content.len() as u64))
@@ -1480,6 +1431,7 @@ mod tests {
         let instruction = dlm
             .evaluate(
                 Url::parse(&format!("{}/nonresumablefile_restart", url)).unwrap(),
+                tmp_save_dir.path().to_path_buf(),
                 None,
                 &save_resolver,
             )
@@ -1488,7 +1440,6 @@ mod tests {
         // Patch the instruction to simulate 2 parts, but not resumable
         let instruction = DownloadBuilder::default()
             .download_dir(instruction.download_dir().clone())
-            .save_dir(tmp_save_dir.path().to_path_buf())
             .filename(instruction.filename().to_string())
             .url(instruction.url().clone())
             .size(Some(file_content.len() as u64))
@@ -1582,6 +1533,7 @@ mod tests {
         let instruction = dlm
             .evaluate(
                 Url::parse(&format!("{}/zerofile", url)).unwrap(),
+                tmp_save_dir.path().to_path_buf(),
                 None,
                 &save_resolver,
             )
@@ -1590,7 +1542,6 @@ mod tests {
         // Patch the instruction to simulate 1 part of 0 bytes
         let instruction = DownloadBuilder::default()
             .download_dir(instruction.download_dir().clone())
-            .save_dir(tmp_save_dir.path().to_path_buf())
             .filename(instruction.filename().to_string())
             .url(instruction.url().clone())
             .size(Some(0))
@@ -1752,6 +1703,7 @@ mod tests {
         let instruction = dlm
             .evaluate(
                 Url::parse(&format!("{}/useragentfile", url)).unwrap(),
+                tmp_save_dir.path().to_path_buf(),
                 None,
                 &save_resolver,
             )
@@ -1760,7 +1712,6 @@ mod tests {
         // Patch the instruction to simulate 1 part
         let instruction = DownloadBuilder::default()
             .download_dir(instruction.download_dir().clone())
-            .save_dir(tmp_save_dir.path().to_path_buf())
             .filename(instruction.filename().to_string())
             .url(instruction.url().clone())
             .size(Some(file_content.len() as u64))
@@ -1842,6 +1793,7 @@ mod tests {
         let instruction = dlm
             .evaluate(
                 Url::parse(&format!("{}/randomua", url)).unwrap(),
+                tmp_save_dir.path().to_path_buf(),
                 None,
                 &save_resolver,
             )
@@ -1850,7 +1802,6 @@ mod tests {
         // Patch the instruction to simulate 1 part
         let instruction = DownloadBuilder::default()
             .download_dir(instruction.download_dir().clone())
-            .save_dir(tmp_save_dir.path().to_path_buf())
             .filename(instruction.filename().to_string())
             .url(instruction.url().clone())
             .size(Some(file_content.len() as u64))
