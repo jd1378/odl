@@ -215,9 +215,10 @@ impl DownloadManager {
         let resp = req.send().await?;
         let info = ResponseInfo::from(resp);
         // TODO: fix save_dir based on detected file type category
+        let cwd = std::env::current_dir()?;
         let instruction = Download::from_response_info(
             &self.download_dir,
-            Path::new("./").to_path_buf(),
+            cwd,
             info,
             self.max_connections,
             self.use_server_time,
@@ -531,6 +532,8 @@ impl DownloadManager {
                                 )),
                             });
                         }
+                    } else if let OdlError::Conflict(ConflictError::ChecksumMismatch { .. }) = e {
+                        metadata.finished = false;
                     } else {
                         return Err(e);
                     }
@@ -913,13 +916,24 @@ impl DownloadManager {
                 .await?;
                 metadata = mdata;
             }
+
+            let final_path = Self::assemble_final_file(&mut metadata, &instruction).await?;
+            Self::remove_all_parts(&instruction.download_dir()).await;
+            Ok(final_path)
+        } else {
+            let final_path = instruction.final_file_path();
+            if tokio::fs::try_exists(&final_path).await.unwrap_or(false) {
+                Ok(final_path)
+            } else {
+                Err(OdlError::StdIoError {
+                    e: std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("Expected final file not found at {}", final_path.display()),
+                    ),
+                    extra_info: None,
+                })
+            }
         }
-
-        let final_path = Self::assemble_final_file(&mut metadata, &instruction).await?;
-
-        Self::remove_all_parts(&instruction.download_dir()).await;
-
-        Ok(final_path)
     }
 
     /// Attempts to download a single part
