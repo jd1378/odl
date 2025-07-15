@@ -9,6 +9,7 @@ use odl::{
         FileChangedResolution, FinalFileExistsResolution, NotResumableResolution,
         SameDownloadExistsResolution, SaveConflictResolver, ServerConflictResolver,
     },
+    credentials::Credentials,
     download_manager::{DownloadManager, DownloadManagerBuilder},
     error::OdlError,
 };
@@ -69,6 +70,7 @@ pub const PROGRESS_CHARS: &'static str = "█▇▆▅▄▃▂▁";
 #[tokio::main]
 async fn main() -> Result<(), OdlError> {
     let args: Args = Args::parse();
+
     let child_style = ProgressStyle::with_template(
             "{span_child_prefix}{spinner} {bar:40.cyan/blue} {percent:>3}%  {decimal_bytes:<10} / {decimal_total_bytes:<10} {decimal_bytes_per_sec:<12}"
         )
@@ -158,6 +160,11 @@ async fn main() -> Result<(), OdlError> {
         });
 
     let dlm = Arc::new(dlm);
+    let credentials = if let Some(user) = args.http_user.as_deref() {
+        Some(Credentials::new(user, args.http_password.as_deref()))
+    } else {
+        None
+    };
 
     for url in urls.into_iter() {
         let download_span = info_span!("download", url = %url);
@@ -168,6 +175,7 @@ async fn main() -> Result<(), OdlError> {
         let resolver = CliResolver { force: args.force };
         let save_dir = save_dir.clone();
         let user_provided_filename = user_provided_filename.clone();
+        let credentials = credentials.clone();
 
         futures.push(
             async move {
@@ -175,7 +183,7 @@ async fn main() -> Result<(), OdlError> {
                     .acquire_download_permit()
                     .await
                     .expect("didn't expect the semaphore to close at this point");
-                let mut instruction = dlm.evaluate(url, save_dir, None, &resolver).await?;
+                let mut instruction = dlm.evaluate(url, save_dir, credentials, &resolver).await?;
                 if let Some(filename) = user_provided_filename {
                     instruction.set_filename(filename);
                 }

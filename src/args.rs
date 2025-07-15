@@ -73,4 +73,12 @@ pub struct Args {
     /// Default behavior is to abort on any kind of conflict.
     #[arg(short, long, default_value_t = false)]
     pub force: bool,
+
+    /// HTTP basic authentication username.
+    #[arg(long, value_name = "USER")]
+    pub http_user: Option<String>,
+
+    /// HTTP basic authentication password.
+    #[arg(long, value_name = "PASSWORD")]
+    pub http_password: Option<String>,
 }
