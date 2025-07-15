@@ -2,7 +2,7 @@ use std::{path::PathBuf, time::Duration};
 
 use async_trait::async_trait;
 use clap::Parser;
-use indicatif::ProgressStyle;
+use indicatif::{ProgressState, ProgressStyle};
 use odl::{
     Download,
     conflict::{
@@ -18,7 +18,7 @@ mod args;
 use args::Args;
 use futures::future::join_all;
 use tracing::{Instrument, info_span, instrument};
-use tracing_indicatif::{IndicatifLayer, span_ext::IndicatifSpanExt};
+use tracing_indicatif::{IndicatifLayer, TickSettings, span_ext::IndicatifSpanExt};
 use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,13 +70,19 @@ pub const PROGRESS_CHARS: &'static str = "█▇▆▅▄▃▂▁";
 async fn main() -> Result<(), OdlError> {
     let args: Args = Args::parse();
     let child_style = ProgressStyle::with_template(
-            "{span_child_prefix}{spinner} {bar:40.cyan/blue} {percent:>3}% {decimal_bytes:<10} / {decimal_total_bytes:<10} {decimal_bytes_per_sec:<10}"
+            "{span_child_prefix}{spinner} {bar:40.cyan/blue} {percent:>3}%  {decimal_bytes:<10} / {decimal_total_bytes:<10} {decimal_bytes_per_sec:<12}"
         )
         .expect("templating progress bar should not fail").progress_chars(PROGRESS_CHARS);
     let indicatif_layer = IndicatifLayer::new()
         .with_progress_style(child_style)
+        .with_tick_settings(TickSettings {
+            term_draw_hz: 10,
+            default_tick_interval: None,
+            footer_tick_interval: None,
+            ..Default::default()
+        })
         .with_span_child_prefix_symbol("↳ ")
-        .with_span_child_prefix_indent(" ");
+        .with_span_child_prefix_indent("  ");
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
@@ -126,11 +132,17 @@ async fn main() -> Result<(), OdlError> {
     }
 
     let mut futures = Vec::new();
+    let parent_style = ProgressStyle::with_template(
+        "{spinner} {maybe_connect} {msg:!40}   {percent:>3}%  {decimal_bytes:<10} / {decimal_total_bytes:<10} {decimal_bytes_per_sec:<12} eta {eta_precise} elapsed {elapsed}",
+    )
+    .expect("templating progress bar should not fail").with_key("maybe_connect", |state: &ProgressState, writer: &mut dyn std::fmt::Write| {
+            if state.len().is_none() || state.len().is_some_and(|x| x == 0) {
+                let _ = write!(writer, "━");
+            } else {
+                let _ = write!(writer, "┌");
+            }
+        });
     for url in urls.into_iter() {
-        let parent_style = ProgressStyle::with_template(
-            "{spinner} {msg:!40}    {percent:>3}% {decimal_bytes:<10} / {decimal_total_bytes:<10} {decimal_bytes_per_sec:<10} eta {eta_precise} elapsed {elapsed}",
-        )
-        .expect("templating progress bar should not fail");
         let download_span = info_span!("download", url = %url);
         download_span.pb_set_style(&parent_style);
         download_span.pb_set_message("Warming up");

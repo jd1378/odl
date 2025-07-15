@@ -189,7 +189,8 @@ impl DownloadManager {
     where
         CR: SaveConflictResolver,
     {
-        Span::current().pb_set_message("Evaluating");
+        let current_span = Span::current();
+        current_span.pb_set_message("Evaluating");
         let client = self.get_client(None)?;
 
         let mut req = client
@@ -227,11 +228,11 @@ impl DownloadManager {
 
         let instruction = Self::resolve_save_conflicts(instruction, conflict_resolver).await?;
 
-        Span::current().pb_set_message(instruction.filename());
+        current_span.pb_set_message(instruction.filename());
         if let Some(size) = instruction.size() {
-            Span::current().pb_set_length(size);
+            current_span.pb_set_length(size);
         } else {
-            Span::current().pb_set_length(0);
+            current_span.pb_set_length(0);
         }
 
         return Ok(instruction);
@@ -761,7 +762,7 @@ impl DownloadManager {
             let first_push = first_iter.clone();
             first_iter = false;
             let aggregator_span = Span::current();
-            let part_span = tracing::info_span!(parent: &Span::current(), "part");
+            let part_span = tracing::info_span!("part");
 
             futures.push_back(tokio::spawn(
                 async move {
@@ -831,6 +832,23 @@ impl DownloadManager {
         Ok(())
     }
 
+    /// Sums the sizes of all part files on disk for a given instruction and metadata.
+    /// Returns None if metadata.size is None, otherwise returns the total size in bytes.
+    async fn sum_parts_on_disk(instruction: &Download, metadata: &DownloadMetadata) -> Option<u64> {
+        metadata.size?;
+        let part_futures = metadata.parts.values().map(|part| {
+            let part_path = instruction.part_path(&part.ulid);
+            async move {
+                match tokio::fs::metadata(&part_path).await {
+                    Ok(meta) => meta.len(),
+                    Err(_) => 0,
+                }
+            }
+        });
+        let sizes = futures::future::join_all(part_futures).await;
+        Some(sizes.into_iter().sum())
+    }
+
     async fn process_download<CR>(
         self: &Self,
         instruction: Download,
@@ -845,6 +863,12 @@ impl DownloadManager {
         Self::recover_metadata(&instruction).await?;
 
         let mut metadata = Self::resolve_server_conflicts(&instruction, conflict_resolver).await?;
+
+        if let Some(sum_of_parts_sizes) = Self::sum_parts_on_disk(&instruction, &metadata).await {
+            let current_span = Span::current();
+            current_span.pb_set_position(sum_of_parts_sizes);
+            current_span.pb_reset_eta();
+        }
 
         // we skip over download parts if we already finished downloading
         if !metadata.finished {
@@ -911,6 +935,9 @@ impl DownloadManager {
     where
         S: FnOnce() + Send,
     {
+        let current_span = Span::current();
+        current_span.pb_set_length(part.size);
+
         let current_size = match tokio::fs::metadata(part_path).await {
             Ok(meta) => meta.len(),
             Err(e) => {
@@ -927,6 +954,9 @@ impl DownloadManager {
                 }
             }
         };
+
+        current_span.pb_set_position(current_size);
+        current_span.pb_reset_eta();
 
         // we want to create the file anyway, it may be 0 bytes.
         let file = tokio::fs::OpenOptions::new()
@@ -961,11 +991,6 @@ impl DownloadManager {
         }
 
         let mut resp = req.send().await.map_err(OdlError::from)?;
-
-        let current_span = Span::current();
-        current_span.pb_set_length(part.size);
-        current_span.pb_set_position(current_size);
-        aggregator_span.pb_inc(current_size);
 
         // Read the first chunk
         match resp.chunk().await.map_err(OdlError::from)? {

@@ -1457,7 +1457,7 @@ dependencies = [
  "thiserror 2.0.12",
  "tokio",
  "tracing",
- "tracing-indicatif",
+ "tracing-indicatif-patched",
  "tracing-subscriber",
  "ulid",
 ]
@@ -2477,10 +2477,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "tracing-indicatif"
-version = "0.3.11"
+name = "tracing-indicatif-patched"
+version = "0.3.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8c714cc8fc46db04fcfddbd274c6ef59bebb1b435155984e7c6e89c3ce66f200"
+checksum = "761e097b1b746e910a8103f880d8025175ccacece315583068896c49663b8c50"
 dependencies = [
  "indicatif",
  "tracing",
