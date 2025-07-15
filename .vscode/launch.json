@@ -1,0 +1,66 @@
+{
+  // Use IntelliSense to learn about possible attributes.
+  // Hover to view descriptions of existing attributes.
+  // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug unit tests in library 'odl'",
+      "cargo": {
+        "args": [
+          "test",
+          "--no-run",
+          "--lib",
+          "--package=odl"
+        ],
+        "filter": {
+          "name": "odl",
+          "kind": "lib"
+        }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug executable 'odl'",
+      "cargo": {
+        "args": [
+          "build",
+          "--bin=odl",
+          "--package=odl"
+        ],
+        "filter": {
+          "name": "odl",
+          "kind": "bin"
+        }
+      },
+      "args": [
+        "http://ipv4.download.thinkbroadband.com/50MB.zip"
+      ],
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug unit tests in executable 'odl'",
+      "cargo": {
+        "args": [
+          "test",
+          "--no-run",
+          "--bin=odl",
+          "--package=odl"
+        ],
+        "filter": {
+          "name": "odl",
+          "kind": "bin"
+        }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}"
+    }
+  ]
+}
