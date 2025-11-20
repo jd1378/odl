@@ -1,46 +1,42 @@
+mod checksum;
+mod io;
+mod recover_metadata;
+mod save_conflict;
+mod server_conflict;
+
+use std::{path::PathBuf, sync::Arc, time::Duration};
+
 use derive_builder::Builder;
 use fs2::FileExt;
-use futures::{
-    future::join_all,
-    stream::{FuturesOrdered, StreamExt},
-};
 use prost::Message;
 use reqwest::{
     Client, Proxy, Url,
     header::{HeaderMap, HeaderValue, RANGE, USER_AGENT},
 };
-use std::{path::PathBuf, sync::Arc, time::Duration};
+
+use futures::stream::{FuturesOrdered, StreamExt};
+
 use tokio::sync::{AcquireError, Semaphore};
-use tokio::{io::AsyncWriteExt, io::BufReader, sync::Mutex};
+use tokio::{io::AsyncWriteExt, sync::Mutex};
 use tokio::{io::BufWriter, sync::SemaphorePermit};
 use tracing::{Instrument, Span};
 use tracing_indicatif::span_ext::IndicatifSpanExt;
 
-use crate::{
-    conflict::SameDownloadExistsResolution, download_metadata::FileChecksum, hash::HashDigest,
-};
-use crate::{
-    conflict::{FileChangedResolution, NotResumableResolution},
-    response_info::ResponseInfo,
-};
-use crate::{
-    conflict::{SaveConflict, ServerConflict},
-    download::Download,
-    download_metadata::{DownloadMetadata, PartDetails},
-    error::OdlError,
-    fs_utils::{
-        self, IsUnique, atomic_write, is_filename_unique, read_delimited_message_from_path,
-    },
-    retry_policies::{FixedRetry, FixedThenExponentialRetry},
-};
+use crate::download_manager::recover_metadata::recover_metadata;
+use crate::download_manager::{io::assemble_final_file, server_conflict::resolve_server_conflicts};
+use crate::download_manager::{io::remove_all_parts, save_conflict::resolve_save_conflicts};
+use crate::error::MetadataError;
+use crate::response_info::ResponseInfo;
 use crate::{
     conflict::{SaveConflictResolver, ServerConflictResolver},
-    error::ConflictError,
+    download_manager::io::sum_parts_on_disk,
 };
 use crate::{credentials::Credentials, user_agents::random_user_agent};
 use crate::{
-    error::MetadataError,
-    fs_utils::{atomic_replace, set_file_mtime_async},
+    download::Download,
+    download_metadata::{DownloadMetadata, PartDetails},
+    error::OdlError,
+    fs_utils::{self, atomic_write},
 };
 
 #[derive(Builder, Debug)]
@@ -226,7 +222,7 @@ impl DownloadManager {
             self.headers.clone(),
         );
 
-        let instruction = Self::resolve_save_conflicts(instruction, conflict_resolver).await?;
+        let instruction = resolve_save_conflicts(instruction, conflict_resolver).await?;
 
         current_span.pb_set_message(instruction.filename());
         if let Some(size) = instruction.size() {
@@ -308,380 +304,6 @@ impl DownloadManager {
             client = client.user_agent(user_agent.clone());
         }
         Ok(client.build()?)
-    }
-
-    /// Checks for common storage conflicts before the download begins
-    async fn resolve_save_conflicts<CR>(
-        mut instruction: Download,
-        conflict_resolver: &CR,
-    ) -> Result<Download, OdlError>
-    where
-        CR: SaveConflictResolver,
-    {
-        if tokio::fs::try_exists(instruction.download_dir())
-            .await
-            .unwrap_or(false)
-        {
-            let resolution: SameDownloadExistsResolution = SameDownloadExistsResolution::Resume;
-            match resolution {
-                SameDownloadExistsResolution::Abort => {
-                    return Err(OdlError::Conflict(ConflictError::Save {
-                        conflict: SaveConflict::SameDownloadExists,
-                    }));
-                }
-                SameDownloadExistsResolution::AddNumberToNameAndContinue => {
-                    let result = is_filename_unique(&instruction.download_dir()).await?;
-                    if let IsUnique::SuggestedAlternative(filename) = result {
-                        instruction.set_filename(filename);
-                    }
-                }
-                SameDownloadExistsResolution::Resume => {
-                    // do nothing and return
-                    return Ok(instruction);
-                }
-            }
-        }
-
-        let final_path = instruction.save_dir().join(instruction.filename());
-
-        // This can still happen even if AddNumberToNameAndContinue solution is used previously
-        // But it does not happen often in that case.
-        if tokio::fs::try_exists(&final_path).await.unwrap_or(false) {
-            match conflict_resolver.final_file_exists(&instruction).await {
-                crate::conflict::FinalFileExistsResolution::Abort => {
-                    return Err(OdlError::Conflict(ConflictError::Save {
-                        conflict: SaveConflict::FinalFileExists,
-                    }));
-                }
-                crate::conflict::FinalFileExistsResolution::ReplaceAndContinue => {
-                    // We try to safely remove files, so just in case that
-                    // the download_dir is not selected correctly, we don't end up
-                    // deleting the wrong files.
-                    let _ = tokio::fs::remove_file(instruction.metadata_path()).await;
-                    let _ = tokio::fs::remove_file(instruction.metadata_temp_path()).await;
-                    let mut entries = tokio::fs::read_dir(instruction.download_dir()).await?;
-                    while let Some(entry) = entries.next_entry().await? {
-                        let path = entry.path();
-                        if let Some(ext) = path.extension() {
-                            if ext == Download::PART_EXTENSION {
-                                tokio::fs::remove_file(&path).await?;
-                            }
-                        }
-                    }
-                }
-                crate::conflict::FinalFileExistsResolution::AddNumberToNameAndContinue => {
-                    if let IsUnique::SuggestedAlternative(new_name) =
-                        is_filename_unique(&final_path).await?
-                    {
-                        instruction.set_filename(new_name);
-                    }
-                }
-            }
-        }
-
-        Ok(instruction)
-    }
-
-    /// Attempt to recover from an interrupted metadata write.
-    async fn recover_metadata(instruction: &Download) -> Result<(), OdlError> {
-        let metadata_temp_path = instruction.metadata_temp_path();
-
-        match read_delimited_message_from_path::<DownloadMetadata, PathBuf>(&metadata_temp_path)
-            .await
-        {
-            Ok(_) => {
-                // If temp metadata is valid, atomically replace the main metadata file
-                atomic_replace(metadata_temp_path, instruction.metadata_path()).await?;
-            }
-            Err(_) => {
-                // If temp metadata is invalid or unreadable, remove it if it exists
-                if tokio::fs::try_exists(&metadata_temp_path)
-                    .await
-                    .unwrap_or(false)
-                {
-                    // successful removal is important at this point
-                    tokio::fs::remove_file(&metadata_temp_path).await?;
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn apply_restart_state_to_metadata(
-        metadata: &mut DownloadMetadata,
-        new_download: &Download,
-        new_checksums: Vec<FileChecksum>,
-    ) {
-        metadata.last_etag = new_download.etag().to_owned();
-        metadata.last_modified = new_download.last_modified();
-        metadata.size = new_download.size();
-        Self::remove_all_parts(new_download.download_dir()).await;
-        metadata.parts = Download::determine_parts(metadata.size, metadata.max_connections);
-        metadata.checksums = new_checksums;
-    }
-
-    /// Checks for common conflicts between new instruction and metadata on disk
-    /// and attemps to resolve them before the download starts.
-    /// writes the updated metadata to disk and returns it
-    async fn resolve_server_conflicts<CR>(
-        instruction: &Download,
-        conflict_resolver: &CR,
-    ) -> Result<DownloadMetadata, OdlError>
-    where
-        CR: ServerConflictResolver,
-    {
-        let mut metadata: DownloadMetadata = match read_delimited_message_from_path::<
-            DownloadMetadata,
-            PathBuf,
-        >(&instruction.metadata_path())
-        .await
-        {
-            Ok(mut disk_metadata) => {
-                // update disk_metadata from instruction
-                disk_metadata.is_resumable = instruction.is_resumable();
-                disk_metadata.filename = instruction.filename().to_string();
-                disk_metadata.max_connections = instruction.max_connections();
-                disk_metadata.requires_auth = instruction.requires_auth();
-                disk_metadata.requires_basic_auth = instruction.requires_basic_auth();
-                disk_metadata.use_server_time = instruction.use_server_time();
-                disk_metadata.save_dir = instruction.save_dir().to_string_lossy().into_owned();
-                disk_metadata
-            }
-            Err(e) => {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    return Err(OdlError::StdIoError {
-                        e,
-                        extra_info: Some(format!(
-                            "Failed to read metadata for download at {}",
-                            instruction.metadata_path().display(),
-                        )),
-                    });
-                }
-                instruction.as_metadata()
-            }
-        };
-
-        if metadata.finished {
-            let checksum_result: Result<(), OdlError> =
-                Self::check_final_file_checksum(&metadata, instruction, true).await;
-
-            match checksum_result {
-                Ok(_) => {
-                    // no need to do anything
-                }
-                Err(e) => {
-                    if let OdlError::StdIoError { e: io_err, .. } = e {
-                        if io_err.kind() == std::io::ErrorKind::NotFound {
-                            metadata.finished = false;
-                        } else {
-                            return Err(OdlError::StdIoError {
-                                e: io_err,
-                                extra_info: Some(format!(
-                                    "Failed to check final file checksum for {}",
-                                    instruction.final_file_path().display(),
-                                )),
-                            });
-                        }
-                    } else if let OdlError::Conflict(ConflictError::ChecksumMismatch { .. }) = e {
-                        metadata.finished = false;
-                    } else {
-                        return Err(e);
-                    }
-                }
-            }
-        }
-
-        if !metadata.finished {
-            // Check if all finished parts actually exist on disk, otherwise mark them unfinished
-            let finished_parts: Vec<_> = metadata
-                .parts
-                .iter()
-                .filter(|(_, part)| part.finished)
-                .map(|(_, part)| {
-                    let ulid = part.ulid.clone();
-                    let path = instruction.part_path(&ulid);
-                    async move {
-                        let exists = tokio::fs::try_exists(&path).await.unwrap_or(false);
-                        (ulid, exists)
-                    }
-                })
-                .collect();
-
-            let results = join_all(finished_parts).await;
-            for (ulid, exists) in results {
-                if !exists {
-                    if let Some(part) = metadata.parts.get_mut(&ulid) {
-                        part.finished = false;
-                    }
-                }
-            }
-
-            // Do possible corruption checks between new download instructions and the metadata on disk
-            let new_checksums = instruction.as_metadata().checksums;
-            let mut conflict: Option<ServerConflict> = None;
-
-            // Since resolution of either of issues is restarting the download, we just need to check one.
-            if !metadata.is_resumable {
-                conflict = Some(ServerConflict::NotResumable)
-            } else if metadata.last_etag != *instruction.etag()
-                || metadata.last_modified != instruction.last_modified()
-                || metadata.size != instruction.size()
-                || metadata.checksums != new_checksums
-            {
-                conflict = Some(ServerConflict::FileChanged);
-            }
-
-            if let Some(conflict) = conflict {
-                match conflict {
-                    ServerConflict::FileChanged => {
-                        match conflict_resolver.resolve_file_changed(&instruction).await {
-                            FileChangedResolution::Abort => {
-                                return Err(OdlError::Conflict(ConflictError::Server { conflict }));
-                            }
-                            FileChangedResolution::Restart => {
-                                Self::apply_restart_state_to_metadata(
-                                    &mut metadata,
-                                    instruction,
-                                    new_checksums,
-                                )
-                                .await
-                            }
-                        }
-                    }
-                    ServerConflict::NotResumable => {
-                        match conflict_resolver.resolve_not_resumable(&instruction).await {
-                            NotResumableResolution::Abort => {
-                                return Err(OdlError::Conflict(ConflictError::Server { conflict }));
-                            }
-                            NotResumableResolution::Restart => {
-                                Self::apply_restart_state_to_metadata(
-                                    &mut metadata,
-                                    instruction,
-                                    new_checksums,
-                                )
-                                .await
-                            }
-                        }
-                    }
-                    ServerConflict::UrlBroken | ServerConflict::CredentialsInvalid => {
-                        return Err(OdlError::Conflict(ConflictError::Server { conflict }));
-                    }
-                }
-            }
-        }
-
-        // write metadata changes back to disk, if any
-        let encoded = metadata.encode_length_delimited_to_vec();
-        atomic_write(
-            instruction.metadata_path(),
-            instruction.metadata_temp_path(),
-            &encoded,
-        )
-        .await?;
-
-        Ok(metadata)
-    }
-
-    async fn assemble_final_file(
-        metadata: &DownloadMetadata,
-        instruction: &Download,
-    ) -> Result<PathBuf, OdlError> {
-        let final_path = instruction.final_file_path();
-        let final_file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&final_path)
-            .await?;
-        let mut final_file = BufWriter::new(final_file);
-        let mut sorted_parts: Vec<&PartDetails> = metadata.parts.values().collect();
-        sorted_parts.sort_by_key(|p| p.offset);
-        for p in sorted_parts.iter() {
-            let part_path = instruction.part_path(&p.ulid);
-            let mut part_file = tokio::fs::File::open(&part_path).await?;
-            tokio::io::copy(&mut part_file, &mut final_file).await?;
-        }
-
-        if metadata.use_server_time {
-            if let Some(last_modified) = metadata.last_modified {
-                if let Err(e) = set_file_mtime_async(&final_path, last_modified).await {
-                    tracing::error!(
-                        "Failed to set file mtime for {}: {}",
-                        final_path.display(),
-                        e
-                    );
-                }
-            }
-        }
-
-        Self::check_final_file_checksum(metadata, instruction, false).await?;
-
-        return Ok(final_path);
-    }
-
-    /// can return OdlError::StdIoError of file not found kind
-    async fn check_final_file_checksum(
-        metadata: &DownloadMetadata,
-        instruction: &Download,
-        remove_if_empty_and_size_unknown: bool,
-    ) -> Result<(), OdlError> {
-        let final_path = instruction.final_file_path();
-        // do a simple size check first anyway, if we know that
-        let actual_size = match tokio::fs::metadata(&final_path).await {
-            Ok(meta) => meta.len(),
-            Err(e) => {
-                return Err(OdlError::StdIoError {
-                    e,
-                    extra_info: Some(format!(
-                        "Failed to get file size for final file at {}",
-                        final_path.display(),
-                    )),
-                });
-            }
-        };
-        if let Some(size) = metadata.size {
-            if actual_size != size {
-                return Err(OdlError::Conflict(ConflictError::ChecksumMismatch {
-                    expected: format!("size={}", size),
-                    actual: format!("size={}", actual_size),
-                }));
-            }
-        } else if remove_if_empty_and_size_unknown && actual_size == 0 {
-            let _ = tokio::fs::remove_file(&final_path).await;
-            return Err(OdlError::Conflict(ConflictError::ChecksumMismatch {
-                expected: "size=unknown".to_string(),
-                actual: "size=0".to_string(),
-            }));
-        }
-        if !metadata.checksums.is_empty() {
-            for checksum in &metadata.checksums {
-                let expected = HashDigest::try_from(checksum).map_err(|e| {
-                    OdlError::MetadataError(MetadataError::Other {
-                        message: format!("Invalid checksum in metadata: {}", e),
-                    })
-                })?;
-                let file = tokio::fs::File::open(&final_path).await?;
-                let reader = BufReader::new(file);
-                let actual = HashDigest::from_reader(reader, &expected)
-                    .await
-                    .map_err(|e| OdlError::StdIoError {
-                        e,
-                        extra_info: Some(format!(
-                            "Failed to open file for calculating checksum at {}",
-                            final_path.display(),
-                        )),
-                    })?;
-
-                if actual != expected {
-                    return Err(OdlError::Conflict(ConflictError::ChecksumMismatch {
-                        expected: format!("{:?}", expected),
-                        actual: format!("{:?}", actual),
-                    }));
-                }
-            }
-        }
-        Ok(())
     }
 
     /// Attempts to download a list of parts
@@ -786,23 +408,6 @@ impl DownloadManager {
         Ok(())
     }
 
-    /// Sums the sizes of all part files on disk for a given instruction and metadata.
-    /// Returns None if metadata.size is None, otherwise returns the total size in bytes.
-    async fn sum_parts_on_disk(instruction: &Download, metadata: &DownloadMetadata) -> Option<u64> {
-        metadata.size?;
-        let part_futures = metadata.parts.values().map(|part| {
-            let part_path = instruction.part_path(&part.ulid);
-            async move {
-                match tokio::fs::metadata(&part_path).await {
-                    Ok(meta) => meta.len(),
-                    Err(_) => 0,
-                }
-            }
-        });
-        let sizes = futures::future::join_all(part_futures).await;
-        Some(sizes.into_iter().sum())
-    }
-
     async fn process_download<CR>(
         self: &Self,
         instruction: Download,
@@ -814,11 +419,11 @@ impl DownloadManager {
         // early directory creation check to fail fast
         tokio::fs::create_dir_all(instruction.save_dir()).await?;
 
-        Self::recover_metadata(&instruction).await?;
+        recover_metadata(&instruction).await?;
 
-        let mut metadata = Self::resolve_server_conflicts(&instruction, conflict_resolver).await?;
+        let mut metadata = resolve_server_conflicts(&instruction, conflict_resolver).await?;
 
-        if let Some(sum_of_parts_sizes) = Self::sum_parts_on_disk(&instruction, &metadata).await {
+        if let Some(sum_of_parts_sizes) = sum_parts_on_disk(&instruction, &metadata).await {
             let current_span = Span::current();
             current_span.pb_set_position(sum_of_parts_sizes);
             current_span.pb_reset_eta();
@@ -868,8 +473,8 @@ impl DownloadManager {
                 metadata = mdata;
             }
 
-            let final_path = Self::assemble_final_file(&mut metadata, &instruction).await?;
-            Self::remove_all_parts(&instruction.download_dir()).await;
+            let final_path = assemble_final_file(&mut metadata, &instruction).await?;
+            remove_all_parts(&instruction.download_dir()).await;
             Ok(final_path)
         } else {
             let final_path = instruction.final_file_path();
@@ -984,22 +589,6 @@ impl DownloadManager {
 
         Ok(())
     }
-
-    /// removes all .part files on disk
-    async fn remove_all_parts(download_dir: &PathBuf) {
-        // Remove all .part files in the download directory
-        // Effectively resetting the download progress
-        if let Ok(mut entries) = tokio::fs::read_dir(&download_dir).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let path = entry.path();
-                if let Some(ext) = path.extension() {
-                    if ext == Download::PART_EXTENSION {
-                        let _ = tokio::fs::remove_file(&path).await;
-                    }
-                }
-            }
-        }
-    }
 }
 
 impl DownloadManagerBuilder {
@@ -1041,8 +630,12 @@ impl DownloadManagerBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conflict::FileChangedResolution;
+    use crate::conflict::NotResumableResolution;
+    use crate::conflict::ServerConflict;
     use crate::download::DownloadBuilder;
     use crate::download_metadata::PartDetails;
+    use crate::error::ConflictError;
     use async_trait::async_trait;
     use mockito::Matcher;
     use mockito::Server;
