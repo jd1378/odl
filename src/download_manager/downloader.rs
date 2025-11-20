@@ -407,11 +407,13 @@ enum PartEvent {
 struct BandwidthLimiter {
     rate: f64,
     state: Mutex<LimiterState>,
+    seq: AtomicU64,
 }
 
 struct LimiterState {
     available: f64,
     last_refill: Instant,
+    queue: VecDeque<u64>,
 }
 
 impl BandwidthLimiter {
@@ -422,25 +424,57 @@ impl BandwidthLimiter {
             state: Mutex::new(LimiterState {
                 available: rate,
                 last_refill: Instant::now(),
+                queue: VecDeque::new(),
             }),
+            seq: AtomicU64::new(1),
         }
     }
 
     async fn acquire(&self, amount: u64) {
         let amount = amount as f64;
+
+        // Get a sequence number and enqueue ourselves to ensure FIFO fairness.
+        let my_seq = self.seq.fetch_add(1, Ordering::SeqCst);
+        {
+            let mut state = self.state.lock().await;
+            state.queue.push_back(my_seq);
+        }
+
         loop {
             let mut state = self.state.lock().await;
             state.refill(self.rate);
-            if state.available >= amount {
-                state.available -= amount;
-                return;
+
+            // If we're at the front of the queue and enough tokens are available, consume and go.
+            if let Some(&front) = state.queue.front() {
+                if front == my_seq && state.available >= amount {
+                    state.available -= amount;
+                    state.queue.pop_front();
+                    return;
+                }
             }
 
-            let deficit = amount - state.available;
-            let wait_secs = deficit / self.rate;
-            let sleep_duration = Duration::from_secs_f64(wait_secs).max(Duration::from_millis(1));
+            // Compute a sensible sleep time. If there's a deficit for our request, wait
+            // the time required to refill that deficit. Otherwise yield to the scheduler
+            // to let the front of the queue make progress without waiting real time.
+            let sleep_duration = if state.available < amount {
+                let deficit = amount - state.available;
+                let wait_secs = deficit / self.rate;
+                let dur = match Duration::try_from_secs_f64(wait_secs) {
+                    Ok(d) => d.max(Duration::from_millis(1)),
+                    Err(_) => Duration::from_millis(1),
+                };
+                Some(dur)
+            } else {
+                None
+            };
+
             drop(state);
-            time::sleep(sleep_duration).await;
+            if let Some(dur) = sleep_duration {
+                time::sleep(dur).await;
+            } else {
+                // Yield to the scheduler; does NOT advance tokio::time (important for time-paused tests)
+                tokio::task::yield_now().await;
+            }
         }
     }
 }
