@@ -205,7 +205,7 @@ impl Downloader {
                 )
                 .await
             }
-            .instrument(part_span),
+            .instrument(part_span.clone()),
         );
 
         active.insert(
@@ -213,6 +213,7 @@ impl Downloader {
             ActiveTask {
                 details: part,
                 controller,
+                span: part_span.clone(),
             },
         );
 
@@ -261,6 +262,7 @@ impl Downloader {
         if let Some((new_part, new_limit)) = split_result {
             if let Some(task) = active.get_mut(&candidate.ulid) {
                 task.details.size = new_limit;
+                task.span.pb_set_length(new_limit);
             }
             pending.push_back(new_part);
             return Ok(true);
@@ -350,6 +352,7 @@ impl Downloader {
 struct ActiveTask {
     details: PartDetails,
     controller: Arc<PartController>,
+    span: Span,
 }
 struct SplitCandidate {
     ulid: String,
