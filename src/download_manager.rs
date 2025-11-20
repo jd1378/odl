@@ -1,4 +1,5 @@
 mod checksum;
+mod downloader;
 mod io;
 mod recover_metadata;
 mod save_conflict;
@@ -11,17 +12,14 @@ use fs2::FileExt;
 use prost::Message;
 use reqwest::{
     Client, Proxy, Url,
-    header::{HeaderMap, HeaderValue, RANGE, USER_AGENT},
+    header::{HeaderMap, USER_AGENT},
 };
 
-use futures::stream::{FuturesOrdered, StreamExt};
-
-use tokio::sync::{AcquireError, Semaphore};
-use tokio::{io::AsyncWriteExt, sync::Mutex};
-use tokio::{io::BufWriter, sync::SemaphorePermit};
-use tracing::{Instrument, Span};
+use tokio::sync::{AcquireError, Semaphore, SemaphorePermit};
+use tracing::Span;
 use tracing_indicatif::span_ext::IndicatifSpanExt;
 
+use crate::download_manager::downloader::Downloader;
 use crate::download_manager::recover_metadata::recover_metadata;
 use crate::download_manager::{io::assemble_final_file, server_conflict::resolve_server_conflicts};
 use crate::download_manager::{io::remove_all_parts, save_conflict::resolve_save_conflicts};
@@ -34,7 +32,7 @@ use crate::{
 use crate::{credentials::Credentials, user_agents::random_user_agent};
 use crate::{
     download::Download,
-    download_metadata::{DownloadMetadata, PartDetails},
+    download_metadata::PartDetails,
     error::OdlError,
     fs_utils::{self, atomic_write},
 };
@@ -306,108 +304,6 @@ impl DownloadManager {
         Ok(client.build()?)
     }
 
-    /// Attempts to download a list of parts
-    async fn download_parts(
-        &self,
-        parts: Vec<PartDetails>,
-        instruction: &Download,
-        metadata: &Arc<Mutex<DownloadMetadata>>,
-    ) -> Result<(), OdlError> {
-        // reqwest is thread-safe, no need for mutex
-        let client: Arc<Client> = Arc::new(self.get_client(Some(&instruction))?);
-        let randomize_user_agent = if let Some(_) = self.user_agent {
-            false
-        } else {
-            self.randomize_user_agent
-        };
-        // we will add permits once we confirm everything is okay on first download
-        let semaphore = Arc::new(Semaphore::new(1));
-        let mut first_iter = true;
-        let first_permit = semaphore.acquire().await?;
-
-        let mut futures = FuturesOrdered::new();
-
-        for part in parts.into_iter() {
-            let semaphore = semaphore.clone();
-            let metadata = Arc::clone(&metadata);
-            let url = instruction.url().clone();
-            let ulid = part.ulid.clone();
-            let part_path = instruction.part_path(&ulid);
-            let part_details = part;
-            let client: Arc<Client> = Arc::clone(&client);
-            let first_push = first_iter.clone();
-            first_iter = false;
-            let aggregator_span = Span::current();
-            let part_span = tracing::info_span!("part");
-
-            futures.push_back(tokio::spawn(
-                async move {
-                    let _permit = if !first_push {
-                        Some(semaphore.acquire().await?)
-                    } else {
-                        None
-                    };
-                    let started_callback = || {
-                        if first_push {
-                            let metadata = Arc::clone(&metadata);
-                            let semaphore: Arc<Semaphore> = Arc::clone(&semaphore);
-                            tokio::spawn(async move {
-                                let mdata = metadata.lock().await;
-                                if mdata.max_connections - 1 > 0 {
-                                    semaphore
-                                        .add_permits(mdata.max_connections.try_into().unwrap_or(1));
-                                }
-                            });
-                        }
-                    };
-                    let res = Self::download_part(
-                        &client,
-                        randomize_user_agent,
-                        &url,
-                        &part_details,
-                        &part_path,
-                        started_callback,
-                        aggregator_span,
-                    )
-                    .await;
-
-                    // Mark part as finished and update metadata safely, but as soon as possible
-                    if res.is_ok() {
-                        let mut mdata = metadata.lock().await;
-                        if let Some(part) = mdata.parts.get_mut(&ulid) {
-                            part.finished = true;
-                        } else {
-                            return Err(OdlError::MetadataError(MetadataError::Other {
-                                message: format!("Part with ulid {} not found in metadata", ulid),
-                            }));
-                        }
-                    }
-                    drop(_permit);
-                    res
-                }
-                .instrument(part_span),
-            ));
-        }
-
-        // Wait for first future that finishes
-        // If it was not successful, close the semaphore and return the error
-        if let Some(res) = futures.next().await {
-            if let Err(e) = res? {
-                // If the first download fails, prevent further downloads and return the error
-                semaphore.close();
-                return Err(e);
-            }
-        }
-        drop(first_permit);
-
-        // Wait for all downloads to finish
-        while let Some(result) = futures.next().await {
-            result??;
-        }
-
-        Ok(())
-    }
-
     async fn process_download<CR>(
         self: &Self,
         instruction: Download,
@@ -442,26 +338,23 @@ impl DownloadManager {
                 })
                 .collect::<Vec<PartDetails>>();
 
-            // Download all parts: first part serial, rest in parallel if first succeeds
-            // Downloads count should be according to max_connections of metadata
             if !to_download.is_empty() {
-                // Mutex for safe access across threads
-                // We need this because downloads can happen in parallel and may finish at any point in time
-                // we want to safely write the metadata in case any of them finish at the same time
-                let metadata_mutex = Arc::new(Mutex::new(metadata)); // metadata is moved here until we put it back
+                let randomize_user_agent = if self.user_agent.is_some() {
+                    false
+                } else {
+                    self.randomize_user_agent
+                };
 
-                self.download_parts(to_download, &instruction, &metadata_mutex)
-                    .await?;
+                let client = self.get_client(Some(&instruction))?;
+                let downloader = Downloader::new(
+                    Arc::new(instruction.clone()),
+                    metadata,
+                    client,
+                    randomize_user_agent,
+                    Span::current(),
+                );
 
-                // Move metadata back from mutex to metadata variable
-                let mut mdata = Arc::try_unwrap(metadata_mutex)
-                    .map_err(|_| {
-                        OdlError::MetadataError(MetadataError::Other {
-                            message: "Failed to unwrap Arc for metadata".to_string(),
-                        })
-                    })?
-                    .into_inner();
-
+                let mut mdata = downloader.run().await?;
                 mdata.finished = true;
                 let encoded = mdata.encode_length_delimited_to_vec();
                 atomic_write(
@@ -490,104 +383,6 @@ impl DownloadManager {
                 })
             }
         }
-    }
-
-    /// Attempts to download a single part
-    async fn download_part<S>(
-        client: &Client,
-        randomize_user_agent: bool,
-        url: &Url,
-        part: &PartDetails,
-        part_path: &PathBuf,
-        started_callback: S,
-        aggregator_span: Span,
-    ) -> Result<(), OdlError>
-    where
-        S: FnOnce() + Send,
-    {
-        let current_span = Span::current();
-        current_span.pb_set_length(part.size);
-
-        let current_size = match tokio::fs::metadata(part_path).await {
-            Ok(meta) => meta.len(),
-            Err(e) => {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    0
-                } else {
-                    return Err(OdlError::StdIoError {
-                        e,
-                        extra_info: Some(format!(
-                            "Failed to get file size for download part at {}",
-                            part_path.display(),
-                        )),
-                    });
-                }
-            }
-        };
-
-        current_span.pb_set_position(current_size);
-        current_span.pb_reset_eta();
-
-        // we want to create the file anyway, it may be 0 bytes.
-        let file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(part_path)
-            .await?;
-
-        // If file already fully downloaded, skip
-        if current_size >= part.size {
-            return Ok(());
-        }
-
-        let mut file = BufWriter::new(file);
-
-        let mut req = client.get(url.clone());
-        let range_header = format!(
-            "bytes={}-{}",
-            part.offset + current_size,
-            part.offset + part.size - 1
-        );
-        req = req.header(
-            RANGE,
-            HeaderValue::from_str(&range_header).map_err(|e| OdlError::Other {
-                message: "Internal Error: Invalid header value was used at download_part"
-                    .to_string(),
-                origin: Box::new(e),
-            })?,
-        );
-        if randomize_user_agent {
-            req = req.header(USER_AGENT, random_user_agent())
-        }
-
-        let mut resp = req.send().await.map_err(OdlError::from)?;
-
-        // Read the first chunk
-        match resp.chunk().await.map_err(OdlError::from)? {
-            Some(b) => {
-                file.write_all(&b).await?;
-                let len = b.len() as u64;
-                current_span.pb_inc(len);
-                aggregator_span.pb_inc(len);
-                started_callback(); // Only called once, after first successful chunk
-            }
-            None => {
-                started_callback(); // Not even sure if it's possible, but anyway
-                return Ok(());
-            }
-        }
-
-        // Read the rest of the chunks
-        while let Some(b) = resp.chunk().await.map_err(OdlError::from)? {
-            let len = b.len() as u64;
-            current_span.pb_inc(len);
-            aggregator_span.pb_inc(len);
-            file.write_all(&b).await?;
-        }
-
-        file.flush().await?;
-
-        Ok(())
     }
 }
 
@@ -642,6 +437,7 @@ mod tests {
     use std::collections::HashMap;
     use tempfile::tempdir;
     use tokio::fs;
+    use tokio::io::AsyncWriteExt;
 
     struct AlwaysAbortResolver;
 
@@ -737,6 +533,7 @@ mod tests {
         // Patch the instruction to simulate 2 parts
         let instruction = DownloadBuilder::default()
             .download_dir(instruction.download_dir().clone())
+            .save_dir(instruction.save_dir().clone())
             .filename(instruction.filename().to_string())
             .url(instruction.url().clone())
             .size(Some(file_content.len() as u64))
@@ -839,6 +636,7 @@ mod tests {
         // Patch the instruction to simulate 1 part
         let instruction = DownloadBuilder::default()
             .download_dir(instruction.download_dir().clone())
+            .save_dir(instruction.save_dir().clone())
             .filename(instruction.filename().to_string())
             .url(instruction.url().clone())
             .size(Some(file_content.len() as u64))
@@ -918,6 +716,7 @@ mod tests {
         // Patch the instruction to simulate 2 parts, but not resumable
         let instruction = DownloadBuilder::default()
             .download_dir(instruction.download_dir().clone())
+            .save_dir(instruction.save_dir().clone())
             .filename(instruction.filename().to_string())
             .url(instruction.url().clone())
             .size(Some(file_content.len() as u64))
@@ -1033,6 +832,7 @@ mod tests {
         // Patch the instruction to simulate 2 parts, but not resumable
         let instruction = DownloadBuilder::default()
             .download_dir(instruction.download_dir().clone())
+            .save_dir(instruction.save_dir().clone())
             .filename(instruction.filename().to_string())
             .url(instruction.url().clone())
             .size(Some(file_content.len() as u64))
@@ -1135,6 +935,7 @@ mod tests {
         // Patch the instruction to simulate 1 part of 0 bytes
         let instruction = DownloadBuilder::default()
             .download_dir(instruction.download_dir().clone())
+            .save_dir(instruction.save_dir().clone())
             .filename(instruction.filename().to_string())
             .url(instruction.url().clone())
             .size(Some(0))
@@ -1198,19 +999,18 @@ mod tests {
             .create_async()
             .await;
 
-        // Prepare a temp file with already_downloaded bytes written
+        // Prepare a temp directory and partial part file
         let tmp_dir = tempdir()?;
-        let part_path = tmp_dir.path().join("part1.part");
+        let download_dir = tmp_dir.path().join("partial");
+        fs::create_dir_all(&download_dir).await?;
+        let part_path = download_dir.join("part1.part");
         {
-            let mut f = tokio::fs::File::create(&part_path).await?;
+            let mut f = fs::File::create(&part_path).await?;
             f.write_all(&file_content[..already_downloaded as usize])
                 .await?;
         }
 
-        // Build a minimal ClientWithMiddleware
-        let client = reqwest::Client::builder().build()?;
-
-        // Prepare PartDetails
+        // Build instruction and metadata reflecting the partial download
         let part_details = PartDetails {
             ulid: "part1".to_string(),
             offset: part_offset,
@@ -1218,21 +1018,39 @@ mod tests {
             finished: false,
         };
 
-        // Call download_part
-        let url = Url::parse(&format!("{}/partialfile", url)).unwrap();
-        let mut started_called = false;
-        DownloadManager::download_part(
-            &client,
+        let mut parts_map = HashMap::new();
+        parts_map.insert(part_details.ulid.clone(), part_details.clone());
+
+        let instruction = DownloadBuilder::default()
+            .download_dir(download_dir.clone())
+            .save_dir(tmp_dir.path().to_path_buf())
+            .filename("partialfile.bin".to_string())
+            .url(Url::parse(&format!("{}/partialfile", url)).unwrap())
+            .is_resumable(true)
+            .max_connections(1)
+            .size(Some(part_size))
+            .parts(parts_map)
+            .build()
+            .unwrap();
+
+        let metadata = instruction.as_metadata();
+        let client = reqwest::Client::builder().build()?;
+        let downloader = Downloader::new(
+            Arc::new(instruction.clone()),
+            metadata,
+            client,
             false,
-            &url,
-            &part_details,
-            &part_path,
-            || {
-                started_called = true;
-            },
             Span::current(),
-        )
-        .await?;
+        );
+
+        let updated_metadata = downloader.run().await?;
+        assert!(
+            updated_metadata
+                .parts
+                .get("part1")
+                .map(|p| p.finished)
+                .unwrap_or(false)
+        );
 
         // Check file content: should be the full file_content
         let result = tokio::fs::read(&part_path).await?;
@@ -1240,7 +1058,6 @@ mod tests {
 
         // Ensure mock was hit
         get_mock.assert_async().await;
-        assert!(started_called, "started_callback should be called");
 
         Ok(())
     }
@@ -1305,6 +1122,7 @@ mod tests {
         // Patch the instruction to simulate 1 part
         let instruction = DownloadBuilder::default()
             .download_dir(instruction.download_dir().clone())
+            .save_dir(instruction.save_dir().clone())
             .filename(instruction.filename().to_string())
             .url(instruction.url().clone())
             .size(Some(file_content.len() as u64))
@@ -1395,6 +1213,7 @@ mod tests {
         // Patch the instruction to simulate 1 part
         let instruction = DownloadBuilder::default()
             .download_dir(instruction.download_dir().clone())
+            .save_dir(instruction.save_dir().clone())
             .filename(instruction.filename().to_string())
             .url(instruction.url().clone())
             .size(Some(file_content.len() as u64))

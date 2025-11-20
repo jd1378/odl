@@ -1,0 +1,652 @@
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
+
+use reqwest::{
+    Client,
+    header::{HeaderValue, RANGE, USER_AGENT},
+};
+use tokio::{fs, io::AsyncWriteExt, task::JoinSet};
+use tokio::{io::BufWriter, sync::Mutex};
+use tracing::{Instrument, Span, info_span};
+use tracing_indicatif::span_ext::IndicatifSpanExt;
+use ulid::Ulid;
+
+use prost::Message;
+
+use crate::{
+    download::Download,
+    download_metadata::{DownloadMetadata, PartDetails},
+    error::{MetadataError, OdlError},
+    fs_utils::atomic_write,
+    user_agents::random_user_agent,
+};
+
+/// Minimum chunk size we keep on a single task before attempting another split.
+const MIN_DYNAMIC_SPLIT: u64 = 256 * 1024; // 256 KB
+
+/// Coordinates how parts are downloaded, including dynamic splitting to keep
+/// all available connections busy.
+pub struct Downloader {
+    instruction: Arc<Download>,
+    metadata: Arc<Mutex<DownloadMetadata>>,
+    client: Arc<Client>,
+    randomize_user_agent: bool,
+    concurrency_limit: usize,
+    aggregator_span: Span,
+    persist_mutex: Arc<Mutex<()>>,
+}
+
+impl Downloader {
+    pub fn new(
+        instruction: Arc<Download>,
+        metadata: DownloadMetadata,
+        client: Client,
+        randomize_user_agent: bool,
+        aggregator_span: Span,
+    ) -> Self {
+        let concurrency_limit = metadata.max_connections as usize;
+        Self {
+            instruction,
+            metadata: Arc::new(Mutex::new(metadata)),
+            client: Arc::new(client),
+            randomize_user_agent,
+            concurrency_limit: if concurrency_limit == 0 {
+                1
+            } else {
+                concurrency_limit
+            },
+            aggregator_span,
+            persist_mutex: Arc::new(Mutex::new(())),
+        }
+    }
+
+    pub async fn run(self) -> Result<DownloadMetadata, OdlError> {
+        let mut pending = self.pending_parts().await;
+        let mut active: HashMap<String, ActiveTask> = HashMap::new();
+        let mut join_set: JoinSet<Result<PartOutcome, OdlError>> = JoinSet::new();
+
+        self.fill_capacity(&mut pending, &mut active, &mut join_set)
+            .await?;
+
+        while let Some(result) = join_set.join_next().await {
+            match result {
+                Ok(Ok(outcome)) => {
+                    active.remove(&outcome.ulid);
+                    self.mark_part_finished(&outcome).await?;
+                    self.fill_capacity(&mut pending, &mut active, &mut join_set)
+                        .await?;
+                }
+                Ok(Err(e)) => {
+                    join_set.shutdown().await;
+                    return Err(e);
+                }
+                Err(join_err) => {
+                    join_set.shutdown().await;
+                    return Err(OdlError::Other {
+                        message: "Download task panicked".to_string(),
+                        origin: Box::new(join_err),
+                    });
+                }
+            }
+        }
+
+        let metadata_mutex = Arc::try_unwrap(self.metadata).map_err(|_| {
+            OdlError::MetadataError(MetadataError::Other {
+                message: "Failed to unwrap metadata Arc".to_string(),
+            })
+        })?;
+        Ok(metadata_mutex.into_inner())
+    }
+
+    async fn pending_parts(&self) -> VecDeque<PartDetails> {
+        let metadata = self.metadata.lock().await;
+        metadata
+            .parts
+            .values()
+            .filter(|p| !p.finished)
+            .cloned()
+            .collect()
+    }
+
+    async fn fill_capacity(
+        &self,
+        pending: &mut VecDeque<PartDetails>,
+        active: &mut HashMap<String, ActiveTask>,
+        join_set: &mut JoinSet<Result<PartOutcome, OdlError>>,
+    ) -> Result<(), OdlError> {
+        if self.concurrency_limit == 0 {
+            return Ok(());
+        }
+
+        self.ensure_pending_pool(pending, active).await?;
+
+        while active.len() < self.concurrency_limit {
+            if let Some(part) = pending.pop_front() {
+                self.schedule_part(part, active, join_set).await?;
+            } else {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn ensure_pending_pool(
+        &self,
+        pending: &mut VecDeque<PartDetails>,
+        active: &mut HashMap<String, ActiveTask>,
+    ) -> Result<(), OdlError> {
+        while pending.len() < self.concurrency_limit {
+            if !self.try_split_active(active, pending).await? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    async fn schedule_part(
+        &self,
+        part: PartDetails,
+        active: &mut HashMap<String, ActiveTask>,
+        join_set: &mut JoinSet<Result<PartOutcome, OdlError>>,
+    ) -> Result<(), OdlError> {
+        let initial_downloaded = self.detect_existing_size(&part).await?;
+        let controller = Arc::new(PartController::new(part.size, initial_downloaded));
+        let task_part = part.clone();
+        let controller_clone = Arc::clone(&controller);
+        let client = Arc::clone(&self.client);
+        let instruction = Arc::clone(&self.instruction);
+        let aggregator_span = self.aggregator_span.clone();
+        let randomize_user_agent = self.randomize_user_agent;
+        let span_ulid = task_part.ulid.clone();
+        let part_span = info_span!("part", ulid = span_ulid.as_str());
+
+        join_set.spawn(
+            async move {
+                download_part(
+                    client,
+                    instruction,
+                    task_part,
+                    controller_clone,
+                    randomize_user_agent,
+                    aggregator_span,
+                )
+                .await
+            }
+            .instrument(part_span),
+        );
+
+        active.insert(
+            part.ulid.clone(),
+            ActiveTask {
+                details: part,
+                controller,
+            },
+        );
+
+        Ok(())
+    }
+
+    async fn detect_existing_size(&self, part: &PartDetails) -> Result<u64, OdlError> {
+        let part_path = self.instruction.part_path(&part.ulid);
+        match fs::metadata(&part_path).await {
+            Ok(meta) => Ok(meta.len()),
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    Ok(0)
+                } else {
+                    Err(OdlError::StdIoError {
+                        e,
+                        extra_info: Some(format!(
+                            "Failed to inspect download part at {}",
+                            part_path.display(),
+                        )),
+                    })
+                }
+            }
+        }
+    }
+
+    async fn try_split_active(
+        &self,
+        active: &mut HashMap<String, ActiveTask>,
+        pending: &mut VecDeque<PartDetails>,
+    ) -> Result<bool, OdlError> {
+        let candidate = active
+            .iter()
+            .filter(|(_, task)| task.remaining_bytes() >= MIN_DYNAMIC_SPLIT * 2)
+            .max_by_key(|(_, task)| task.remaining_bytes())
+            .map(|(ulid, task)| SplitCandidate {
+                ulid: ulid.clone(),
+                controller: Arc::clone(&task.controller),
+            });
+
+        let Some(candidate) = candidate else {
+            return Ok(false);
+        };
+
+        let split_result = self.split_task(&candidate).await?;
+        if let Some((new_part, new_limit)) = split_result {
+            if let Some(task) = active.get_mut(&candidate.ulid) {
+                task.details.size = new_limit;
+            }
+            pending.push_back(new_part);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    async fn split_task(
+        &self,
+        candidate: &SplitCandidate,
+    ) -> Result<Option<(PartDetails, u64)>, OdlError> {
+        let downloaded = candidate.controller.downloaded();
+        let current_limit = candidate.controller.limit();
+        if current_limit <= downloaded + MIN_DYNAMIC_SPLIT * 2 {
+            return Ok(None);
+        }
+
+        let remaining = current_limit - downloaded;
+        let split_size = remaining / 2;
+        if split_size < MIN_DYNAMIC_SPLIT {
+            return Ok(None);
+        }
+
+        let new_limit = current_limit - split_size;
+        candidate.controller.set_limit(new_limit);
+
+        let (new_part, encoded_metadata) = {
+            let mut metadata = self.metadata.lock().await;
+            let part_entry = metadata.parts.get_mut(&candidate.ulid).ok_or_else(|| {
+                OdlError::MetadataError(MetadataError::Other {
+                    message: format!("Part with ulid {} not found", candidate.ulid),
+                })
+            })?;
+            part_entry.size = new_limit;
+            let new_part_offset = part_entry.offset + new_limit;
+            let new_ulid = Ulid::new().to_string();
+            let new_part = PartDetails {
+                offset: new_part_offset,
+                size: split_size,
+                ulid: new_ulid.clone(),
+                finished: false,
+            };
+            metadata.parts.insert(new_ulid, new_part.clone());
+            let encoded = metadata.encode_length_delimited_to_vec();
+            (new_part, encoded)
+        };
+
+        self.persist_metadata_bytes(encoded_metadata).await?;
+
+        Ok(Some((new_part, new_limit)))
+    }
+
+    async fn mark_part_finished(&self, outcome: &PartOutcome) -> Result<(), OdlError> {
+        let maybe_encoded = {
+            let mut metadata = self.metadata.lock().await;
+            if let Some(part) = metadata.parts.get_mut(&outcome.ulid) {
+                part.finished = true;
+                part.size = outcome.final_size;
+                Some(metadata.encode_length_delimited_to_vec())
+            } else {
+                None
+            }
+        };
+
+        if let Some(encoded) = maybe_encoded {
+            self.persist_metadata_bytes(encoded).await?;
+        }
+        Ok(())
+    }
+
+    async fn persist_metadata_bytes(&self, encoded: Vec<u8>) -> Result<(), OdlError> {
+        let _guard = self.persist_mutex.lock().await;
+        let metadata_path = self.instruction.metadata_path();
+        let metadata_temp_path = self.instruction.metadata_temp_path();
+        atomic_write(metadata_path.clone(), metadata_temp_path, &encoded)
+            .await
+            .map_err(|e| OdlError::StdIoError {
+                e,
+                extra_info: Some(format!(
+                    "Failed to persist metadata at {}",
+                    metadata_path.display()
+                )),
+            })
+    }
+}
+
+struct ActiveTask {
+    details: PartDetails,
+    controller: Arc<PartController>,
+}
+struct SplitCandidate {
+    ulid: String,
+    controller: Arc<PartController>,
+}
+
+impl ActiveTask {
+    fn remaining_bytes(&self) -> u64 {
+        self.controller
+            .limit()
+            .saturating_sub(self.controller.downloaded())
+    }
+}
+
+struct PartController {
+    downloaded: AtomicU64,
+    limit: AtomicU64,
+}
+
+impl PartController {
+    fn new(limit: u64, initial_downloaded: u64) -> Self {
+        Self {
+            downloaded: AtomicU64::new(initial_downloaded),
+            limit: AtomicU64::new(limit),
+        }
+    }
+
+    fn record_progress(&self, delta: u64) -> u64 {
+        self.downloaded.fetch_add(delta, Ordering::SeqCst) + delta
+    }
+
+    fn downloaded(&self) -> u64 {
+        self.downloaded.load(Ordering::SeqCst)
+    }
+
+    fn limit(&self) -> u64 {
+        self.limit.load(Ordering::SeqCst)
+    }
+
+    fn set_limit(&self, new_limit: u64) {
+        self.limit.store(new_limit, Ordering::SeqCst);
+    }
+}
+
+struct PartOutcome {
+    ulid: String,
+    final_size: u64,
+}
+
+async fn download_part(
+    client: Arc<Client>,
+    instruction: Arc<Download>,
+    part: PartDetails,
+    controller: Arc<PartController>,
+    randomize_user_agent: bool,
+    aggregator_span: Span,
+) -> Result<PartOutcome, OdlError> {
+    let part_path = instruction.part_path(&part.ulid);
+    let url = instruction.url().clone();
+    let mut current_size = controller.downloaded();
+    let target_size = controller.limit();
+
+    let current_span = Span::current();
+    current_span.pb_set_length(target_size);
+    current_span.pb_set_position(current_size);
+    current_span.pb_reset_eta();
+
+    let file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&part_path)
+        .await?;
+
+    if current_size >= target_size {
+        return Ok(PartOutcome {
+            ulid: part.ulid,
+            final_size: target_size,
+        });
+    }
+
+    let mut file = BufWriter::new(file);
+
+    let mut req = client.get(url);
+    let range_header = format!(
+        "bytes={}-{}",
+        part.offset + current_size,
+        part.offset + part.size - 1,
+    );
+    let range_value = HeaderValue::from_str(&range_header).map_err(|e| OdlError::Other {
+        message: "Internal Error: Invalid range header".to_string(),
+        origin: Box::new(e),
+    })?;
+    req = req.header(RANGE, range_value);
+    if randomize_user_agent {
+        req = req.header(USER_AGENT, random_user_agent())
+    }
+
+    let mut resp = req.send().await.map_err(OdlError::from)?;
+
+    while let Some(mut chunk) = resp.chunk().await.map_err(OdlError::from)? {
+        let allow_until = controller.limit();
+        let downloaded = controller.downloaded();
+        if downloaded >= allow_until {
+            break;
+        }
+
+        let remaining = allow_until - downloaded;
+        if chunk.len() as u64 > remaining {
+            chunk = chunk.split_to(remaining as usize);
+        }
+
+        let len = chunk.len() as u64;
+        file.write_all(&chunk).await?;
+        aggregator_span.pb_inc(len);
+        current_span.pb_inc(len);
+        controller.record_progress(len);
+        current_size += len;
+
+        if controller.downloaded() >= allow_until {
+            break;
+        }
+    }
+
+    file.flush().await?;
+
+    Ok(PartOutcome {
+        ulid: part.ulid,
+        final_size: controller.limit(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::download::DownloadBuilder;
+    use mockito::{Matcher, Server};
+    use reqwest::Url;
+    use tempfile::tempdir;
+    use tokio::fs;
+
+    const TEST_FILENAME: &str = "test.bin";
+
+    fn make_part(ulid: &str, offset: u64, size: u64) -> PartDetails {
+        PartDetails {
+            offset,
+            size,
+            ulid: ulid.to_string(),
+            finished: false,
+        }
+    }
+
+    async fn create_instruction(
+        download_dir: &std::path::Path,
+        save_dir: &std::path::Path,
+        url: &str,
+        size: u64,
+        parts: HashMap<String, PartDetails>,
+        max_connections: u64,
+    ) -> Arc<Download> {
+        let download = DownloadBuilder::default()
+            .download_dir(download_dir.to_path_buf())
+            .save_dir(save_dir.to_path_buf())
+            .filename(TEST_FILENAME.to_string())
+            .url(Url::parse(url).expect("valid url"))
+            .size(Some(size))
+            .parts(parts)
+            .max_connections(max_connections)
+            .is_resumable(true)
+            .build()
+            .expect("build download");
+        Arc::new(download)
+    }
+
+    async fn read_metadata(instruction: &Download) -> DownloadMetadata {
+        let bytes = fs::read(instruction.metadata_path())
+            .await
+            .expect("metadata file present");
+        DownloadMetadata::decode_length_delimited(&*bytes).expect("decode metadata")
+    }
+
+    #[tokio::test]
+    async fn test_downloader_downloads_single_part() -> Result<(), Box<dyn std::error::Error>> {
+        let file_content = b"HelloDownloader";
+        let mut server = Server::new_async().await;
+        let base = server.url();
+        let get_mock = server
+            .mock("GET", "/file")
+            .match_header(
+                "range",
+                Matcher::Exact(format!("bytes=0-{}", file_content.len() - 1)),
+            )
+            .with_status(206)
+            .with_body(file_content)
+            .create_async()
+            .await;
+
+        let tmp = tempdir()?;
+        let download_dir = tmp.path().join("download");
+        let save_dir = tmp.path().join("save");
+        fs::create_dir_all(&download_dir).await?;
+        fs::create_dir_all(&save_dir).await?;
+
+        let mut parts = HashMap::new();
+        parts.insert(
+            "part1".to_string(),
+            make_part("part1", 0, file_content.len() as u64),
+        );
+
+        let instruction = create_instruction(
+            &download_dir,
+            &save_dir,
+            &format!("{}/file", base),
+            file_content.len() as u64,
+            parts,
+            1,
+        )
+        .await;
+
+        let metadata = instruction.as_metadata();
+        let downloader = Downloader::new(
+            Arc::clone(&instruction),
+            metadata,
+            reqwest::Client::builder().build()?,
+            false,
+            Span::current(),
+        );
+        let updated_metadata = downloader.run().await?;
+
+        let part_bytes = fs::read(instruction.part_path("part1")).await?;
+        assert_eq!(part_bytes, file_content);
+        assert!(
+            updated_metadata
+                .parts
+                .get("part1")
+                .map(|p| p.finished)
+                .unwrap_or(false)
+        );
+        assert!(fs::try_exists(instruction.metadata_path()).await?);
+        get_mock.assert_async().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_downloader_split_persists_metadata() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempdir()?;
+        let download_dir = tmp.path().join("download");
+        let save_dir = tmp.path().join("save");
+        fs::create_dir_all(&download_dir).await?;
+        fs::create_dir_all(&save_dir).await?;
+
+        let mut parts = HashMap::new();
+        let original_size = MIN_DYNAMIC_SPLIT * 4;
+        parts.insert("orig".to_string(), make_part("orig", 0, original_size));
+
+        let instruction = create_instruction(
+            &download_dir,
+            &save_dir,
+            "http://example.com/file",
+            original_size,
+            parts,
+            2,
+        )
+        .await;
+        let metadata = instruction.as_metadata();
+        let downloader = Downloader::new(
+            Arc::clone(&instruction),
+            metadata,
+            reqwest::Client::builder().build()?,
+            false,
+            Span::current(),
+        );
+
+        let controller = Arc::new(PartController::new(original_size, 0));
+        let candidate = SplitCandidate {
+            ulid: "orig".to_string(),
+            controller: Arc::clone(&controller),
+        };
+
+        let split_result = downloader.split_task(&candidate).await?;
+        assert!(split_result.is_some());
+        let persisted = read_metadata(&instruction).await;
+        assert_eq!(persisted.parts.len(), 2);
+        assert!(persisted.parts.values().any(|p| p.ulid != "orig"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_downloader_mark_part_finished_persists() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let tmp = tempdir()?;
+        let download_dir = tmp.path().join("download");
+        let save_dir = tmp.path().join("save");
+        fs::create_dir_all(&download_dir).await?;
+        fs::create_dir_all(&save_dir).await?;
+
+        let mut parts = HashMap::new();
+        parts.insert("p1".to_string(), make_part("p1", 0, 1024));
+        let instruction = create_instruction(
+            &download_dir,
+            &save_dir,
+            "http://example.com/file",
+            1024,
+            parts,
+            1,
+        )
+        .await;
+        let metadata = instruction.as_metadata();
+        let downloader = Downloader::new(
+            Arc::clone(&instruction),
+            metadata,
+            reqwest::Client::builder().build()?,
+            false,
+            Span::current(),
+        );
+
+        let outcome = PartOutcome {
+            ulid: "p1".to_string(),
+            final_size: 1024,
+        };
+        downloader.mark_part_finished(&outcome).await?;
+        let persisted = read_metadata(&instruction).await;
+        let part = persisted.parts.get("p1").expect("part exists");
+        assert!(part.finished);
+        assert_eq!(part.size, 1024);
+        Ok(())
+    }
+}
