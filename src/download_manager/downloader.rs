@@ -10,8 +10,13 @@ use reqwest::{
     Client,
     header::{HeaderValue, RANGE, USER_AGENT},
 };
-use tokio::{fs, io::AsyncWriteExt, task::JoinSet};
-use tokio::{io::BufWriter, sync::Mutex};
+use tokio::{
+    fs,
+    io::{AsyncWriteExt, BufWriter},
+    sync::Mutex,
+    task::JoinSet,
+    time::{self, Duration, Instant},
+};
 use tracing::{Instrument, Span, info_span};
 use tracing_indicatif::span_ext::IndicatifSpanExt;
 use ulid::Ulid;
@@ -29,6 +34,11 @@ use crate::{
 /// Minimum chunk size we keep on a single task before attempting another split.
 const MIN_DYNAMIC_SPLIT: u64 = 256 * 1024; // 256 KB
 
+#[cfg(not(test))]
+const STALE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const STALE_CONNECTION_TIMEOUT: Duration = Duration::from_millis(100);
+
 /// Coordinates how parts are downloaded, including dynamic splitting to keep
 /// all available connections busy.
 pub struct Downloader {
@@ -38,6 +48,7 @@ pub struct Downloader {
     randomize_user_agent: bool,
     concurrency_limit: usize,
     aggregator_span: Span,
+    speed_limiter: Option<Arc<BandwidthLimiter>>,
     persist_mutex: Arc<Mutex<()>>,
 }
 
@@ -48,8 +59,12 @@ impl Downloader {
         client: Client,
         randomize_user_agent: bool,
         aggregator_span: Span,
+        download_speed_limit: Option<u64>,
     ) -> Self {
         let concurrency_limit = metadata.max_connections as usize;
+        let speed_limiter = download_speed_limit
+            .filter(|limit| *limit > 0)
+            .map(|limit| Arc::new(BandwidthLimiter::new(limit)));
         Self {
             instruction,
             metadata: Arc::new(Mutex::new(metadata)),
@@ -61,6 +76,7 @@ impl Downloader {
                 concurrency_limit
             },
             aggregator_span,
+            speed_limiter,
             persist_mutex: Arc::new(Mutex::new(())),
         }
     }
@@ -68,16 +84,25 @@ impl Downloader {
     pub async fn run(self) -> Result<DownloadMetadata, OdlError> {
         let mut pending = self.pending_parts().await;
         let mut active: HashMap<String, ActiveTask> = HashMap::new();
-        let mut join_set: JoinSet<Result<PartOutcome, OdlError>> = JoinSet::new();
+        let mut join_set: JoinSet<Result<PartEvent, OdlError>> = JoinSet::new();
 
         self.fill_capacity(&mut pending, &mut active, &mut join_set)
             .await?;
 
         while let Some(result) = join_set.join_next().await {
             match result {
-                Ok(Ok(outcome)) => {
-                    active.remove(&outcome.ulid);
-                    self.mark_part_finished(&outcome).await?;
+                Ok(Ok(event)) => {
+                    match event {
+                        PartEvent::Completed(outcome) => {
+                            active.remove(&outcome.ulid);
+                            self.mark_part_finished(&outcome).await?;
+                        }
+                        PartEvent::NeedsReschedule { ulid } => {
+                            if let Some(task) = active.remove(&ulid) {
+                                pending.push_back(task.details);
+                            }
+                        }
+                    }
                     self.fill_capacity(&mut pending, &mut active, &mut join_set)
                         .await?;
                 }
@@ -117,7 +142,7 @@ impl Downloader {
         &self,
         pending: &mut VecDeque<PartDetails>,
         active: &mut HashMap<String, ActiveTask>,
-        join_set: &mut JoinSet<Result<PartOutcome, OdlError>>,
+        join_set: &mut JoinSet<Result<PartEvent, OdlError>>,
     ) -> Result<(), OdlError> {
         if self.concurrency_limit == 0 {
             return Ok(());
@@ -153,7 +178,7 @@ impl Downloader {
         &self,
         part: PartDetails,
         active: &mut HashMap<String, ActiveTask>,
-        join_set: &mut JoinSet<Result<PartOutcome, OdlError>>,
+        join_set: &mut JoinSet<Result<PartEvent, OdlError>>,
     ) -> Result<(), OdlError> {
         let initial_downloaded = self.detect_existing_size(&part).await?;
         let controller = Arc::new(PartController::new(part.size, initial_downloaded));
@@ -163,6 +188,7 @@ impl Downloader {
         let instruction = Arc::clone(&self.instruction);
         let aggregator_span = self.aggregator_span.clone();
         let randomize_user_agent = self.randomize_user_agent;
+        let speed_limiter = self.speed_limiter.clone();
         let span_ulid = task_part.ulid.clone();
         let part_span = info_span!("part", ulid = span_ulid.as_str());
 
@@ -175,6 +201,7 @@ impl Downloader {
                     controller_clone,
                     randomize_user_agent,
                     aggregator_span,
+                    speed_limiter,
                 )
                 .await
             }
@@ -372,6 +399,62 @@ struct PartOutcome {
     final_size: u64,
 }
 
+enum PartEvent {
+    Completed(PartOutcome),
+    NeedsReschedule { ulid: String },
+}
+
+struct BandwidthLimiter {
+    rate: f64,
+    state: Mutex<LimiterState>,
+}
+
+struct LimiterState {
+    available: f64,
+    last_refill: Instant,
+}
+
+impl BandwidthLimiter {
+    fn new(bytes_per_second: u64) -> Self {
+        let rate = bytes_per_second.max(1) as f64;
+        Self {
+            rate,
+            state: Mutex::new(LimiterState {
+                available: rate,
+                last_refill: Instant::now(),
+            }),
+        }
+    }
+
+    async fn acquire(&self, amount: u64) {
+        let amount = amount as f64;
+        loop {
+            let mut state = self.state.lock().await;
+            state.refill(self.rate);
+            if state.available >= amount {
+                state.available -= amount;
+                return;
+            }
+
+            let deficit = amount - state.available;
+            let wait_secs = deficit / self.rate;
+            let sleep_duration = Duration::from_secs_f64(wait_secs).max(Duration::from_millis(1));
+            drop(state);
+            time::sleep(sleep_duration).await;
+        }
+    }
+}
+
+impl LimiterState {
+    fn refill(&mut self, rate: f64) {
+        let now = Instant::now();
+        let elapsed = now - self.last_refill;
+        self.last_refill = now;
+        let replenished = elapsed.as_secs_f64() * rate;
+        self.available = (self.available + replenished).min(rate);
+    }
+}
+
 async fn download_part(
     client: Arc<Client>,
     instruction: Arc<Download>,
@@ -379,8 +462,12 @@ async fn download_part(
     controller: Arc<PartController>,
     randomize_user_agent: bool,
     aggregator_span: Span,
-) -> Result<PartOutcome, OdlError> {
-    let part_path = instruction.part_path(&part.ulid);
+    speed_limiter: Option<Arc<BandwidthLimiter>>,
+) -> Result<PartEvent, OdlError> {
+    let PartDetails {
+        offset, size, ulid, ..
+    } = part;
+    let part_path = instruction.part_path(&ulid);
     let url = instruction.url().clone();
     let mut current_size = controller.downloaded();
     let target_size = controller.limit();
@@ -397,20 +484,16 @@ async fn download_part(
         .await?;
 
     if current_size >= target_size {
-        return Ok(PartOutcome {
-            ulid: part.ulid,
+        return Ok(PartEvent::Completed(PartOutcome {
+            ulid,
             final_size: target_size,
-        });
+        }));
     }
 
     let mut file = BufWriter::new(file);
 
     let mut req = client.get(url);
-    let range_header = format!(
-        "bytes={}-{}",
-        part.offset + current_size,
-        part.offset + part.size - 1,
-    );
+    let range_header = format!("bytes={}-{}", offset + current_size, offset + size - 1,);
     let range_value = HeaderValue::from_str(&range_header).map_err(|e| OdlError::Other {
         message: "Internal Error: Invalid range header".to_string(),
         origin: Box::new(e),
@@ -422,46 +505,64 @@ async fn download_part(
 
     let mut resp = req.send().await.map_err(OdlError::from)?;
 
-    while let Some(mut chunk) = resp.chunk().await.map_err(OdlError::from)? {
+    loop {
         let allow_until = controller.limit();
-        let downloaded = controller.downloaded();
-        if downloaded >= allow_until {
+        if controller.downloaded() >= allow_until {
             break;
         }
 
-        let remaining = allow_until - downloaded;
+        let chunk_result = time::timeout(STALE_CONNECTION_TIMEOUT, resp.chunk()).await;
+        let maybe_chunk = match chunk_result {
+            Ok(chunk) => chunk.map_err(OdlError::from)?,
+            Err(_) => {
+                file.flush().await?;
+                return Ok(PartEvent::NeedsReschedule { ulid });
+            }
+        };
+
+        let mut chunk = match maybe_chunk {
+            Some(chunk) => chunk,
+            None => break,
+        };
+
+        let downloaded = controller.downloaded();
+        let remaining = allow_until.saturating_sub(downloaded);
         if chunk.len() as u64 > remaining {
             chunk = chunk.split_to(remaining as usize);
         }
 
         let len = chunk.len() as u64;
+        if let Some(limiter) = speed_limiter.as_ref() {
+            limiter.acquire(len).await;
+        }
         file.write_all(&chunk).await?;
         aggregator_span.pb_inc(len);
         current_span.pb_inc(len);
         controller.record_progress(len);
         current_size += len;
-
-        if controller.downloaded() >= allow_until {
-            break;
-        }
     }
 
     file.flush().await?;
 
-    Ok(PartOutcome {
-        ulid: part.ulid,
-        final_size: controller.limit(),
-    })
+    if controller.downloaded() >= controller.limit() {
+        Ok(PartEvent::Completed(PartOutcome {
+            ulid,
+            final_size: controller.limit(),
+        }))
+    } else {
+        Ok(PartEvent::NeedsReschedule { ulid })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::download::DownloadBuilder;
+    use futures::FutureExt;
     use mockito::{Matcher, Server};
     use reqwest::Url;
     use tempfile::tempdir;
-    use tokio::fs;
+    use tokio::{fs, time};
 
     const TEST_FILENAME: &str = "test.bin";
 
@@ -548,6 +649,7 @@ mod tests {
             reqwest::Client::builder().build()?,
             false,
             Span::current(),
+            None,
         );
         let updated_metadata = downloader.run().await?;
 
@@ -593,6 +695,7 @@ mod tests {
             reqwest::Client::builder().build()?,
             false,
             Span::current(),
+            None,
         );
 
         let controller = Arc::new(PartController::new(original_size, 0));
@@ -636,6 +739,7 @@ mod tests {
             reqwest::Client::builder().build()?,
             false,
             Span::current(),
+            None,
         );
 
         let outcome = PartOutcome {
@@ -648,5 +752,75 @@ mod tests {
         assert!(part.finished);
         assert_eq!(part.size, 1024);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_download_part_returns_reschedule_on_short_body()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempdir()?;
+        let download_dir = tmp.path().join("download");
+        let save_dir = tmp.path().join("save");
+        fs::create_dir_all(&download_dir).await?;
+        fs::create_dir_all(&save_dir).await?;
+
+        let mut server = Server::new_async().await;
+        let base = server.url();
+        let file_content = b"12"; // intentionally shorter than requested
+        let get_mock = server
+            .mock("GET", "/partial")
+            .match_header("range", Matcher::Exact("bytes=0-4".into()))
+            .with_status(206)
+            .with_body(file_content)
+            .create_async()
+            .await;
+
+        let mut parts = HashMap::new();
+        parts.insert("part".to_string(), make_part("part", 0, 5));
+        let instruction = create_instruction(
+            &download_dir,
+            &save_dir,
+            &format!("{}/partial", base),
+            5,
+            parts,
+            1,
+        )
+        .await;
+
+        let metadata = instruction.as_metadata();
+        let part = metadata.parts.get("part").unwrap().clone();
+        let controller = Arc::new(PartController::new(part.size, 0));
+        let event = download_part(
+            Arc::new(reqwest::Client::builder().build()?),
+            Arc::clone(&instruction),
+            part,
+            controller,
+            false,
+            Span::current(),
+            None,
+        )
+        .await?;
+
+        match event {
+            PartEvent::NeedsReschedule { ulid } => assert_eq!(ulid, "part"),
+            PartEvent::Completed(_) => panic!("expected reschedule"),
+        }
+        get_mock.assert_async().await;
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_bandwidth_limiter_enforces_limit() {
+        let limiter = BandwidthLimiter::new(1024);
+        limiter.acquire(1024).await;
+
+        let second = limiter.acquire(1024);
+        tokio::pin!(second);
+        assert!(second.as_mut().now_or_never().is_none());
+
+        time::advance(Duration::from_millis(900)).await;
+        assert!(second.as_mut().now_or_never().is_none());
+
+        time::advance(Duration::from_millis(200)).await;
+        assert!(second.as_mut().now_or_never().is_some());
     }
 }

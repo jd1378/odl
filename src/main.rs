@@ -234,7 +234,8 @@ fn build_download_manager(args: &Args) -> Result<DownloadManager, OdlError> {
         .randomize_user_agent(args.randomize_user_agent)
         .proxy(proxy)
         .use_server_time(args.use_server_time)
-        .accept_invalid_certs(args.accept_invalid_certs);
+        .accept_invalid_certs(args.accept_invalid_certs)
+        .download_speed_limit(args.speed_limit);
 
     if let Some(download_dir) = args.temp_download_dir.clone() {
         builder.download_dir(download_dir);

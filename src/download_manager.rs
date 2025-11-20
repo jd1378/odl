@@ -96,6 +96,10 @@ pub struct DownloadManager {
     #[builder(default = false)]
     accept_invalid_certs: bool,
 
+    /// Optional maximum aggregate download speed per download in bytes per second.
+    #[builder(default)]
+    download_speed_limit: Option<u64>,
+
     /// Semaphore to limit concurrent downloads (not exposed in builder)
     #[builder(setter(skip), default = "Arc::new(Semaphore::new(0))")]
     semaphore: Arc<Semaphore>,
@@ -172,6 +176,14 @@ impl DownloadManager {
 
     pub fn set_accept_invalid_certs(self: &mut Self, value: bool) {
         self.accept_invalid_certs = value
+    }
+
+    pub fn download_speed_limit(&self) -> Option<u64> {
+        self.download_speed_limit
+    }
+
+    pub fn set_download_speed_limit(&mut self, value: Option<u64>) {
+        self.download_speed_limit = value;
     }
 
     pub async fn evaluate<CR>(
@@ -352,6 +364,7 @@ impl DownloadManager {
                     client,
                     randomize_user_agent,
                     Span::current(),
+                    self.download_speed_limit,
                 );
 
                 let mut mdata = downloader.run().await?;
@@ -407,6 +420,13 @@ impl DownloadManagerBuilder {
             if wait_between_retries == Duration::from_millis(0) {
                 return Err(DownloadManagerBuilderError::UninitializedField(
                     "wait_between_retries",
+                ));
+            }
+        }
+        if let Some(Some(limit)) = self.download_speed_limit {
+            if limit == 0 {
+                return Err(DownloadManagerBuilderError::UninitializedField(
+                    "download_speed_limit",
                 ));
             }
         }
@@ -1041,6 +1061,7 @@ mod tests {
             client,
             false,
             Span::current(),
+            None,
         );
 
         let updated_metadata = downloader.run().await?;

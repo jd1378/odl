@@ -1,6 +1,86 @@
 use std::path::PathBuf;
+use std::str::FromStr;
 
 use clap::Parser;
+
+fn parse_speed(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty speed".to_string());
+    }
+
+    // Remove common trailing rate markers like `/s` or `bps` (case-insensitive)
+    let mut working = s.to_string();
+    let lower = working.to_lowercase();
+    if lower.ends_with("/s") {
+        working.truncate(working.len() - 2);
+    } else if lower.ends_with("bps") {
+        working.truncate(working.len() - 3);
+    }
+    let working = working.trim();
+
+    // split into numeric prefix and suffix
+    let mut idx = 0usize;
+    for (i, ch) in working.char_indices() {
+        if !(ch.is_ascii_digit() || ch == '.') {
+            idx = i;
+            break;
+        }
+        idx = i + ch.len_utf8();
+    }
+
+    let (num_part, suf_part) = if idx == 0 {
+        // no numeric prefix
+        return Err(format!("invalid speed '{}': missing numeric value", s));
+    } else if idx >= working.len() {
+        (working, "")
+    } else {
+        (working[..idx].trim(), working[idx..].trim())
+    };
+
+    let value =
+        f64::from_str(num_part).map_err(|e| format!("invalid number '{}': {}", num_part, e))?;
+    if value < 0.0 {
+        return Err("speed must be non-negative".to_string());
+    }
+
+    let suffix_owned = suf_part
+        .trim()
+        .trim_start_matches(|c: char| c == ' ' || c == '\t' || c == '\'')
+        .to_lowercase();
+
+    // Determine multiplier (all based on 1024)
+    let multiplier: f64 = match suffix_owned.as_str() {
+        "" | "b" | "byte" | "bytes" => 1.0,
+        "k" | "kb" | "kib" | "kibibyte" | "kb/s" => 1024f64,
+        "m" | "mb" | "mib" | "mibibyte" => 1024f64.powi(2),
+        "g" | "gb" | "gib" | "gibibyte" => 1024f64.powi(3),
+        // Allow common variants like "kib/s" trimmed earlier, also accept single-letter with optional trailing 'b'
+        other => {
+            // try to match prefixes (e.g., "kib", "kb", "k")
+            let o = other.trim();
+            if o.starts_with('k') {
+                1024f64
+            } else if o.starts_with('m') {
+                1024f64.powi(2)
+            } else if o.starts_with('g') {
+                1024f64.powi(3)
+            } else {
+                return Err(format!("unknown size suffix '{}'", other));
+            }
+        }
+    };
+
+    let bytes_f = value * multiplier;
+    if !bytes_f.is_finite() || bytes_f < 0.0 {
+        return Err("resulting speed out of range".to_string());
+    }
+    let bytes = bytes_f as u128; // use wider intermediate to reduce overflow risk
+    if bytes > (u64::MAX as u128) {
+        return Err("speed too large".to_string());
+    }
+    Ok(bytes as u64)
+}
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -81,4 +161,52 @@ pub struct Args {
     /// HTTP basic authentication password.
     #[arg(long, value_name = "PASSWORD")]
     pub http_password: Option<String>,
+
+    /// Maximum aggregate download speed per file in bytes per second.
+    /// Accepts human-readable values like `100KB`, `1.5MiB`, `2G` (all units parsed as base 1024).
+    /// When unset, downloads run at full speed.
+    #[arg(long, value_name = "BYTES_PER_SEC", value_parser = parse_speed)]
+    pub speed_limit: Option<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_speed;
+
+    #[test]
+    fn test_simple_bytes() {
+        assert_eq!(parse_speed("100").unwrap(), 100);
+        assert_eq!(parse_speed("100B").unwrap(), 100);
+    }
+
+    #[test]
+    fn test_kilobytes() {
+        assert_eq!(parse_speed("1K").unwrap(), 1024);
+        assert_eq!(parse_speed("1KB").unwrap(), 1024);
+        assert_eq!(parse_speed("100kib").unwrap(), 100 * 1024);
+    }
+
+    #[test]
+    fn test_megabytes() {
+        assert_eq!(parse_speed("1M").unwrap(), 1024u64.pow(2));
+        assert_eq!(
+            parse_speed("1.5MB").unwrap(),
+            ((1.5f64 * (1024f64.powi(2))) as u64)
+        );
+    }
+
+    #[test]
+    fn test_gigabytes() {
+        assert_eq!(parse_speed("2G").unwrap(), 2 * 1024u64.pow(3));
+        assert_eq!(parse_speed("2GiB").unwrap(), 2 * 1024u64.pow(3));
+    }
+
+    #[test]
+    fn test_suffix_with_per_second() {
+        assert_eq!(parse_speed("100KB/s").unwrap(), 100 * 1024);
+        assert_eq!(
+            parse_speed("1.5MiB/s").unwrap(),
+            ((1.5f64 * (1024f64.powi(2))) as u64)
+        );
+    }
 }
