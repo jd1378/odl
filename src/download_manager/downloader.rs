@@ -13,7 +13,7 @@ use reqwest::{
 use tokio::{
     fs,
     io::{AsyncWriteExt, BufWriter},
-    sync::Mutex,
+    sync::{Mutex, Notify},
     task::JoinSet,
     time::{self, Duration, Instant},
 };
@@ -86,38 +86,36 @@ impl Downloader {
         let mut active: HashMap<String, ActiveTask> = HashMap::new();
         let mut join_set: JoinSet<Result<PartEvent, OdlError>> = JoinSet::new();
 
+        // Schedule a single probe connection first. Once it begins receiving data
+        // we'll expand to fill the full concurrency capacity.
+        if let Some(first_part) = pending.pop_front() {
+            let probe = Arc::new(Notify::new());
+            self.schedule_part(first_part, &mut active, &mut join_set, Some(probe.clone()))
+                .await?;
+
+            // Wait until either the probe signals it has started receiving data,
+            // or the task finishes (e.g., zero-length part completes immediately).
+            tokio::select! {
+                _ = probe.notified() => {
+                    // probe started; continue to fill capacity below
+                }
+                maybe_res = join_set.join_next() => {
+                    if let Some(res) = maybe_res {
+                        self.handle_join_result_item(res, &mut pending, &mut active, &mut join_set).await?;
+                    }
+                }
+            }
+        }
+
+        // Now fill remaining capacity up to configured concurrency.
         self.fill_capacity(&mut pending, &mut active, &mut join_set)
             .await?;
 
         while let Some(result) = join_set.join_next().await {
-            match result {
-                Ok(Ok(event)) => {
-                    match event {
-                        PartEvent::Completed(outcome) => {
-                            active.remove(&outcome.ulid);
-                            self.mark_part_finished(&outcome).await?;
-                        }
-                        PartEvent::NeedsReschedule { ulid } => {
-                            if let Some(task) = active.remove(&ulid) {
-                                pending.push_back(task.details);
-                            }
-                        }
-                    }
-                    self.fill_capacity(&mut pending, &mut active, &mut join_set)
-                        .await?;
-                }
-                Ok(Err(e)) => {
-                    join_set.shutdown().await;
-                    return Err(e);
-                }
-                Err(join_err) => {
-                    join_set.shutdown().await;
-                    return Err(OdlError::Other {
-                        message: "Download task panicked".to_string(),
-                        origin: Box::new(join_err),
-                    });
-                }
-            }
+            self.handle_join_result_item(result, &mut pending, &mut active, &mut join_set)
+                .await?;
+            self.fill_capacity(&mut pending, &mut active, &mut join_set)
+                .await?;
         }
 
         let metadata_mutex = Arc::try_unwrap(self.metadata).map_err(|_| {
@@ -152,12 +150,46 @@ impl Downloader {
 
         while active.len() < self.concurrency_limit {
             if let Some(part) = pending.pop_front() {
-                self.schedule_part(part, active, join_set).await?;
+                self.schedule_part(part, active, join_set, None).await?;
             } else {
                 break;
             }
         }
 
+        Ok(())
+    }
+
+    async fn handle_join_result_item(
+        &self,
+        res: Result<Result<PartEvent, OdlError>, tokio::task::JoinError>,
+        pending: &mut VecDeque<PartDetails>,
+        active: &mut HashMap<String, ActiveTask>,
+        join_set: &mut JoinSet<Result<PartEvent, OdlError>>,
+    ) -> Result<(), OdlError> {
+        match res {
+            Ok(Ok(event)) => match event {
+                PartEvent::Completed(outcome) => {
+                    active.remove(&outcome.ulid);
+                    self.mark_part_finished(&outcome).await?;
+                }
+                PartEvent::NeedsReschedule { ulid } => {
+                    if let Some(task) = active.remove(&ulid) {
+                        pending.push_back(task.details);
+                    }
+                }
+            },
+            Ok(Err(e)) => {
+                join_set.shutdown().await;
+                return Err(e);
+            }
+            Err(join_err) => {
+                join_set.shutdown().await;
+                return Err(OdlError::Other {
+                    message: "Download task panicked".to_string(),
+                    origin: Box::new(join_err),
+                });
+            }
+        }
         Ok(())
     }
 
@@ -179,6 +211,7 @@ impl Downloader {
         part: PartDetails,
         active: &mut HashMap<String, ActiveTask>,
         join_set: &mut JoinSet<Result<PartEvent, OdlError>>,
+        probe_notify: Option<Arc<Notify>>,
     ) -> Result<(), OdlError> {
         let initial_downloaded = self.detect_existing_size(&part).await?;
         let controller = Arc::new(PartController::new(part.size, initial_downloaded));
@@ -192,6 +225,9 @@ impl Downloader {
         let span_ulid = task_part.ulid.clone();
         let part_span = info_span!("part", ulid = span_ulid.as_str());
 
+        // Pass through the optional probe notifier to the download task. The notifier
+        // will be signalled when the task starts receiving data (first chunk).
+        let probe_for_task = probe_notify.clone();
         join_set.spawn(
             async move {
                 download_part(
@@ -202,6 +238,7 @@ impl Downloader {
                     randomize_user_agent,
                     aggregator_span,
                     speed_limiter,
+                    probe_for_task,
                 )
                 .await
             }
@@ -498,6 +535,7 @@ async fn download_part(
     randomize_user_agent: bool,
     aggregator_span: Span,
     speed_limiter: Option<Arc<BandwidthLimiter>>,
+    probe_notify: Option<Arc<Notify>>,
 ) -> Result<PartEvent, OdlError> {
     let PartDetails {
         offset, size, ulid, ..
@@ -540,6 +578,7 @@ async fn download_part(
 
     let mut resp = req.send().await.map_err(OdlError::from)?;
 
+    let mut started_notified = false;
     loop {
         let allow_until = controller.limit();
         if controller.downloaded() >= allow_until {
@@ -559,6 +598,14 @@ async fn download_part(
             Some(chunk) => chunk,
             None => break,
         };
+
+        // Signal that we've started receiving data for this probe connection.
+        if !started_notified {
+            if let Some(n) = probe_notify.as_ref() {
+                n.notify_one();
+            }
+            started_notified = true;
+        }
 
         let downloaded = controller.downloaded();
         let remaining = allow_until.saturating_sub(downloaded);
@@ -831,6 +878,7 @@ mod tests {
             controller,
             false,
             Span::current(),
+            None,
             None,
         )
         .await?;

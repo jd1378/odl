@@ -236,6 +236,7 @@ fn build_download_manager(args: &Args) -> Result<DownloadManager, OdlError> {
         .use_server_time(args.use_server_time)
         .accept_invalid_certs(args.accept_invalid_certs)
         .download_speed_limit(args.speed_limit);
+    builder.connect_timeout(Some(args.timeout));
 
     if let Some(download_dir) = args.temp_download_dir.clone() {
         builder.download_dir(download_dir);

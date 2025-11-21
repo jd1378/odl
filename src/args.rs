@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::time::Duration;
 
 use clap::Parser;
 
@@ -82,6 +83,71 @@ fn parse_speed(s: &str) -> Result<u64, String> {
     Ok(bytes as u64)
 }
 
+fn parse_duration(s: &str) -> Result<Duration, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty duration".to_string());
+    }
+
+    // split numeric prefix and suffix
+    let mut idx = 0usize;
+    for (i, ch) in s.char_indices() {
+        if !(ch.is_ascii_digit() || ch == '.') {
+            idx = i;
+            break;
+        }
+        idx = i + ch.len_utf8();
+    }
+
+    if idx == 0 {
+        return Err(format!("invalid duration '{}': missing numeric value", s));
+    }
+
+    let (num_part, suf_part) = if idx >= s.len() {
+        (s, "")
+    } else {
+        (s[..idx].trim(), s[idx..].trim())
+    };
+
+    let value =
+        f64::from_str(num_part).map_err(|e| format!("invalid number '{}': {}", num_part, e))?;
+    if !value.is_finite() || value < 0.0 {
+        return Err("duration must be non-negative finite number".to_string());
+    }
+
+    let suffix = suf_part
+        .trim()
+        .trim_start_matches(|c: char| c == ' ' || c == '\t' || c == '\'')
+        .to_lowercase();
+
+    let multiplier_secs = match suffix.as_str() {
+        "" | "s" | "sec" | "secs" | "second" | "seconds" => 1.0,
+        "m" | "min" | "mins" | "minute" | "minutes" => 60.0,
+        "h" | "hr" | "hrs" | "hour" | "hours" => 3600.0,
+        "d" | "day" | "days" => 86400.0,
+        other => {
+            // accept common variants with plurals/prefixes
+            if other.starts_with('s') {
+                1.0
+            } else if other.starts_with('m') {
+                60.0
+            } else if other.starts_with('h') {
+                3600.0
+            } else if other.starts_with('d') {
+                86400.0
+            } else {
+                return Err(format!("unknown duration suffix '{}'", other));
+            }
+        }
+    };
+
+    let secs_f = value * multiplier_secs;
+    if !secs_f.is_finite() || secs_f < 0.0 {
+        return Err("resulting duration out of range".to_string());
+    }
+    Ok(Duration::from_secs_f64(secs_f))
+}
+
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 pub struct Args {
@@ -129,6 +195,10 @@ pub struct Args {
     #[arg(long, value_name = "(http(s)|socks)://")]
     pub proxy: Option<String>,
 
+    /// Timeout for HTTP requests. Accepts suffixes like `30s`, `5m`, `2h`, `1d` or long forms (`seconds`, `minutes`, `hours`, `days`). Default `5s`. Default Unit is seconds if omitted.
+    #[arg(short = 't', long = "timeout", value_name = "DURATION", value_parser = parse_duration, default_value = "5s")]
+    pub timeout: Duration,
+
     /// Max number of retries in case of a network error
     #[arg(long, default_value_t = 10, value_name = "COUNT")]
     pub retry: u64,
@@ -171,7 +241,9 @@ pub struct Args {
 
 #[cfg(test)]
 mod tests {
+    use super::parse_duration;
     use super::parse_speed;
+    use std::time::Duration;
 
     #[test]
     fn test_simple_bytes() {
@@ -208,5 +280,27 @@ mod tests {
             parse_speed("1.5MiB/s").unwrap(),
             ((1.5f64 * (1024f64.powi(2))) as u64)
         );
+    }
+
+    #[test]
+    fn test_parse_duration_seconds_and_variants() {
+        assert_eq!(parse_duration("30s").unwrap(), Duration::from_secs(30));
+        assert_eq!(parse_duration("30sec").unwrap(), Duration::from_secs(30));
+        assert_eq!(
+            parse_duration("30seconds").unwrap(),
+            Duration::from_secs(30)
+        );
+        assert_eq!(parse_duration("30").unwrap(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_parse_duration_minutes_hours_days() {
+        assert_eq!(parse_duration("2m").unwrap(), Duration::from_secs(120));
+        assert_eq!(parse_duration("2min").unwrap(), Duration::from_secs(120));
+        assert_eq!(parse_duration("1h").unwrap(), Duration::from_secs(3600));
+        assert_eq!(parse_duration("1d").unwrap(), Duration::from_secs(86400));
+        // fractional hours
+        let d = parse_duration("1.5h").unwrap();
+        assert!((d.as_secs_f64() - 1.5 * 3600.0).abs() < 1e-6);
     }
 }

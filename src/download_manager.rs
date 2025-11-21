@@ -99,6 +99,10 @@ pub struct DownloadManager {
     #[builder(default)]
     download_speed_limit: Option<u64>,
 
+    /// Optional timeout for connect phase of request
+    #[builder(default)]
+    connect_timeout: Option<Duration>,
+
     /// Semaphore to limit concurrent downloads (not exposed in builder)
     #[builder(setter(skip), default = "Arc::new(Semaphore::new(0))")]
     semaphore: Arc<Semaphore>,
@@ -179,6 +183,14 @@ impl DownloadManager {
 
     pub fn download_speed_limit(&self) -> Option<u64> {
         self.download_speed_limit
+    }
+
+    pub fn connect_timeout(&self) -> Option<Duration> {
+        self.connect_timeout
+    }
+
+    pub fn set_connect_timeout(&mut self, value: Option<Duration>) {
+        self.connect_timeout = value;
     }
 
     pub fn set_download_speed_limit(&mut self, value: Option<u64>) {
@@ -312,6 +324,9 @@ impl DownloadManager {
         if let Some(user_agent) = &self.user_agent {
             client = client.user_agent(user_agent.clone());
         }
+        if let Some(timeout) = self.connect_timeout {
+            client = client.connect_timeout(timeout);
+        }
         Ok(client.build()?)
     }
 
@@ -420,6 +435,13 @@ impl DownloadManagerBuilder {
             if limit == 0 {
                 return Err(DownloadManagerBuilderError::UninitializedField(
                     "download_speed_limit",
+                ));
+            }
+        }
+        if let Some(Some(timeout)) = self.connect_timeout {
+            if timeout == Duration::from_millis(0) {
+                return Err(DownloadManagerBuilderError::UninitializedField(
+                    "request_timeout",
                 ));
             }
         }
