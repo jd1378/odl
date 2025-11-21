@@ -14,7 +14,6 @@ open source flexible download library and cli intended to be fast, reliable and 
 | 🔁 Retry logic                                   | Automatic retries with configurable backoff on failures                                       |
 | 🕒 Preserve modification times (optional)         | Optionally keeps server file modification timestamps                                          |
 | 🏷️ Server-sent file names         | Uses server-provided file names when available, otherwise falls back to the URL's last segment |
-| 🧪 Thoroughly tested                              | Extensive tests with mock servers and diverse download scenarios                              |
 
 ## Roadmap
 

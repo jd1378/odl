@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 fn parse_speed(s: &str) -> Result<u64, String> {
     let s = s.trim();
@@ -153,15 +153,16 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
 pub struct Args {
     /// The URL of the file to download, or a path to a file containing one URL per line.
     /// Blank lines and lines starting with `#` or `//` are ignored.
-    pub input: String,
+    /// Optional so subcommands (like `config`) can be used without providing an input.
+    pub input: Option<String>,
 
     /// If true, tries to download the file at url and read it as a text file and then use it as input
     #[arg(long, default_value_t = false)]
     pub remote_list: bool,
 
     /// Max connections that download manager can make in parallel for a single file
-    #[arg(long, default_value_t = 4, value_name = "COUNT")]
-    pub max_connections: u64,
+    #[arg(long, value_name = "COUNT")]
+    pub max_connections: Option<u64>,
 
     /// The maximum number of files that the download manager can download in parallel.
     ///
@@ -170,8 +171,8 @@ pub struct Args {
     ///
     /// Note: For controlling how many parts of a single file can be downloaded concurrently,
     /// see the `max_connections` option.
-    #[arg(long, default_value_t = 3, value_name = "COUNT")]
-    pub max_concurrent_downloads: usize,
+    #[arg(long, value_name = "COUNT")]
+    pub max_concurrent_downloads: Option<usize>,
 
     /// When `input` is a URL, this specifies the output file path.
     /// When `input` is a file containing URLs, this specifies the output directory for downloaded files.
@@ -189,31 +190,31 @@ pub struct Args {
     pub user_agent: Option<String>,
 
     /// Should the user_agent be randomized for each request?
-    #[arg(long, default_value_t = true)]
-    pub randomize_user_agent: bool,
+    #[arg(long)]
+    pub randomize_user_agent: Option<bool>,
 
     #[arg(long, value_name = "(http(s)|socks)://")]
     pub proxy: Option<String>,
 
     /// Timeout for HTTP requests. Accepts suffixes like `30s`, `5m`, `2h`, `1d` or long forms (`seconds`, `minutes`, `hours`, `days`). Default `5s`. Default Unit is seconds if omitted.
-    #[arg(short = 't', long = "timeout", value_name = "DURATION", value_parser = parse_duration, default_value = "5s")]
-    pub timeout: Duration,
+    #[arg(long = "timeout", value_name = "DURATION", value_parser = parse_duration)]
+    pub timeout: Option<Duration>,
 
     /// Max number of retries in case of a network error
-    #[arg(long, default_value_t = 10, value_name = "COUNT")]
-    pub retry: u64,
+    #[arg(long, value_name = "COUNT")]
+    pub retry: Option<u64>,
 
     /// Wait number of seconds after a network error before retry. Fractions are supported.
-    #[arg(long, default_value_t = 0.3, value_name = "Seconds")]
-    pub waitretry: f32,
+    #[arg(long, value_name = "Seconds")]
+    pub waitretry: Option<f32>,
 
     /// If true, sets the downloaded file's last-modified timestamp to match the server's value (if available).
-    #[arg(short, long, default_value_t = false)]
-    pub use_server_time: bool,
+    #[arg(short, long)]
+    pub use_server_time: Option<bool>,
 
     /// Should we accept invalid SSL certificates? Do not use unless you are absolutely sure of what you are doing.
-    #[arg(long, default_value_t = false)]
-    pub accept_invalid_certs: bool,
+    #[arg(long)]
+    pub accept_invalid_certs: Option<bool>,
 
     /// Custom HTTP headers to include in each request. Specify as `KEY:VALUE`.
     #[arg(long = "header", value_name = "KEY:VALUE", num_args = 0.., action = clap::ArgAction::Append)]
@@ -237,6 +238,62 @@ pub struct Args {
     /// When unset, downloads run at full speed.
     #[arg(long, value_name = "BYTES_PER_SEC", value_parser = parse_speed)]
     pub speed_limit: Option<u64>,
+    #[command(subcommand)]
+    pub command: Option<Commands>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum Commands {
+    /// Configure persistent download-manager settings saved in download_dir/config.toml
+    Config {
+        /// Print current configuration and exit
+        #[arg(long)]
+        show: bool,
+
+        /// Directory where config is stored (defaults to standard odl dir)
+        #[arg(long, value_name = "DIR")]
+        download_dir: Option<PathBuf>,
+
+        /// Set max connections per-file
+        #[arg(long, value_name = "COUNT")]
+        max_connections: Option<u64>,
+
+        /// Set maximum concurrent downloads
+        #[arg(long, value_name = "COUNT")]
+        max_concurrent_downloads: Option<usize>,
+
+        /// Set max retries
+        #[arg(long, value_name = "COUNT")]
+        max_retries: Option<u64>,
+
+        /// Wait between retries (seconds, fractional allowed)
+        #[arg(long, value_name = "SECONDS")]
+        wait_between_retries: Option<f64>,
+
+        /// Download speed limit (bytes/sec) e.g. 1MiB
+        #[arg(long, value_name = "BYTES_PER_SEC")]
+        download_speed_limit: Option<u64>,
+
+        /// Custom user agent
+        #[arg(long)]
+        user_agent: Option<String>,
+
+        /// Randomize user agent
+        #[arg(long)]
+        randomize_user_agent: Option<bool>,
+
+        /// Proxy as string
+        #[arg(long)]
+        proxy: Option<String>,
+
+        /// Use server time when saving
+        #[arg(long)]
+        use_server_time: Option<bool>,
+
+        /// Accept invalid certs
+        #[arg(long)]
+        accept_invalid_certs: Option<bool>,
+    },
 }
 
 #[cfg(test)]

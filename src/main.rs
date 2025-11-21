@@ -1,7 +1,7 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use indicatif::{ProgressState, ProgressStyle};
 use odl::{
     Download,
@@ -17,6 +17,8 @@ use reqwest::{Proxy, Url};
 use tokio::{self, io::AsyncBufReadExt};
 mod args;
 use args::Args;
+mod config;
+use config::Config;
 use futures::future::join_all;
 use tracing::{Instrument, info_span, instrument};
 use tracing_indicatif::{IndicatifLayer, TickSettings, span_ext::IndicatifSpanExt};
@@ -71,6 +73,110 @@ pub const PROGRESS_CHARS: &'static str = "█▇▆▅▄▃▂▁";
 async fn main() -> Result<(), OdlError> {
     let args: Args = Args::parse();
 
+    // If no input and no subcommand provided, show help and exit
+    if args.command.is_none() && args.input.is_none() {
+        let mut cmd = Args::command();
+        if let Err(e) = cmd.print_help() {
+            eprintln!("Failed to print help: {}", e);
+        }
+        println!();
+        return Ok(());
+    }
+
+    // Handle `odl config` subcommand if provided
+    if let Some(cmd) = &args.command {
+        match cmd {
+            args::Commands::Config {
+                show,
+                download_dir,
+                max_connections,
+                max_concurrent_downloads,
+                max_retries,
+                wait_between_retries,
+                download_speed_limit,
+                user_agent,
+                randomize_user_agent,
+                proxy,
+                use_server_time,
+                accept_invalid_certs,
+            } => {
+                // determine directory where config is stored
+                let target_dir = if let Some(d) = download_dir {
+                    d.clone()
+                } else if let Some(d) = &args.temp_download_dir {
+                    d.clone()
+                } else {
+                    dirs::data_dir()
+                        .map(|mut p| {
+                            p.push("odl");
+                            p
+                        })
+                        .unwrap_or_else(|| {
+                            let tmp = PathBuf::from("/tmp/odl");
+                            std::fs::create_dir_all(&tmp).ok();
+                            tmp
+                        })
+                };
+
+                let mut cfg = match Config::load_from_dir(&target_dir) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("Failed to load existing config: {}", e);
+                        Config::default()
+                    }
+                };
+
+                if *show {
+                    match toml::to_string_pretty(&cfg) {
+                        Ok(s) => println!("{}", s),
+                        Err(e) => eprintln!("Failed to format config: {}", e),
+                    }
+                    return Ok(());
+                }
+
+                // apply command-specified settings into config
+                if let Some(v) = max_connections {
+                    cfg.max_connections = Some(*v);
+                }
+                if let Some(v) = max_concurrent_downloads {
+                    cfg.max_concurrent_downloads = Some(*v);
+                }
+                if let Some(v) = max_retries {
+                    cfg.max_retries = Some(*v);
+                }
+                if let Some(v) = wait_between_retries {
+                    cfg.wait_between_retries_secs = Some(*v);
+                }
+                if let Some(v) = download_speed_limit {
+                    cfg.download_speed_limit = Some(*v);
+                }
+                if let Some(v) = user_agent {
+                    cfg.user_agent = Some(v.clone());
+                }
+                if let Some(v) = randomize_user_agent {
+                    cfg.randomize_user_agent = Some(*v);
+                }
+                if let Some(v) = proxy {
+                    cfg.proxy = Some(v.clone());
+                }
+                if let Some(v) = use_server_time {
+                    cfg.use_server_time = Some(*v);
+                }
+                if let Some(v) = accept_invalid_certs {
+                    cfg.accept_invalid_certs = Some(*v);
+                }
+
+                match cfg.save_to_dir(&target_dir) {
+                    Ok(()) => println!(
+                        "Saved configuration to {}/config.toml",
+                        target_dir.display()
+                    ),
+                    Err(e) => eprintln!("Failed to save configuration: {}", e),
+                }
+                return Ok(());
+            }
+        }
+    }
     let child_style = ProgressStyle::with_template(
             "{span_child_prefix}{spinner} {bar:40.cyan/blue} {percent:>3}%  {decimal_bytes:<10} / {decimal_total_bytes:<10} {decimal_bytes_per_sec:<12}"
         )
@@ -211,8 +317,47 @@ async fn main() -> Result<(), OdlError> {
 
 #[instrument(skip(args), name = "Warming up odl...")]
 fn build_download_manager(args: &Args) -> Result<DownloadManager, OdlError> {
-    let proxy = if let Some(proxy_str) = &args.proxy {
-        match Proxy::all(proxy_str) {
+    // determine where config would live (same logic used by download manager default)
+    let config_dir = if let Some(d) = &args.temp_download_dir {
+        d.clone()
+    } else {
+        dirs::data_dir()
+            .map(|mut p| {
+                p.push("odl");
+                p
+            })
+            .unwrap_or_else(|| {
+                let tmp = PathBuf::from("/tmp/odl");
+                std::fs::create_dir_all(&tmp).ok();
+                tmp
+            })
+    };
+
+    let cfg = match Config::load_from_dir(&config_dir) {
+        Ok(c) => c,
+        Err(_) => Config::default(),
+    };
+
+    // helper: choose value preference: CLI arg (if Some) else config (if Some) else fallback default
+    let max_connections = args.max_connections.or(cfg.max_connections).unwrap_or(4u64);
+    let max_concurrent_downloads = args
+        .max_concurrent_downloads
+        .or(cfg.max_concurrent_downloads)
+        .unwrap_or(3usize);
+    let max_retries = args.retry.or(cfg.max_retries).unwrap_or(10u64);
+    let wait_between_secs = args
+        .waitretry
+        .map(|f| f as f64)
+        .or(cfg.wait_between_retries_secs)
+        .unwrap_or(0.3f64);
+    let user_agent = args.user_agent.clone().or(cfg.user_agent);
+    let randomize_user_agent = args
+        .randomize_user_agent
+        .or(cfg.randomize_user_agent)
+        .unwrap_or(true);
+    let proxy_str = args.proxy.clone().or(cfg.proxy);
+    let proxy = if let Some(proxy_str) = proxy_str {
+        match Proxy::all(&proxy_str) {
             Ok(p) => Some(p),
             Err(e) => {
                 return Err(OdlError::CliError {
@@ -223,22 +368,39 @@ fn build_download_manager(args: &Args) -> Result<DownloadManager, OdlError> {
     } else {
         None
     };
+    let use_server_time = args
+        .use_server_time
+        .or(cfg.use_server_time)
+        .unwrap_or(false);
+    let accept_invalid_certs = args
+        .accept_invalid_certs
+        .or(cfg.accept_invalid_certs)
+        .unwrap_or(false);
+    let download_speed_limit = args.speed_limit.or(cfg.download_speed_limit);
 
     let mut builder = DownloadManagerBuilder::default();
     builder
-        .max_connections(args.max_connections)
-        .max_concurrent_downloads(args.max_concurrent_downloads)
-        .max_retries(args.retry)
-        .wait_between_retries(Duration::from_secs_f32(args.waitretry))
-        .user_agent(args.user_agent.clone())
-        .randomize_user_agent(args.randomize_user_agent)
+        .max_connections(max_connections)
+        .max_concurrent_downloads(max_concurrent_downloads)
+        .max_retries(max_retries)
+        .wait_between_retries(Duration::from_secs_f64(wait_between_secs))
+        .user_agent(user_agent)
+        .randomize_user_agent(randomize_user_agent)
         .proxy(proxy)
-        .use_server_time(args.use_server_time)
-        .accept_invalid_certs(args.accept_invalid_certs)
-        .download_speed_limit(args.speed_limit);
-    builder.connect_timeout(Some(args.timeout));
+        .use_server_time(use_server_time)
+        .accept_invalid_certs(accept_invalid_certs)
+        .download_speed_limit(download_speed_limit);
 
-    if let Some(download_dir) = args.temp_download_dir.clone() {
+    // connect timeout preference: CLI timeout (if set) else config value
+    if let Some(secs) = args
+        .timeout
+        .map(|d| d.as_secs_f64())
+        .or(cfg.connect_timeout_secs)
+    {
+        builder.connect_timeout(Some(Duration::from_secs_f64(secs)));
+    }
+
+    if let Some(download_dir) = args.temp_download_dir.clone().or(cfg.download_dir) {
         builder.download_dir(download_dir);
     }
 
@@ -275,7 +437,13 @@ fn build_download_manager(args: &Args) -> Result<DownloadManager, OdlError> {
 
 #[instrument(skip(args), name = "Determining download type")]
 fn determine_download_type(args: &Args) -> Result<DownloadType, OdlError> {
-    Ok(match Url::parse(&args.input) {
+    // require input to be present for normal operation
+    let input = args.input.as_ref().ok_or(OdlError::CliError {
+        message: "Missing input. Provide a URL or file path, or use a subcommand like `config`."
+            .to_string(),
+    })?;
+
+    Ok(match Url::parse(input) {
         Ok(url) => {
             if args.remote_list {
                 DownloadType::FileAtUrl(url)
@@ -284,7 +452,7 @@ fn determine_download_type(args: &Args) -> Result<DownloadType, OdlError> {
             }
         }
         Err(_) => {
-            let path = PathBuf::from(&args.input);
+            let path = PathBuf::from(input);
             if path.try_exists()? {
                 if args.remote_list {
                     return Err(OdlError::CliError {

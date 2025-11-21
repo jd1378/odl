@@ -39,7 +39,7 @@ use crate::{
 #[derive(Builder, Debug)]
 #[builder(build_fn(validate = "Self::validate", private, name = "private_build"))]
 pub struct DownloadManager {
-    /// Directory of where to keep files when downloading. This is where we keep track of our downloads.
+    /// Directory of where to keep files when downloading. This is where we keep track of our downloads and configuration.
     #[builder(default = fs_utils::get_odl_dir().unwrap_or_else(|| {
                 let tmp_dir = std::path::PathBuf::from("/tmp/odl");
                 std::fs::create_dir_all(&tmp_dir).ok();
