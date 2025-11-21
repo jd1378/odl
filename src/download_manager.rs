@@ -594,6 +594,140 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_save_conflict_final_file_exists_abort() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // Start mock server
+        let mut server = Server::new_async().await;
+        let base = server.url();
+
+        // HEAD request returns file info
+        let head_mock = server
+            .mock("HEAD", "/file_abort")
+            .with_status(200)
+            .with_header("content-length", "1")
+            .with_header("accept-ranges", "bytes")
+            .create_async()
+            .await;
+
+        // Prepare temp dirs and create final file to trigger conflict
+        let tmp_download_dir = tempfile::tempdir()?;
+        let tmp_save_dir = tempfile::tempdir()?;
+        let filename = "file_abort";
+        let final_path = tmp_save_dir.path().join(filename);
+        tokio::fs::write(&final_path, b"x").await?;
+
+        let dlm = DownloadManagerBuilder::default()
+            .download_dir(tmp_download_dir.path().to_path_buf())
+            .max_connections(1)
+            .build()
+            .unwrap();
+
+        struct AbortFinalResolver;
+        #[async_trait]
+        impl SaveConflictResolver for AbortFinalResolver {
+            async fn final_file_exists(
+                &self,
+                _: &Download,
+            ) -> crate::conflict::FinalFileExistsResolution {
+                crate::conflict::FinalFileExistsResolution::Abort
+            }
+            async fn same_download_exists(
+                &self,
+                _: &Download,
+            ) -> crate::conflict::SameDownloadExistsResolution {
+                crate::conflict::SameDownloadExistsResolution::Resume
+            }
+        }
+
+        let resolver = AbortFinalResolver {};
+
+        let result = dlm
+            .evaluate(
+                Url::parse(&format!("{}/file_abort", base)).unwrap(),
+                tmp_save_dir.path().to_path_buf(),
+                None,
+                &resolver,
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(OdlError::Conflict(ConflictError::Save {
+                conflict: crate::conflict::SaveConflict::FinalFileExists
+            }))
+        ));
+
+        head_mock.assert_async().await;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_save_conflict_final_file_exists_add_number()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Start mock server
+        let mut server = Server::new_async().await;
+        let base = server.url();
+
+        // HEAD request returns file info
+        let head_mock = server
+            .mock("HEAD", "/file_add")
+            .with_status(200)
+            .with_header("content-length", "1")
+            .with_header("accept-ranges", "bytes")
+            .create_async()
+            .await;
+
+        // Prepare temp dirs and create final file to trigger suggestion
+        let tmp_download_dir = tempfile::tempdir()?;
+        let tmp_save_dir = tempfile::tempdir()?;
+        let filename = "file_add";
+        let final_path = tmp_save_dir.path().join(filename);
+        tokio::fs::write(&final_path, b"x").await?;
+
+        let dlm = DownloadManagerBuilder::default()
+            .download_dir(tmp_download_dir.path().to_path_buf())
+            .max_connections(1)
+            .build()
+            .unwrap();
+
+        struct AddNumberResolver;
+        #[async_trait]
+        impl SaveConflictResolver for AddNumberResolver {
+            async fn final_file_exists(
+                &self,
+                _: &Download,
+            ) -> crate::conflict::FinalFileExistsResolution {
+                crate::conflict::FinalFileExistsResolution::AddNumberToNameAndContinue
+            }
+            async fn same_download_exists(
+                &self,
+                _: &Download,
+            ) -> crate::conflict::SameDownloadExistsResolution {
+                crate::conflict::SameDownloadExistsResolution::Resume
+            }
+        }
+
+        let resolver = AddNumberResolver {};
+
+        let instruction = dlm
+            .evaluate(
+                Url::parse(&format!("{}/file_add", base)).unwrap(),
+                tmp_save_dir.path().to_path_buf(),
+                None,
+                &resolver,
+            )
+            .await?;
+
+        // Expect suggested alternative filename (file_add_2)
+        assert_eq!(instruction.filename(), "file_add_2");
+
+        head_mock.assert_async().await;
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_download_manager_single_part_download() -> Result<(), Box<dyn std::error::Error>>
     {
         // Prepare test data
