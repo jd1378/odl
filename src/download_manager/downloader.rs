@@ -25,9 +25,9 @@ use prost::Message;
 
 use crate::{
     download::Download,
+    download_manager::io::persist_encoded_metadata,
     download_metadata::{DownloadMetadata, PartDetails},
     error::{MetadataError, OdlError},
-    fs_utils::atomic_write,
     user_agents::random_user_agent,
 };
 
@@ -335,15 +335,13 @@ impl Downloader {
 
     async fn persist_metadata_bytes(&self, encoded: Vec<u8>) -> Result<(), OdlError> {
         let _guard = self.persist_mutex.lock().await;
-        let metadata_path = self.instruction.metadata_path();
-        let metadata_temp_path = self.instruction.metadata_temp_path();
-        atomic_write(metadata_path.clone(), metadata_temp_path, &encoded)
+        persist_encoded_metadata(&encoded, &self.instruction)
             .await
             .map_err(|e| OdlError::StdIoError {
                 e,
                 extra_info: Some(format!(
                     "Failed to persist metadata at {}",
-                    metadata_path.display()
+                    self.instruction.metadata_path().display()
                 )),
             })
     }

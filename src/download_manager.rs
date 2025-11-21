@@ -9,7 +9,6 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use derive_builder::Builder;
 use fs2::FileExt;
-use prost::Message;
 use reqwest::{
     Client, Proxy, Url,
     header::{HeaderMap, USER_AGENT},
@@ -19,8 +18,8 @@ use tokio::sync::{AcquireError, Semaphore, SemaphorePermit};
 use tracing::Span;
 use tracing_indicatif::span_ext::IndicatifSpanExt;
 
-use crate::download_manager::downloader::Downloader;
 use crate::download_manager::recover_metadata::recover_metadata;
+use crate::download_manager::{downloader::Downloader, io::persist_metadata};
 use crate::download_manager::{io::assemble_final_file, server_conflict::resolve_server_conflicts};
 use crate::download_manager::{io::remove_all_parts, save_conflict::resolve_save_conflicts};
 use crate::error::MetadataError;
@@ -34,7 +33,7 @@ use crate::{
     download::Download,
     download_metadata::PartDetails,
     error::OdlError,
-    fs_utils::{self, atomic_write},
+    fs_utils::{self},
 };
 
 #[derive(Builder, Debug)]
@@ -369,13 +368,7 @@ impl DownloadManager {
 
                 let mut mdata = downloader.run().await?;
                 mdata.finished = true;
-                let encoded = mdata.encode_length_delimited_to_vec();
-                atomic_write(
-                    instruction.metadata_path(),
-                    instruction.metadata_temp_path(),
-                    &encoded,
-                )
-                .await?;
+                persist_metadata(&mdata, &instruction).await?;
                 metadata = mdata;
             }
 

@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use futures::io;
+use prost::Message;
 use tokio::io::BufWriter;
 
 use crate::{
@@ -7,7 +9,7 @@ use crate::{
     download_manager::checksum::check_final_file_checksum,
     download_metadata::{DownloadMetadata, PartDetails},
     error::OdlError,
-    fs_utils::set_file_mtime_async,
+    fs_utils::{atomic_write, set_file_mtime_async},
 };
 
 /// removes all .part files on disk
@@ -78,4 +80,21 @@ pub async fn sum_parts_on_disk(instruction: &Download, metadata: &DownloadMetada
     });
     let sizes = futures::future::join_all(part_futures).await;
     Some(sizes.into_iter().sum())
+}
+
+pub async fn persist_metadata(
+    metadata: &DownloadMetadata,
+    instruction: &Download,
+) -> io::Result<()> {
+    let encoded = metadata.encode_length_delimited_to_vec();
+    persist_encoded_metadata(&encoded, instruction).await
+}
+
+pub async fn persist_encoded_metadata(encoded: &Vec<u8>, instruction: &Download) -> io::Result<()> {
+    atomic_write(
+        instruction.metadata_path(),
+        instruction.metadata_temp_path(),
+        &encoded,
+    )
+    .await
 }

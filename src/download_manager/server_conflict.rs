@@ -1,16 +1,17 @@
 use std::path::PathBuf;
 
-use prost::Message;
-
 use crate::{
     Download,
     conflict::{
         FileChangedResolution, NotResumableResolution, ServerConflict, ServerConflictResolver,
     },
-    download_manager::{checksum::check_final_file_checksum, io::remove_all_parts},
+    download_manager::{
+        checksum::check_final_file_checksum,
+        io::{persist_metadata, remove_all_parts},
+    },
     download_metadata::{DownloadMetadata, FileChecksum},
     error::{ConflictError, OdlError},
-    fs_utils::{atomic_write, read_delimited_message_from_path},
+    fs_utils::read_delimited_message_from_path,
 };
 use futures::future::join_all;
 
@@ -19,6 +20,7 @@ async fn apply_restart_state_to_metadata(
     new_download: &Download,
     new_checksums: Vec<FileChecksum>,
 ) {
+    metadata.finished = false;
     metadata.last_etag = new_download.etag().to_owned();
     metadata.last_modified = new_download.last_modified();
     metadata.size = new_download.size();
@@ -68,6 +70,7 @@ where
         }
     };
 
+    let mut should_reset_state = false;
     if metadata.finished {
         let checksum_result: Result<(), OdlError> =
             check_final_file_checksum(&metadata, instruction, true).await;
@@ -79,7 +82,7 @@ where
             Err(e) => {
                 if let OdlError::StdIoError { e: io_err, .. } = e {
                     if io_err.kind() == std::io::ErrorKind::NotFound {
-                        metadata.finished = false;
+                        should_reset_state = true;
                     } else {
                         return Err(OdlError::StdIoError {
                             e: io_err,
@@ -90,7 +93,7 @@ where
                         });
                     }
                 } else if let OdlError::Conflict(ConflictError::ChecksumMismatch { .. }) = e {
-                    metadata.finished = false;
+                    should_reset_state = true;
                 } else {
                     return Err(e);
                 }
@@ -98,7 +101,10 @@ where
         }
     }
 
-    if !metadata.finished {
+    let new_checksums = instruction.as_metadata().checksums;
+    if should_reset_state {
+        apply_restart_state_to_metadata(&mut metadata, instruction, new_checksums).await
+    } else if !metadata.finished {
         // Check if all finished parts actually exist on disk, otherwise mark them unfinished
         let finished_parts: Vec<_> = metadata
             .parts
@@ -124,7 +130,6 @@ where
         }
 
         // Do possible corruption checks between new download instructions and the metadata on disk
-        let new_checksums = instruction.as_metadata().checksums;
         let mut conflict: Option<ServerConflict> = None;
 
         // Since resolution of either of issues is restarting the download, we just need to check one.
@@ -178,13 +183,7 @@ where
     }
 
     // write metadata changes back to disk, if any
-    let encoded = metadata.encode_length_delimited_to_vec();
-    atomic_write(
-        instruction.metadata_path(),
-        instruction.metadata_temp_path(),
-        &encoded,
-    )
-    .await?;
+    persist_metadata(&metadata, &instruction).await?;
 
     Ok(metadata)
 }
