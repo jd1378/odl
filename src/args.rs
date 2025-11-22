@@ -196,7 +196,7 @@ pub struct Args {
     #[arg(long, value_name = "(http(s)|socks)://")]
     pub proxy: Option<String>,
 
-    /// Timeout for HTTP requests. Accepts suffixes like `30s`, `5m`, `2h`, `1d` or long forms (`seconds`, `minutes`, `hours`, `days`). Default `5s`. Default Unit is seconds if omitted.
+    /// Connect timeout for requests. Accepts suffixes like `30s`, `5m`, `2h`, `1d` or long forms (`seconds`, `minutes`, `hours`, `days`). Default `5s`. Default Unit is seconds if omitted.
     #[arg(short, long = "timeout", value_name = "DURATION", value_parser = parse_duration)]
     pub timeout: Option<Duration>,
 
@@ -287,7 +287,7 @@ pub enum Commands {
         #[arg(long)]
         proxy: Option<String>,
 
-        /// Timeout for HTTP requests. Accepts suffixes like `30s`, `5m`, `2h`, `1d` or long forms (`seconds`, `minutes`, `hours`, `days`). Default `5s`. Default Unit is seconds if omitted.
+        /// Connect timeout for requests. Accepts suffixes like `30s`, `5m`, `2h`, `1d` or long forms (`seconds`, `minutes`, `hours`, `days`). Default `5s`. Default Unit is seconds if omitted.
         #[arg(short, long = "timeout", value_name = "DURATION", value_parser = parse_duration)]
         timeout: Option<Duration>,
 
