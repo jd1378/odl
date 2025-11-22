@@ -180,10 +180,14 @@ pub struct Args {
     #[arg(short, long, value_name = "FILE|DIR")]
     pub output: Option<PathBuf>,
 
-    /// This is the path where odl tracks download progress and it's config.
+    /// This is the path where odl tracks download progress.
     /// All data will be downloaded here first before being appended at the output location.
     #[arg(short, long, value_name = "DIR")]
-    pub data_dir: Option<PathBuf>,
+    pub download_dir: Option<PathBuf>,
+
+    /// The config file to use. defaults to `odl/config.toml` inside user's appdata directory (varies based on OS)
+    #[arg(short, long, value_name = "FILE")]
+    pub config_file: Option<PathBuf>,
 
     /// User agent to use for making requests. This option overrides random-user-agent.
     #[arg(short = 'U', long)]
@@ -205,8 +209,8 @@ pub struct Args {
     pub retry: Option<u64>,
 
     /// Wait number of seconds after a network error before retry. Fractions are supported.
-    #[arg(long, value_name = "Seconds")]
-    pub waitretry: Option<f32>,
+    #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+    pub wait_between_retries: Option<Duration>,
 
     /// If true, sets the downloaded file's last-modified timestamp to match the server's value (if available).
     #[arg(short, long)]
@@ -250,10 +254,14 @@ pub enum Commands {
         #[arg(long)]
         show: bool,
 
-        /// Directory where config is stored (defaults to standard odl dir).
-        /// You can use this to configure different download managers in different directories.
+        /// Config file to change (defaults to standard odl config path).
+        /// You can use this to configure different download managers.
+        #[arg(long, value_name = "FILE")]
+        config_file: Option<PathBuf>,
+
+        /// Where download manager keeps each download's parts and progress metadata
         #[arg(long, value_name = "DIR")]
-        data_dir: Option<PathBuf>,
+        download_dir: Option<PathBuf>,
 
         /// Set max connections per-file
         #[arg(long, value_name = "COUNT")]
@@ -267,9 +275,9 @@ pub enum Commands {
         #[arg(long, value_name = "COUNT")]
         max_retries: Option<u64>,
 
-        /// Wait between retries (seconds, fractional allowed)
-        #[arg(long, value_name = "SECONDS")]
-        wait_between_retries: Option<f64>,
+        /// Wait between retries. Accepts suffixes like `30s`, `5m`, `2h`, `1d` or long forms (`seconds`, `minutes`, `hours`, `days`). Default `5s`. Default Unit is seconds if omitted.
+        #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+        wait_between_retries: Option<Duration>,
 
         /// Download speed limit (bytes/sec) e.g. 1MiB
         #[arg(short, long, value_name = "BYTES_PER_SEC", value_parser = parse_speed)]

@@ -5,9 +5,8 @@ mod recover_metadata;
 mod save_conflict;
 mod server_conflict;
 
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc};
 
-use derive_builder::Builder;
 use fs2::FileExt;
 use reqwest::{
     Client, Proxy, Url,
@@ -18,6 +17,7 @@ use tokio::sync::{AcquireError, Semaphore, SemaphorePermit};
 use tracing::Span;
 use tracing_indicatif::span_ext::IndicatifSpanExt;
 
+use crate::config::Config;
 use crate::download_manager::recover_metadata::recover_metadata;
 use crate::download_manager::{downloader::Downloader, io::persist_metadata};
 use crate::download_manager::{io::assemble_final_file, server_conflict::resolve_server_conflicts};
@@ -29,172 +29,47 @@ use crate::{
     download_manager::io::sum_parts_on_disk,
 };
 use crate::{credentials::Credentials, user_agents::random_user_agent};
-use crate::{
-    download::Download,
-    download_metadata::PartDetails,
-    error::OdlError,
-    fs_utils::{self},
-};
+use crate::{download::Download, download_metadata::PartDetails, error::OdlError};
 
-#[derive(Builder, Debug)]
-#[builder(build_fn(validate = "Self::validate", private, name = "private_build"))]
+#[derive(Debug)]
 pub struct DownloadManager {
-    /// This is where we keep track of our downloads data, progress and configuration.
-    #[builder(default = fs_utils::get_odl_dir().unwrap_or_else(|| {
-                let tmp_dir = std::path::PathBuf::from("/tmp/odl");
-                std::fs::create_dir_all(&tmp_dir).ok();
-                tmp_dir
-            }))]
-    data_dir: PathBuf,
-
-    /// Max connections that download manager can make in parallel for a single file
-    #[builder(default = 4)]
-    max_connections: u64,
-
-    /// The maximum number of files that the download manager can download in parallel.
-    ///
-    /// This controls the overall concurrency of downloads. For example, if set to 4, up to 4 files
-    /// will be downloaded at the same time, regardless of how many connections are used for each file.
-    ///
-    /// Note: For controlling how many parts of a single file can be downloaded concurrently,
-    /// see the `max_connections` option.
-    #[builder(default = 3)]
-    max_concurrent_downloads: usize,
-
-    /// Number of maximum retries after which a download is considered failed. After third retry it increases exponentially.
-    /// For example the time for max_retries=6 and wait_between_retries=500ms will be:
-    /// 500ms, 500ms, 500ms, 1000ms, 2000ms, 4000ms
-    #[builder(default = 3)]
-    max_retries: u64,
-
-    /// Amount of time to wait between retries. After third retry it increases exponentially.
-    #[builder(default = Duration::from_millis(500))]
-    wait_between_retries: Duration,
-
-    /// Custom HTTP headers.
-    #[builder(default = None)]
-    headers: Option<HeaderMap>,
-
-    /// Custom user agent. This option overrides `randomize_user_agent`
-    #[builder(default = None)]
-    user_agent: Option<String>,
-
-    /// Randomize user agent for each request.
-    #[builder(default = true)]
-    randomize_user_agent: bool,
-
-    /// Custom request Proxy to use for downloads
-    #[builder(default = None)]
-    proxy: Option<Proxy>,
-
-    /// Whether to use the last-modified sent by server when saving the file
-    #[builder(default = false)]
-    use_server_time: bool,
-
-    /// Should we accept invalid SSL certificates? Do not use unless you are absolutely sure of what you are doing.
-    #[builder(default = false)]
-    accept_invalid_certs: bool,
-
-    /// Optional maximum aggregate download speed per download in bytes per second.
-    #[builder(default)]
-    speed_limit: Option<u64>,
-
-    /// Optional timeout for connect phase of request
-    #[builder(default)]
-    connect_timeout: Option<Duration>,
+    /// Config to use for DownloadManager
+    config: Config,
 
     /// Semaphore to limit concurrent downloads (not exposed in builder)
-    #[builder(setter(skip), default = "Arc::new(Semaphore::new(0))")]
     semaphore: Arc<Semaphore>,
 }
 
 impl DownloadManager {
-    pub fn max_connections(self: &Self) -> u64 {
-        return self.max_connections;
+    pub fn new(config: Config) -> DownloadManager {
+        let max_concurrent_downloads = config.max_concurrent_downloads;
+        return DownloadManager {
+            config,
+            semaphore: Arc::new(Semaphore::new(max_concurrent_downloads)),
+        };
     }
 
-    pub fn set_max_connections(self: &mut Self, value: u64) {
-        self.max_connections = if value > 0 { value } else { 1 }
+    pub fn config(self: &Self) -> &Config {
+        return &self.config;
     }
 
-    pub fn max_concurrent_downloads(self: &Self) -> usize {
-        return self.max_concurrent_downloads;
-    }
-
-    pub fn set_max_concurrent_downloads(self: &mut Self, value: usize) {
-        self.max_concurrent_downloads = if value > 0 { value } else { 1 }
-    }
-
-    pub fn max_retries(self: &Self) -> u64 {
-        return self.max_retries;
-    }
-
-    pub fn set_max_retries(self: &mut Self, value: u64) {
-        self.max_retries = value
-    }
-
-    pub fn wait_between_retries(self: &Self) -> Duration {
-        return self.wait_between_retries;
-    }
-
-    pub fn set_wait_between_retries(self: &mut Self, value: Duration) {
-        self.wait_between_retries = value;
-    }
-
-    pub fn user_agent(self: &Self) -> &Option<String> {
-        return &self.user_agent;
-    }
-
-    pub fn set_user_agent(self: &mut Self, value: Option<String>) {
-        self.user_agent = value
-    }
-
-    pub fn random_user_agent(self: &Self) -> bool {
-        return self.randomize_user_agent;
-    }
-
-    pub fn set_random_user_agent(self: &mut Self, value: bool) {
-        self.randomize_user_agent = value
-    }
-
-    pub fn proxy(self: &Self) -> &Option<Proxy> {
-        return &self.proxy;
-    }
-
-    pub fn set_proxy(self: &mut Self, value: Option<Proxy>) {
-        self.proxy = value
-    }
-
-    pub fn use_server_time(self: &Self) -> bool {
-        return self.use_server_time;
-    }
-
-    pub fn set_use_server_time(self: &mut Self, value: bool) {
-        self.use_server_time = value
-    }
-
-    pub fn accept_invalid_certs(self: &Self) -> bool {
-        return self.accept_invalid_certs;
-    }
-
-    pub fn set_accept_invalid_certs(self: &mut Self, value: bool) {
-        self.accept_invalid_certs = value
-    }
-
-    pub fn speed_limit(&self) -> Option<u64> {
-        self.speed_limit
-    }
-
-    pub fn connect_timeout(&self) -> Option<Duration> {
-        self.connect_timeout
-    }
-
-    pub fn set_connect_timeout(&mut self, value: Option<Duration>) {
-        self.connect_timeout = value;
-    }
-
-    pub fn set_speed_limit(&mut self, value: Option<u64>) {
-        self.speed_limit = value;
+    pub async fn set_config(&mut self, value: Config) -> Result<(), AcquireError> {
+        let old_max = self.config.max_concurrent_downloads;
+        self.config = value;
+        let new_max = self.config.max_concurrent_downloads;
+        if new_max > old_max {
+            let add_count = new_max.saturating_sub(old_max);
+            self.semaphore.add_permits(add_count);
+        } else if new_max < old_max {
+            let forget_count = old_max.saturating_sub(new_max);
+            // Acquire forget_count permits (will wait until in-use permits are released)
+            let _perm = Arc::clone(&self.semaphore)
+                .acquire_many_owned(forget_count as u32)
+                .await?;
+            // Prevent release of these permits so they are permanently consumed
+            _perm.forget();
+        }
+        Ok(())
     }
 
     pub async fn evaluate<CR>(
@@ -226,21 +101,21 @@ impl DownloadManager {
         if let Some(creds) = &credentials {
             req = req.basic_auth(creds.username(), creds.password());
         }
-        if !self.user_agent.is_some() && self.randomize_user_agent {
+        if self.config.user_agent.is_none() && self.config.randomize_user_agent {
             req = req.header(USER_AGENT, random_user_agent());
         }
 
         let resp = req.send().await?;
         let info = ResponseInfo::from(resp);
         let instruction = Download::from_response_info(
-            &self.data_dir,
+            &self.config.download_dir,
             save_dir,
             info,
-            self.max_connections,
-            self.use_server_time,
+            self.config.max_connections,
+            self.config.use_server_time,
             credentials,
-            self.proxy.clone(),
-            self.headers.clone(),
+            Option::<Proxy>::from(&self.config),
+            Some(HeaderMap::from(&self.config)),
         );
 
         let instruction = resolve_save_conflicts(instruction, conflict_resolver).await?;
@@ -303,13 +178,9 @@ impl DownloadManager {
 
     fn get_client(self: &Self, instructions: Option<&Download>) -> Result<Client, OdlError> {
         let mut client = reqwest::Client::builder();
-        if let Some(proxy) = &self.proxy {
-            client = client.proxy(proxy.clone());
-        }
-        if let Some(headers) = &self.headers {
-            client = client.default_headers(headers.clone());
-        }
+
         if let Some(download) = instructions {
+            // we already have passed our config's headers and proxy to Download at evaluation, no need to check config here
             if let Some(proxy) = download.proxy() {
                 client = client.proxy(proxy.clone());
             }
@@ -317,15 +188,24 @@ impl DownloadManager {
             if let Some(headers) = download.headers() {
                 client = client.default_headers(headers.clone());
             }
+        } else {
+            // we want to evaluate the download, so we use config here
+            if self.config.headers.as_ref().is_some_and(|x| !x.is_empty()) {
+                client = client.default_headers(HeaderMap::from(&self.config));
+            }
+            if let Some(proxy) = Option::<Proxy>::from(&self.config) {
+                client = client.proxy(proxy);
+            }
         }
-        if self.accept_invalid_certs {
-            client = client.danger_accept_invalid_certs(self.accept_invalid_certs)
+
+        if self.config.accept_invalid_certs {
+            client = client.danger_accept_invalid_certs(self.config.accept_invalid_certs)
         }
-        if let Some(user_agent) = &self.user_agent {
+        if let Some(user_agent) = &self.config.user_agent {
             client = client.user_agent(user_agent.clone());
         }
-        if let Some(timeout) = self.connect_timeout {
-            client = client.connect_timeout(timeout);
+        if let Some(timeout) = &self.config.connect_timeout {
+            client = client.connect_timeout(timeout.clone());
         }
         Ok(client.build()?)
     }
@@ -365,10 +245,10 @@ impl DownloadManager {
                 .collect::<Vec<PartDetails>>();
 
             if !to_download.is_empty() {
-                let randomize_user_agent = if self.user_agent.is_some() {
+                let randomize_user_agent = if self.config.user_agent.is_some() {
                     false
                 } else {
-                    self.randomize_user_agent
+                    self.config.randomize_user_agent
                 };
 
                 let client = self.get_client(Some(&instruction))?;
@@ -378,7 +258,7 @@ impl DownloadManager {
                     client,
                     randomize_user_agent,
                     Span::current(),
-                    self.speed_limit,
+                    self.config.speed_limit,
                 );
 
                 let mut mdata = downloader.run().await?;
@@ -404,56 +284,6 @@ impl DownloadManager {
                 })
             }
         }
-    }
-}
-
-impl DownloadManagerBuilder {
-    fn validate(&self) -> Result<(), DownloadManagerBuilderError> {
-        if self
-            .max_concurrent_downloads
-            .is_some_and(|max| max <= 0 || max >= Semaphore::MAX_PERMITS)
-        {
-            return Err(DownloadManagerBuilderError::UninitializedField(
-                "max_concurrent_downloads",
-            ));
-        }
-        if let Some(max_connections) = self.max_connections {
-            if max_connections == 0 {
-                return Err(DownloadManagerBuilderError::UninitializedField(
-                    "max_connections",
-                ));
-            }
-        }
-        if let Some(wait_between_retries) = self.wait_between_retries {
-            if wait_between_retries == Duration::from_millis(0) {
-                return Err(DownloadManagerBuilderError::UninitializedField(
-                    "wait_between_retries",
-                ));
-            }
-        }
-        if let Some(Some(limit)) = self.speed_limit {
-            if limit == 0 {
-                return Err(DownloadManagerBuilderError::UninitializedField(
-                    "speed_limit",
-                ));
-            }
-        }
-        if let Some(Some(timeout)) = self.connect_timeout {
-            if timeout == Duration::from_millis(0) {
-                return Err(DownloadManagerBuilderError::UninitializedField(
-                    "request_timeout",
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    pub fn build(&self) -> Result<DownloadManager, DownloadManagerBuilderError> {
-        let result = self.private_build()?;
-        result
-            .semaphore
-            .add_permits(self.max_concurrent_downloads.unwrap_or(3));
-        Ok(result)
     }
 }
 
@@ -548,11 +378,12 @@ mod tests {
         // Build DownloadManager with 2 connections and separate download/save dirs
         let tmp_data_dir = tempfile::tempdir()?;
         let tmp_save_dir = tempfile::tempdir()?;
-        let dlm = DownloadManagerBuilder::default()
-            .data_dir(tmp_data_dir.path().to_path_buf())
+        let cfg = crate::config::ConfigBuilder::default()
+            .config_file(tmp_data_dir.path().to_path_buf())
             .max_connections(2)
             .build()
             .unwrap();
+        let dlm = DownloadManager::new(cfg);
 
         // Evaluate to get Download instruction
         let save_resolver = AlwaysReplaceResolver {};
@@ -638,11 +469,12 @@ mod tests {
         let final_path = tmp_save_dir.path().join(filename);
         tokio::fs::write(&final_path, b"x").await?;
 
-        let dlm = DownloadManagerBuilder::default()
-            .data_dir(tmp_data_dir.path().to_path_buf())
+        let cfg = crate::config::ConfigBuilder::default()
+            .config_file(tmp_data_dir.path().to_path_buf())
             .max_connections(1)
             .build()
             .unwrap();
+        let dlm = DownloadManager::new(cfg);
 
         struct AbortFinalResolver;
         #[async_trait]
@@ -707,11 +539,12 @@ mod tests {
         let final_path = tmp_save_dir.path().join(filename);
         tokio::fs::write(&final_path, b"x").await?;
 
-        let dlm = DownloadManagerBuilder::default()
-            .data_dir(tmp_data_dir.path().to_path_buf())
+        let cfg = crate::config::ConfigBuilder::default()
+            .config_file(tmp_data_dir.path().to_path_buf())
             .max_connections(1)
             .build()
             .unwrap();
+        let dlm = DownloadManager::new(cfg);
 
         struct AddNumberResolver;
         #[async_trait]
@@ -786,11 +619,12 @@ mod tests {
         // Build DownloadManager with 1 connection and separate download/save dirs
         let tmp_data_dir = tempfile::tempdir()?;
         let tmp_save_dir = tempfile::tempdir()?;
-        let dlm = DownloadManagerBuilder::default()
-            .data_dir(tmp_data_dir.path().to_path_buf())
+        let cfg = crate::config::ConfigBuilder::default()
+            .config_file(tmp_data_dir.path().to_path_buf())
             .max_connections(1)
             .build()
             .unwrap();
+        let dlm = DownloadManager::new(cfg);
 
         // Evaluate to get Download instruction
         let save_resolver = AlwaysReplaceResolver {};
@@ -865,11 +699,12 @@ mod tests {
         // Build DownloadManager with 2 connections and separate download/save dirs
         let tmp_data_dir = tempfile::tempdir()?;
         let tmp_save_dir = tempfile::tempdir()?;
-        let dlm = DownloadManagerBuilder::default()
-            .data_dir(tmp_data_dir.path().to_path_buf())
+        let cfg = crate::config::ConfigBuilder::default()
+            .config_file(tmp_data_dir.path().to_path_buf())
             .max_connections(2)
             .build()
             .unwrap();
+        let dlm = DownloadManager::new(cfg);
 
         // Evaluate to get Download instruction
         let save_resolver = AlwaysReplaceResolver {};
@@ -981,11 +816,12 @@ mod tests {
         // Build DownloadManager with 2 connections (will be forced to 1) and separate download/save dirs
         let tmp_data_dir = tempfile::tempdir()?;
         let tmp_save_dir = tempfile::tempdir()?;
-        let dlm = DownloadManagerBuilder::default()
-            .data_dir(tmp_data_dir.path().to_path_buf())
+        let cfg = crate::config::ConfigBuilder::default()
+            .config_file(tmp_data_dir.path().to_path_buf())
             .max_connections(2)
             .build()
             .unwrap();
+        let dlm = DownloadManager::new(cfg);
 
         // Evaluate to get Download instruction
         let save_resolver = AlwaysReplaceResolver {};
@@ -1084,11 +920,12 @@ mod tests {
         // Build DownloadManager with 1 connection and separate download/save dirs
         let tmp_data_dir = tempfile::tempdir()?;
         let tmp_save_dir = tempfile::tempdir()?;
-        let dlm = DownloadManagerBuilder::default()
-            .data_dir(tmp_data_dir.path().to_path_buf())
+        let cfg = crate::config::ConfigBuilder::default()
+            .config_file(tmp_data_dir.path().to_path_buf())
             .max_connections(1)
             .build()
             .unwrap();
+        let dlm = DownloadManager::new(cfg);
 
         // Evaluate to get Download instruction
         let save_resolver = AlwaysReplaceResolver {};
@@ -1270,13 +1107,14 @@ mod tests {
         // Build DownloadManager with custom user agent
         let tmp_data_dir = tempfile::tempdir()?;
         let tmp_save_dir = tempfile::tempdir()?;
-        let dlm = DownloadManagerBuilder::default()
-            .data_dir(tmp_data_dir.path().to_path_buf())
+        let cfg = crate::config::ConfigBuilder::default()
+            .config_file(tmp_data_dir.path().to_path_buf())
             .max_connections(1)
             .user_agent(Some(custom_ua.to_string()))
             .randomize_user_agent(false)
             .build()
             .unwrap();
+        let dlm = DownloadManager::new(cfg);
 
         // Evaluate to get Download instruction
         let save_resolver = AlwaysReplaceResolver {};
@@ -1362,12 +1200,13 @@ mod tests {
         // Build DownloadManager with randomize_user_agent = true and no custom user agent
         let tmp_data_dir = tempfile::tempdir()?;
         let tmp_save_dir = tempfile::tempdir()?;
-        let dlm = DownloadManagerBuilder::default()
-            .data_dir(tmp_data_dir.path().to_path_buf())
+        let cfg = crate::config::ConfigBuilder::default()
+            .config_file(tmp_data_dir.path().to_path_buf())
             .max_connections(1)
             .randomize_user_agent(true)
             .build()
             .unwrap();
+        let dlm = DownloadManager::new(cfg);
 
         // Evaluate to get Download instruction
         let save_resolver = AlwaysReplaceResolver {};

@@ -4,8 +4,8 @@ use thiserror::Error;
 use tokio::{sync::AcquireError, task::JoinError};
 
 use crate::{
+    config::ConfigBuilderError,
     conflict::{SaveConflict, ServerConflict},
-    download_manager::DownloadManagerBuilderError,
 };
 
 #[derive(Error, Debug)]
@@ -60,7 +60,7 @@ pub enum OdlError {
     #[error("Error: {message:?}")]
     CliError { message: String },
     #[error(transparent)]
-    DownloadManagerBuilderError(#[from] DownloadManagerBuilderError),
+    ConfigBuilderError(#[from] ConfigBuilderError),
     #[error(transparent)]
     MetadataError(#[from] MetadataError),
     #[error("Other error: {message:?}")]

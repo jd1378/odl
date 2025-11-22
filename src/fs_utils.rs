@@ -66,11 +66,17 @@ pub async fn set_file_mtime_async<P: AsRef<Path>>(path: &P, unix_time_secs: i64)
     Ok(())
 }
 
-pub fn get_odl_dir() -> Option<PathBuf> {
-    dirs::data_dir().map(|mut path| {
-        path.push("odl");
-        path
-    })
+pub fn get_odl_dir() -> PathBuf {
+    dirs::data_dir()
+        .map(|mut path| {
+            path.push("odl");
+            path
+        })
+        .unwrap_or_else(|| {
+            let tmp_dir = std::path::PathBuf::from("/tmp/odl");
+            std::fs::create_dir_all(&tmp_dir).ok();
+            tmp_dir
+        })
 }
 
 /// reads a protobuf delimited encoded message of Type `M` and return if successful
