@@ -59,10 +59,10 @@ impl Downloader {
         client: Client,
         randomize_user_agent: bool,
         aggregator_span: Span,
-        download_speed_limit: Option<u64>,
+        speed_limit: Option<u64>,
     ) -> Self {
         let concurrency_limit = metadata.max_connections as usize;
-        let speed_limiter = download_speed_limit
+        let speed_limiter = speed_limit
             .filter(|limit| *limit > 0)
             .map(|limit| Arc::new(BandwidthLimiter::new(limit)));
         Self {

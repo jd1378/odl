@@ -93,10 +93,11 @@ async fn main() -> Result<(), OdlError> {
                 max_concurrent_downloads,
                 max_retries,
                 wait_between_retries,
-                download_speed_limit,
+                speed_limit,
                 user_agent,
                 randomize_user_agent,
                 proxy,
+                timeout,
                 use_server_time,
                 accept_invalid_certs,
             } => {
@@ -157,8 +158,8 @@ async fn main() -> Result<(), OdlError> {
                 if let Some(v) = wait_between_retries {
                     cfg.wait_between_retries_secs = Some(*v);
                 }
-                if let Some(v) = download_speed_limit {
-                    cfg.download_speed_limit = Some(*v);
+                if let Some(v) = speed_limit {
+                    cfg.speed_limit = Some(*v);
                 }
                 if let Some(v) = user_agent {
                     cfg.user_agent = Some(v.clone());
@@ -168,6 +169,9 @@ async fn main() -> Result<(), OdlError> {
                 }
                 if let Some(v) = proxy {
                     cfg.proxy = Some(v.clone());
+                }
+                if let Some(v) = *timeout {
+                    cfg.connect_timeout_secs = Some(v.as_secs_f64());
                 }
                 if let Some(v) = use_server_time {
                     cfg.use_server_time = Some(*v);
@@ -386,7 +390,7 @@ fn build_download_manager(args: &Args) -> Result<DownloadManager, OdlError> {
         .accept_invalid_certs
         .or(cfg.accept_invalid_certs)
         .unwrap_or(false);
-    let download_speed_limit = args.speed_limit.or(cfg.download_speed_limit);
+    let speed_limit = args.speed_limit.or(cfg.speed_limit);
 
     let mut builder = DownloadManagerBuilder::default();
     builder
@@ -399,7 +403,7 @@ fn build_download_manager(args: &Args) -> Result<DownloadManager, OdlError> {
         .proxy(proxy)
         .use_server_time(use_server_time)
         .accept_invalid_certs(accept_invalid_certs)
-        .download_speed_limit(download_speed_limit);
+        .speed_limit(speed_limit);
 
     // connect timeout preference: CLI timeout (if set) else config value
     if let Some(secs) = args

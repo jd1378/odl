@@ -17,7 +17,7 @@ pub struct Config {
     pub proxy: Option<String>,
     pub use_server_time: Option<bool>,
     pub accept_invalid_certs: Option<bool>,
-    pub download_speed_limit: Option<u64>,
+    pub speed_limit: Option<u64>,
     /// connect timeout in seconds (can be fractional)
     pub connect_timeout_secs: Option<f64>,
 }

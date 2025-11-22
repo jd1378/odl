@@ -97,7 +97,7 @@ pub struct DownloadManager {
 
     /// Optional maximum aggregate download speed per download in bytes per second.
     #[builder(default)]
-    download_speed_limit: Option<u64>,
+    speed_limit: Option<u64>,
 
     /// Optional timeout for connect phase of request
     #[builder(default)]
@@ -181,8 +181,8 @@ impl DownloadManager {
         self.accept_invalid_certs = value
     }
 
-    pub fn download_speed_limit(&self) -> Option<u64> {
-        self.download_speed_limit
+    pub fn speed_limit(&self) -> Option<u64> {
+        self.speed_limit
     }
 
     pub fn connect_timeout(&self) -> Option<Duration> {
@@ -193,8 +193,8 @@ impl DownloadManager {
         self.connect_timeout = value;
     }
 
-    pub fn set_download_speed_limit(&mut self, value: Option<u64>) {
-        self.download_speed_limit = value;
+    pub fn set_speed_limit(&mut self, value: Option<u64>) {
+        self.speed_limit = value;
     }
 
     pub async fn evaluate<CR>(
@@ -378,7 +378,7 @@ impl DownloadManager {
                     client,
                     randomize_user_agent,
                     Span::current(),
-                    self.download_speed_limit,
+                    self.speed_limit,
                 );
 
                 let mut mdata = downloader.run().await?;
@@ -431,10 +431,10 @@ impl DownloadManagerBuilder {
                 ));
             }
         }
-        if let Some(Some(limit)) = self.download_speed_limit {
+        if let Some(Some(limit)) = self.speed_limit {
             if limit == 0 {
                 return Err(DownloadManagerBuilderError::UninitializedField(
-                    "download_speed_limit",
+                    "speed_limit",
                 ));
             }
         }

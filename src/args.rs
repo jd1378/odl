@@ -236,7 +236,7 @@ pub struct Args {
     /// Maximum aggregate download speed per file in bytes per second.
     /// Accepts human-readable values like `100KB`, `1.5MiB`, `2G` (all units parsed as base 1024).
     /// When unset, downloads run at full speed.
-    #[arg(long, value_name = "BYTES_PER_SEC", value_parser = parse_speed)]
+    #[arg(short, long, value_name = "BYTES_PER_SEC", value_parser = parse_speed)]
     pub speed_limit: Option<u64>,
     #[command(subcommand)]
     pub command: Option<Commands>,
@@ -250,7 +250,8 @@ pub enum Commands {
         #[arg(long)]
         show: bool,
 
-        /// Directory where config is stored (defaults to standard odl dir)
+        /// Directory where config is stored (defaults to standard odl dir).
+        /// You can use this to configure different download managers in different directories.
         #[arg(long, value_name = "DIR")]
         data_dir: Option<PathBuf>,
 
@@ -271,8 +272,8 @@ pub enum Commands {
         wait_between_retries: Option<f64>,
 
         /// Download speed limit (bytes/sec) e.g. 1MiB
-        #[arg(long, value_name = "BYTES_PER_SEC")]
-        download_speed_limit: Option<u64>,
+        #[arg(short, long, value_name = "BYTES_PER_SEC", value_parser = parse_speed)]
+        speed_limit: Option<u64>,
 
         /// Custom user agent
         #[arg(long)]
@@ -285,6 +286,10 @@ pub enum Commands {
         /// Proxy as string
         #[arg(long)]
         proxy: Option<String>,
+
+        /// Timeout for HTTP requests. Accepts suffixes like `30s`, `5m`, `2h`, `1d` or long forms (`seconds`, `minutes`, `hours`, `days`). Default `5s`. Default Unit is seconds if omitted.
+        #[arg(short, long = "timeout", value_name = "DURATION", value_parser = parse_duration)]
+        timeout: Option<Duration>,
 
         /// Use server time when saving
         #[arg(long)]
