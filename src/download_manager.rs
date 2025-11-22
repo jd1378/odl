@@ -39,13 +39,13 @@ use crate::{
 #[derive(Builder, Debug)]
 #[builder(build_fn(validate = "Self::validate", private, name = "private_build"))]
 pub struct DownloadManager {
-    /// Directory of where to keep files when downloading. This is where we keep track of our downloads and configuration.
+    /// This is where we keep track of our downloads data, progress and configuration.
     #[builder(default = fs_utils::get_odl_dir().unwrap_or_else(|| {
                 let tmp_dir = std::path::PathBuf::from("/tmp/odl");
                 std::fs::create_dir_all(&tmp_dir).ok();
                 tmp_dir
             }))]
-    download_dir: PathBuf,
+    data_dir: PathBuf,
 
     /// Max connections that download manager can make in parallel for a single file
     #[builder(default = 4)]
@@ -233,7 +233,7 @@ impl DownloadManager {
         let resp = req.send().await?;
         let info = ResponseInfo::from(resp);
         let instruction = Download::from_response_info(
-            &self.download_dir,
+            &self.data_dir,
             save_dir,
             info,
             self.max_connections,
@@ -546,10 +546,10 @@ mod tests {
             .await;
 
         // Build DownloadManager with 2 connections and separate download/save dirs
-        let tmp_download_dir = tempfile::tempdir()?;
+        let tmp_data_dir = tempfile::tempdir()?;
         let tmp_save_dir = tempfile::tempdir()?;
         let dlm = DownloadManagerBuilder::default()
-            .download_dir(tmp_download_dir.path().to_path_buf())
+            .data_dir(tmp_data_dir.path().to_path_buf())
             .max_connections(2)
             .build()
             .unwrap();
@@ -632,14 +632,14 @@ mod tests {
             .await;
 
         // Prepare temp dirs and create final file to trigger conflict
-        let tmp_download_dir = tempfile::tempdir()?;
+        let tmp_data_dir = tempfile::tempdir()?;
         let tmp_save_dir = tempfile::tempdir()?;
         let filename = "file_abort";
         let final_path = tmp_save_dir.path().join(filename);
         tokio::fs::write(&final_path, b"x").await?;
 
         let dlm = DownloadManagerBuilder::default()
-            .download_dir(tmp_download_dir.path().to_path_buf())
+            .data_dir(tmp_data_dir.path().to_path_buf())
             .max_connections(1)
             .build()
             .unwrap();
@@ -701,14 +701,14 @@ mod tests {
             .await;
 
         // Prepare temp dirs and create final file to trigger suggestion
-        let tmp_download_dir = tempfile::tempdir()?;
+        let tmp_data_dir = tempfile::tempdir()?;
         let tmp_save_dir = tempfile::tempdir()?;
         let filename = "file_add";
         let final_path = tmp_save_dir.path().join(filename);
         tokio::fs::write(&final_path, b"x").await?;
 
         let dlm = DownloadManagerBuilder::default()
-            .download_dir(tmp_download_dir.path().to_path_buf())
+            .data_dir(tmp_data_dir.path().to_path_buf())
             .max_connections(1)
             .build()
             .unwrap();
@@ -784,10 +784,10 @@ mod tests {
             .await;
 
         // Build DownloadManager with 1 connection and separate download/save dirs
-        let tmp_download_dir = tempfile::tempdir()?;
+        let tmp_data_dir = tempfile::tempdir()?;
         let tmp_save_dir = tempfile::tempdir()?;
         let dlm = DownloadManagerBuilder::default()
-            .download_dir(tmp_download_dir.path().to_path_buf())
+            .data_dir(tmp_data_dir.path().to_path_buf())
             .max_connections(1)
             .build()
             .unwrap();
@@ -863,10 +863,10 @@ mod tests {
             .await;
 
         // Build DownloadManager with 2 connections and separate download/save dirs
-        let tmp_download_dir = tempfile::tempdir()?;
+        let tmp_data_dir = tempfile::tempdir()?;
         let tmp_save_dir = tempfile::tempdir()?;
         let dlm = DownloadManagerBuilder::default()
-            .download_dir(tmp_download_dir.path().to_path_buf())
+            .data_dir(tmp_data_dir.path().to_path_buf())
             .max_connections(2)
             .build()
             .unwrap();
@@ -979,10 +979,10 @@ mod tests {
             .await;
 
         // Build DownloadManager with 2 connections (will be forced to 1) and separate download/save dirs
-        let tmp_download_dir = tempfile::tempdir()?;
+        let tmp_data_dir = tempfile::tempdir()?;
         let tmp_save_dir = tempfile::tempdir()?;
         let dlm = DownloadManagerBuilder::default()
-            .download_dir(tmp_download_dir.path().to_path_buf())
+            .data_dir(tmp_data_dir.path().to_path_buf())
             .max_connections(2)
             .build()
             .unwrap();
@@ -1082,10 +1082,10 @@ mod tests {
             .await;
 
         // Build DownloadManager with 1 connection and separate download/save dirs
-        let tmp_download_dir = tempfile::tempdir()?;
+        let tmp_data_dir = tempfile::tempdir()?;
         let tmp_save_dir = tempfile::tempdir()?;
         let dlm = DownloadManagerBuilder::default()
-            .download_dir(tmp_download_dir.path().to_path_buf())
+            .data_dir(tmp_data_dir.path().to_path_buf())
             .max_connections(1)
             .build()
             .unwrap();
@@ -1268,10 +1268,10 @@ mod tests {
             .await;
 
         // Build DownloadManager with custom user agent
-        let tmp_download_dir = tempfile::tempdir()?;
+        let tmp_data_dir = tempfile::tempdir()?;
         let tmp_save_dir = tempfile::tempdir()?;
         let dlm = DownloadManagerBuilder::default()
-            .download_dir(tmp_download_dir.path().to_path_buf())
+            .data_dir(tmp_data_dir.path().to_path_buf())
             .max_connections(1)
             .user_agent(Some(custom_ua.to_string()))
             .randomize_user_agent(false)
@@ -1360,10 +1360,10 @@ mod tests {
             .await;
 
         // Build DownloadManager with randomize_user_agent = true and no custom user agent
-        let tmp_download_dir = tempfile::tempdir()?;
+        let tmp_data_dir = tempfile::tempdir()?;
         let tmp_save_dir = tempfile::tempdir()?;
         let dlm = DownloadManagerBuilder::default()
-            .download_dir(tmp_download_dir.path().to_path_buf())
+            .data_dir(tmp_data_dir.path().to_path_buf())
             .max_connections(1)
             .randomize_user_agent(true)
             .build()

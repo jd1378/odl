@@ -180,10 +180,10 @@ pub struct Args {
     #[arg(short, long, value_name = "FILE|DIR")]
     pub output: Option<PathBuf>,
 
-    /// This is the path where odl tracks download progress.
+    /// This is the path where odl tracks download progress and it's config.
     /// All data will be downloaded here first before being appended at the output location.
     #[arg(short, long, value_name = "DIR")]
-    pub temp_download_dir: Option<PathBuf>,
+    pub data_dir: Option<PathBuf>,
 
     /// User agent to use for making requests. This option overrides random-user-agent.
     #[arg(short = 'U', long)]
@@ -197,7 +197,7 @@ pub struct Args {
     pub proxy: Option<String>,
 
     /// Timeout for HTTP requests. Accepts suffixes like `30s`, `5m`, `2h`, `1d` or long forms (`seconds`, `minutes`, `hours`, `days`). Default `5s`. Default Unit is seconds if omitted.
-    #[arg(long = "timeout", value_name = "DURATION", value_parser = parse_duration)]
+    #[arg(short, long = "timeout", value_name = "DURATION", value_parser = parse_duration)]
     pub timeout: Option<Duration>,
 
     /// Max number of retries in case of a network error
@@ -244,15 +244,15 @@ pub struct Args {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Configure persistent download-manager settings saved in download_dir/config.toml
+    /// Configure persistent download-manager settings saved in odl/config.toml
     Config {
-        /// Print current configuration and exit
+        /// Print current configuration path and content
         #[arg(long)]
         show: bool,
 
         /// Directory where config is stored (defaults to standard odl dir)
         #[arg(long, value_name = "DIR")]
-        download_dir: Option<PathBuf>,
+        data_dir: Option<PathBuf>,
 
         /// Set max connections per-file
         #[arg(long, value_name = "COUNT")]

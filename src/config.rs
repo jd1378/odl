@@ -6,7 +6,7 @@ use std::{fs, io};
 /// unspecified values can fall back to code defaults.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
-    pub download_dir: Option<PathBuf>,
+    pub data_dir: Option<PathBuf>,
     pub max_connections: Option<u64>,
     pub max_concurrent_downloads: Option<usize>,
     pub max_retries: Option<u64>,
@@ -24,16 +24,16 @@ pub struct Config {
 
 impl Config {
     /// Path to the config file inside the provided download dir.
-    pub fn config_path_for_dir<P: AsRef<Path>>(download_dir: P) -> PathBuf {
-        let mut p = download_dir.as_ref().to_path_buf();
+    pub fn config_path_for_dir<P: AsRef<Path>>(data_dir: P) -> PathBuf {
+        let mut p = data_dir.as_ref().to_path_buf();
         p.push("config.toml");
         p
     }
 
     /// Load configuration from the given directory's `config.toml`.
     /// If file does not exist, returns Ok(Default::default()).
-    pub fn load_from_dir<P: AsRef<Path>>(download_dir: P) -> Result<Config, io::Error> {
-        let path = Config::config_path_for_dir(download_dir);
+    pub fn load_from_dir<P: AsRef<Path>>(data_dir: P) -> Result<Config, io::Error> {
+        let path = Config::config_path_for_dir(data_dir);
         if !path.exists() {
             return Ok(Config::default());
         }
@@ -43,9 +43,9 @@ impl Config {
         Ok(cfg)
     }
 
-    /// Save configuration to `download_dir/config.toml`. Creates parent dir if needed.
-    pub fn save_to_dir<P: AsRef<Path>>(&self, download_dir: P) -> Result<(), io::Error> {
-        let cfg_path = Config::config_path_for_dir(download_dir);
+    /// Save configuration to `data_dir/config.toml`. Creates parent dir if needed.
+    pub fn save_to_dir<P: AsRef<Path>>(&self, data_dir: P) -> Result<(), io::Error> {
+        let cfg_path = Config::config_path_for_dir(data_dir);
         if let Some(p) = cfg_path.parent() {
             fs::create_dir_all(p)?;
         }

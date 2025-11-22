@@ -88,7 +88,7 @@ async fn main() -> Result<(), OdlError> {
         match cmd {
             args::Commands::Config {
                 show,
-                download_dir,
+                data_dir,
                 max_connections,
                 max_concurrent_downloads,
                 max_retries,
@@ -101,9 +101,9 @@ async fn main() -> Result<(), OdlError> {
                 accept_invalid_certs,
             } => {
                 // determine directory where config is stored
-                let target_dir = if let Some(d) = download_dir {
+                let target_dir = if let Some(d) = data_dir {
                     d.clone()
-                } else if let Some(d) = &args.temp_download_dir {
+                } else if let Some(d) = &args.data_dir {
                     d.clone()
                 } else {
                     dirs::data_dir()
@@ -127,8 +127,18 @@ async fn main() -> Result<(), OdlError> {
                 };
 
                 if *show {
+                    println!(
+                        "# config path: {}",
+                        Config::config_path_for_dir(&target_dir).display()
+                    );
                     match toml::to_string_pretty(&cfg) {
-                        Ok(s) => println!("{}", s),
+                        Ok(s) => {
+                            if s.trim().is_empty() {
+                                println!("# config is empty")
+                            } else {
+                                println!("{}", s)
+                            }
+                        }
                         Err(e) => eprintln!("Failed to format config: {}", e),
                     }
                     return Ok(());
@@ -318,7 +328,7 @@ async fn main() -> Result<(), OdlError> {
 #[instrument(skip(args), name = "Warming up odl...")]
 fn build_download_manager(args: &Args) -> Result<DownloadManager, OdlError> {
     // determine where config would live (same logic used by download manager default)
-    let config_dir = if let Some(d) = &args.temp_download_dir {
+    let config_dir = if let Some(d) = &args.data_dir {
         d.clone()
     } else {
         dirs::data_dir()
@@ -400,8 +410,8 @@ fn build_download_manager(args: &Args) -> Result<DownloadManager, OdlError> {
         builder.connect_timeout(Some(Duration::from_secs_f64(secs)));
     }
 
-    if let Some(download_dir) = args.temp_download_dir.clone().or(cfg.download_dir) {
-        builder.download_dir(download_dir);
+    if let Some(data_dir) = args.data_dir.clone().or(cfg.data_dir) {
+        builder.data_dir(data_dir);
     }
 
     if !args.headers.is_empty() {
