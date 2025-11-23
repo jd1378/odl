@@ -66,7 +66,7 @@ impl SaveConflictResolver for CliResolver {
     }
 }
 
-pub const PROGRESS_CHARS: &'static str = "█▇▆▅▄▃▂▁";
+pub const PROGRESS_CHARS: &str = "█▇▆▅▄▃▂▁";
 
 #[tokio::main]
 async fn main() -> Result<(), OdlError> {
@@ -110,10 +110,9 @@ async fn main() -> Result<(), OdlError> {
                     Config::default_config_file()
                 };
 
-                let mut cfg: Config = match Config::load_from_file(&config_path).await {
-                    Ok(c) => c,
-                    Err(_) => Config::default(),
-                };
+                let mut cfg: Config = Config::load_from_file(&config_path)
+                    .await
+                    .unwrap_or_default();
 
                 if *show {
                     println!("# config path: {}", config_path.display());
@@ -323,10 +322,9 @@ async fn build_download_manager(args: &Args) -> Result<DownloadManager, OdlError
         Config::default_config_file()
     };
 
-    let cfg = match Config::load_from_file(&config_file).await {
-        Ok(c) => c,
-        Err(_) => Config::default(),
-    };
+    let cfg = Config::load_from_file(&config_file)
+        .await
+        .unwrap_or_default();
 
     let max_connections: u64 = args.max_connections.unwrap_or(cfg.max_connections);
     let max_concurrent_downloads: usize = args

@@ -538,6 +538,7 @@ impl LimiterState {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn download_part(
     client: Arc<Client>,
     instruction: Arc<Download>,

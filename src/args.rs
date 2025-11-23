@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 fn parse_speed(s: &str) -> Result<u64, String> {
     let s = s.trim();
     if s.is_empty() {
-        return Err("empty speed".to_string());
+        return Err("empty speed string".to_string());
     }
 
     // Remove common trailing rate markers like `/s` or `bps` (case-insensitive)
@@ -47,7 +47,7 @@ fn parse_speed(s: &str) -> Result<u64, String> {
 
     let suffix_owned = suf_part
         .trim()
-        .trim_start_matches(|c: char| c == ' ' || c == '\t' || c == '\'')
+        .trim_start_matches([' ', '\t', '\''])
         .to_lowercase();
 
     // Determine multiplier (all based on 1024)
@@ -74,7 +74,7 @@ fn parse_speed(s: &str) -> Result<u64, String> {
 
     let bytes_f = value * multiplier;
     if !bytes_f.is_finite() || bytes_f < 0.0 {
-        return Err("resulting speed out of range".to_string());
+        return Err("resulting speed is out of range".to_string());
     }
     let bytes = bytes_f as u128; // use wider intermediate to reduce overflow risk
     if bytes > (u64::MAX as u128) {
@@ -86,7 +86,7 @@ fn parse_speed(s: &str) -> Result<u64, String> {
 fn parse_duration(s: &str) -> Result<Duration, String> {
     let s = s.trim();
     if s.is_empty() {
-        return Err("empty duration".to_string());
+        return Err("empty duration string".to_string());
     }
 
     // split numeric prefix and suffix
@@ -110,14 +110,14 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
     };
 
     let value =
-        f64::from_str(num_part).map_err(|e| format!("invalid number '{}': {}", num_part, e))?;
+        f64::from_str(num_part).map_err(|e| format!("Invalid number '{}': {}", num_part, e))?;
     if !value.is_finite() || value < 0.0 {
-        return Err("duration must be non-negative finite number".to_string());
+        return Err("Duration must be a non-negative finite number".to_string());
     }
 
     let suffix = suf_part
         .trim()
-        .trim_start_matches(|c: char| c == ' ' || c == '\t' || c == '\'')
+        .trim_start_matches([' ', '\t', '\''])
         .to_lowercase();
 
     let multiplier_secs = match suffix.as_str() {
@@ -143,7 +143,7 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
 
     let secs_f = value * multiplier_secs;
     if !secs_f.is_finite() || secs_f < 0.0 {
-        return Err("resulting duration out of range".to_string());
+        return Err("Resulting duration is out of range".to_string());
     }
     Ok(Duration::from_secs_f64(secs_f))
 }

@@ -43,14 +43,14 @@ pub struct DownloadManager {
 impl DownloadManager {
     pub fn new(config: Config) -> DownloadManager {
         let max_concurrent_downloads = config.max_concurrent_downloads;
-        return DownloadManager {
+        DownloadManager {
             config,
             semaphore: Arc::new(Semaphore::new(max_concurrent_downloads)),
-        };
+        }
     }
 
-    pub fn config(self: &Self) -> &Config {
-        return &self.config;
+    pub fn config(&self) -> &Config {
+        &self.config
     }
 
     pub async fn set_config(&mut self, value: Config) -> Result<(), AcquireError> {
@@ -73,7 +73,7 @@ impl DownloadManager {
     }
 
     pub async fn evaluate<CR>(
-        self: &Self,
+        &self,
         url: Url,
         save_dir: PathBuf,
         credentials: Option<Credentials>,
@@ -127,12 +127,12 @@ impl DownloadManager {
             current_span.pb_set_length(0);
         }
 
-        return Ok(instruction);
+        Ok(instruction)
     }
 
     /// Immediately starts a download using the given instruction and conflict_resolver
     pub async fn download<CR>(
-        self: &Self,
+        &self,
         instruction: Download,
         conflict_resolver: &CR,
     ) -> Result<PathBuf, OdlError>
@@ -151,7 +151,7 @@ impl DownloadManager {
         {
             Ok(f) => {
                 let f = f.into_std().await;
-                if let Err(_) = f.try_lock_exclusive() {
+                if f.try_lock_exclusive().is_err() {
                     return Err(OdlError::MetadataError(MetadataError::LockfileInUse));
                 }
 
@@ -159,15 +159,13 @@ impl DownloadManager {
                 let _ = FileExt::unlock(&f);
                 result
             }
-            Err(e) => {
-                return Err(OdlError::StdIoError {
-                    e,
-                    extra_info: Some(format!(
-                        "Failed to open lockfile for exclusive locking at {}",
-                        instruction.lockfile_path().display(),
-                    )),
-                });
-            }
+            Err(e) => Err(OdlError::StdIoError {
+                e,
+                extra_info: Some(format!(
+                    "Failed to open lockfile for exclusive locking at {}",
+                    instruction.lockfile_path().display(),
+                )),
+            }),
         }
     }
 
@@ -176,7 +174,7 @@ impl DownloadManager {
         self.semaphore.acquire().await
     }
 
-    fn get_client(self: &Self, instructions: Option<&Download>) -> Result<Client, OdlError> {
+    fn get_client(&self, instructions: Option<&Download>) -> Result<Client, OdlError> {
         let mut client = reqwest::Client::builder();
 
         if let Some(download) = instructions {
@@ -205,13 +203,13 @@ impl DownloadManager {
             client = client.user_agent(user_agent.clone());
         }
         if let Some(timeout) = &self.config.connect_timeout {
-            client = client.connect_timeout(timeout.clone());
+            client = client.connect_timeout(*timeout);
         }
         Ok(client.build()?)
     }
 
     async fn process_download<CR>(
-        self: &Self,
+        &self,
         instruction: Download,
         conflict_resolver: &CR,
     ) -> Result<PathBuf, OdlError>
@@ -236,12 +234,7 @@ impl DownloadManager {
             let to_download = metadata
                 .parts
                 .iter()
-                .filter_map(|(_, p)| {
-                    if !p.finished {
-                        return Some(p.clone());
-                    }
-                    return None;
-                })
+                .filter_map(|(_, p)| if !p.finished { Some(p.clone()) } else { None })
                 .collect::<Vec<PartDetails>>();
 
             if !to_download.is_empty() {
@@ -267,8 +260,8 @@ impl DownloadManager {
                 metadata = mdata;
             }
 
-            let final_path = assemble_final_file(&mut metadata, &instruction).await?;
-            remove_all_parts(&instruction.download_dir()).await;
+            let final_path = assemble_final_file(&metadata, &instruction).await?;
+            remove_all_parts(instruction.download_dir()).await;
             Ok(final_path)
         } else {
             let final_path = instruction.final_file_path();

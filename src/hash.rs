@@ -187,7 +187,7 @@ mod tests {
 
     async fn hash_hex_async(algo: HashAlgorithm, data: &[u8]) -> String {
         let digest = HashDigest::from_reader_with_algorithm(
-            AsyncBufReader::new(&data[..]),
+            AsyncBufReader::new(data),
             algo,
             HashEncoding::Hex,
         )

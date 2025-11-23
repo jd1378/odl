@@ -1,6 +1,6 @@
 # ODL
 
-open source flexible download library and cli intended to be fast, reliable and easy to use.
+Open-source, flexible download library and CLI intended to be fast, reliable, and easy to use.
 
 ## Features
 
@@ -13,7 +13,7 @@ open source flexible download library and cli intended to be fast, reliable and 
 | 🌐 Custom HTTP headers & proxy support            | Flexible networking options for advanced use cases                                            |
 | 🔁 Retry logic                                   | Automatic retries with configurable backoff on failures                                       |
 | 🕒 Preserve modification times (optional)         | Optionally keeps server file modification timestamps                                          |
-| 🏷️ Server-sent file names         | Uses server-provided file names when available, otherwise falls back to the URL's last segment |
+| 🏷️ Server-sent file names         | Uses server-provided file names when available; otherwise falls back to the URL's last segment. |
 
 ## Roadmap
 

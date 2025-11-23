@@ -31,19 +31,20 @@ impl Credentials {
     pub fn new(username: &str, password: Option<&str>) -> Credentials {
         Credentials {
             username: username.to_string(),
-            password: password.map(|x| SecretString::from(x)),
+            password: password.map(SecretString::from),
         }
     }
 
     pub fn username(&self) -> &str {
-        return &self.username;
+        &self.username
     }
 
     pub fn password(&self) -> Option<&str> {
         if let Some(password) = &self.password {
-            return Some(password.expose_secret());
+            Some(password.expose_secret())
+        } else {
+            None
         }
-        return None;
     }
 
     /// Does nothing if credentials contain no password
@@ -54,19 +55,17 @@ impl Credentials {
             let target = target.to_owned();
 
             // Spawn blocking task to avoid blocking async runtime
-            return tokio::task::spawn_blocking(move || {
+            let inner = tokio::task::spawn_blocking(move || {
                 let entry = keyring::Entry::new_with_target(&target, "odl-rs", &username)?;
                 entry.set_password(&password)
             })
             .await
             .map_err(|e| {
-                keyring::Error::PlatformFailure(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                )))
+                keyring::Error::PlatformFailure(Box::new(std::io::Error::other(e.to_string())))
             })?;
+            inner?;
         }
-        return Ok(());
+        Ok(())
     }
 
     /// If no entry exists, password will be None
@@ -81,10 +80,7 @@ impl Credentials {
         })
         .await
         .map_err(|e| {
-            keyring::Error::PlatformFailure(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                e.to_string(),
-            )))
+            keyring::Error::PlatformFailure(Box::new(std::io::Error::other(e.to_string())))
         })? {
             Ok(pw) => Some(SecretString::from(pw)),
             Err(keyring::Error::NoEntry) => None,

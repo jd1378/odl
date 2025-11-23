@@ -84,13 +84,13 @@ pub async fn read_delimited_message_from_path<M: Message + Default, P: AsRef<Pat
     path: &P,
 ) -> io::Result<M> {
     let buf = tokio::fs::read(path).await?;
-    M::decode_length_delimited(&*buf).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+    M::decode_length_delimited(&*buf).map_err(io::Error::other)
 }
 
 pub async fn atomic_replace(src: PathBuf, dst: PathBuf) -> io::Result<()> {
     tokio::task::spawn_blocking(move || atomicwrites::replace_atomic(&src, &dst))
         .await
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))??;
+        .map_err(io::Error::other)??;
 
     Ok(())
 }
@@ -252,7 +252,7 @@ mod tests {
     async fn test_suggested_alternative_when_exists() {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("file.txt");
-        fs::write(&file_path, b"test").unwrap();
+        fs::write(file_path.clone(), b"test").unwrap();
         let result = is_filename_unique(&file_path).await.unwrap();
         assert_eq!(
             result,
@@ -293,9 +293,9 @@ mod tests {
         assert_eq!(result.unwrap(), IsUnique::Yes);
 
         // If the file exists, it should error due to missing parent
-        std::fs::write(&file_path, b"test").unwrap();
+        std::fs::write(file_path, b"test").unwrap();
         let result = is_filename_unique(&file_path).await;
-        let _ = std::fs::remove_file(&file_path);
+        let _ = std::fs::remove_file(file_path);
         assert!(result.is_err());
     }
 

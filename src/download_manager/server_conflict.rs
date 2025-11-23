@@ -146,7 +146,7 @@ where
         if let Some(conflict) = conflict {
             match conflict {
                 ServerConflict::FileChanged => {
-                    match conflict_resolver.resolve_file_changed(&instruction).await {
+                    match conflict_resolver.resolve_file_changed(instruction).await {
                         FileChangedResolution::Abort => {
                             return Err(OdlError::Conflict(ConflictError::Server { conflict }));
                         }
@@ -161,7 +161,7 @@ where
                     }
                 }
                 ServerConflict::NotResumable => {
-                    match conflict_resolver.resolve_not_resumable(&instruction).await {
+                    match conflict_resolver.resolve_not_resumable(instruction).await {
                         NotResumableResolution::Abort => {
                             return Err(OdlError::Conflict(ConflictError::Server { conflict }));
                         }
@@ -183,7 +183,7 @@ where
     }
 
     // write metadata changes back to disk, if any
-    persist_metadata(&metadata, &instruction).await?;
+    persist_metadata(&metadata, instruction).await?;
 
     Ok(metadata)
 }

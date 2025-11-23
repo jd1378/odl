@@ -146,7 +146,7 @@ impl Download {
     }
 
     pub fn etag(&self) -> &Option<String> {
-        return &self.etag;
+        &self.etag
     }
 
     pub fn last_modified(&self) -> Option<i64> {
@@ -213,7 +213,7 @@ impl Download {
                 .into_iter()
                 .map(|c| c.try_into())
                 .collect::<Result<Vec<HashDigest>, _>>()
-                .unwrap_or_else(|_| Vec::new()),
+                .unwrap_or_default(),
             credentials: None,
             requires_auth: metadata.requires_auth,
             requires_basic_auth: metadata.requires_basic_auth,
@@ -262,15 +262,16 @@ impl Download {
                         .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
                         .collect()
                 })
-                .unwrap_or_else(HashMap::new),
+                .unwrap_or_default(),
             max_connections: self.max_connections,
             parts: self.parts.clone(),
             finished: self.finished,
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn from_response_info(
-        download_dir: &path::PathBuf,
+        download_dir: &std::path::Path,
         save_dir: path::PathBuf,
         response_info: ResponseInfo,
         max_connections: u64,
@@ -321,10 +322,7 @@ impl Download {
             1
         };
 
-        let size = match size {
-            Some(s) => s,
-            None => 0,
-        };
+        let size = size.unwrap_or(0);
 
         const MIN_PART_SIZE: u64 = 300 * 1024; // 300 KB
 
@@ -337,14 +335,14 @@ impl Download {
                     offset: 0,
                     size,
                     ulid,
-                    finished: if size == 0 { true } else { false },
+                    finished: size == 0,
                 },
             );
             return parts;
         }
 
         let mut actual_connections = max_connections;
-        let min_connections = (size + MIN_PART_SIZE - 1) / MIN_PART_SIZE;
+        let min_connections = size.div_ceil(MIN_PART_SIZE);
         if actual_connections > min_connections {
             actual_connections = min_connections;
         }
@@ -400,7 +398,7 @@ impl DownloadBuilder {
         }
         if self
             .max_connections
-            .is_none_or(|x| x <= 0 || x >= Semaphore::MAX_PERMITS.try_into().unwrap_or(1_000_000))
+            .is_none_or(|x| x == 0 || x >= Semaphore::MAX_PERMITS.try_into().unwrap_or(1_000_000))
         {
             return Err(DownloadBuilderError::InvalidNumConnections);
         }
@@ -451,7 +449,7 @@ mod tests {
         let part = part_vec[0];
         assert_eq!(part.offset, 0);
         assert_eq!(part.size, 0);
-        assert_eq!(part.finished, true);
+        assert!(part.finished);
     }
 
     #[test]
@@ -462,7 +460,7 @@ mod tests {
         let part = part_vec[0];
         assert_eq!(part.offset, 0);
         assert_eq!(part.size, 1024 * 1024);
-        assert_eq!(part.finished, false);
+        assert!(!part.finished);
     }
 
     #[test]
@@ -475,7 +473,7 @@ mod tests {
         let part = part_vec[0];
         assert_eq!(part.offset, 0);
         assert_eq!(part.size, size);
-        assert_eq!(part.finished, false);
+        assert!(!part.finished);
     }
 
     #[test]
@@ -487,7 +485,7 @@ mod tests {
         let part = part_vec[0];
         assert_eq!(part.offset, 0);
         assert_eq!(part.size, size);
-        assert_eq!(part.finished, false);
+        assert!(!part.finished);
     }
 
     #[test]

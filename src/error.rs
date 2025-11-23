@@ -10,35 +10,35 @@ use crate::{
 
 #[derive(Error, Debug)]
 pub enum NetworkError {
-    #[error("Connect error")]
+    #[error("Connection error")]
     Connect,
     #[error("Connection timeout")]
     Timeout,
     #[error("Response body error")]
     ResponseBody,
-    #[error("Response status not success: {status_code:?}")]
+    #[error("Response status not successful: {status_code}")]
     Status { status_code: u16 },
-    #[error("Network error: {message:?}")]
+    #[error("Network error: {message}")]
     Other { message: String },
 }
 
 #[derive(Error, Debug)]
 pub enum ConflictError {
-    #[error("Download save aborted due to conflict: {conflict:?}")]
+    #[error("Save conflict: {conflict:?}")]
     Save { conflict: SaveConflict },
-    #[error("Download aborted due to conflict: {conflict:?}")]
+    #[error("Server conflict: {conflict:?}")]
     Server { conflict: ServerConflict },
-    #[error("Checksum mismatch: expected `{expected:?}`, got `{actual:?}`")]
+    #[error("Checksum mismatch: expected `{expected}`, got `{actual}`")]
     ChecksumMismatch { expected: String, actual: String },
 }
 
 #[derive(Error, Debug)]
 pub enum MetadataError {
-    #[error("Error while acquiring lock for metadata")]
+    #[error("Failed to acquire metadata lock")]
     LockfileInUse,
-    #[error("Error while decoding metadata: {e:?}")]
+    #[error("Failed to decode metadata: {e}")]
     MetadataDecodeError { e: DecodeError },
-    #[error("Unexpected error in odl related metadata: {message:?}")]
+    #[error("Metadata error: {message}")]
     Other { message: String },
 }
 
@@ -50,20 +50,20 @@ pub enum OdlError {
     Conflict(#[from] ConflictError),
     #[error("The input file is empty")]
     EmptyInputFile,
-    #[error("URL decode error: {message:?}")]
+    #[error("URL decode error: {message}")]
     UrlDecodeError { message: String },
-    #[error("Standard I/O error: {e:?} {extra_info:?}")]
+    #[error("I/O error: {e} {extra_info:?}")]
     StdIoError {
         e: std::io::Error,
         extra_info: Option<String>,
     },
-    #[error("Error: {message:?}")]
+    #[error("CLI error: {message}")]
     CliError { message: String },
     #[error(transparent)]
     ConfigBuilderError(#[from] ConfigBuilderError),
     #[error(transparent)]
     MetadataError(#[from] MetadataError),
-    #[error("Other error: {message:?}")]
+    #[error("{message}")]
     Other {
         message: String,
         origin: Box<dyn std::error::Error + Send + Sync>,
@@ -151,7 +151,7 @@ impl From<prost::DecodeError> for OdlError {
 impl From<AcquireError> for OdlError {
     fn from(e: AcquireError) -> Self {
         OdlError::Other {
-            message: "Failed to acquire permit from semaphore, this should not happen.".to_string(),
+            message: "Failed to acquire semaphore permit".to_string(),
             origin: Box::new(e),
         }
     }
@@ -168,8 +168,8 @@ impl From<keyring::Error> for OdlError {
 
 #[derive(Error, Debug)]
 pub enum DownloadParseError {
-    #[error("Failed to parse url: {message:?}")]
+    #[error("Failed to parse URL: {message}")]
     InvalidUrl { message: String },
-    #[error("Failed to parse timestamp")]
+    #[error("Invalid timestamp")]
     InvalidTimestamp,
 }

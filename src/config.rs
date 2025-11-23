@@ -203,40 +203,13 @@ impl ConfigBuilder {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn headers_preserve_order_on_parse() {
-        let s = r#"
-max_connections = 1
-
-[headers]
-Z-Header = "z"
-A-Header = "a"
-M-Header = "m"
-"#;
-
-        let cfg: Config = toml::from_str(s).expect("parse");
-        let headers = cfg.headers.expect("headers");
-        let keys: Vec<&str> = headers.keys().map(|k| k.as_str()).collect();
-        // TOML parsing order may vary; ensure we have the expected header names regardless of order.
-        let keys_set: std::collections::HashSet<&str> = keys.into_iter().collect();
-        let expected: std::collections::HashSet<&str> = vec!["Z-Header", "A-Header", "M-Header"]
-            .into_iter()
-            .collect();
-        assert_eq!(keys_set, expected);
-    }
-}
-
 impl Config {
     pub fn default_config_file() -> PathBuf {
-        return default_config_file();
+        default_config_file()
     }
 
     pub fn default_wait_between_retries() -> Duration {
-        return default_wait_between_retries();
+        default_wait_between_retries()
     }
 
     /// Path to the config file inside the provided download dir.
@@ -265,8 +238,7 @@ impl Config {
         if let Some(p) = pathbuf.parent() {
             fs::create_dir_all(p).await?;
         }
-        let s =
-            toml::to_string_pretty(&self).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let s = toml::to_string_pretty(&self).map_err(io::Error::other)?;
         fs::write(pathbuf, s).await?;
         Ok(())
     }
@@ -296,5 +268,32 @@ impl From<&Config> for Option<Proxy> {
         cfg.proxy
             .as_deref()
             .and_then(|s| reqwest::Proxy::all(s).ok())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn headers_preserve_order_on_parse() {
+        let s = r#"
+max_connections = 1
+
+[headers]
+Z-Header = "z"
+A-Header = "a"
+M-Header = "m"
+"#;
+
+        let cfg: Config = toml::from_str(s).expect("parse");
+        let headers = cfg.headers.expect("headers");
+        let keys: Vec<&str> = headers.keys().map(|k| k.as_str()).collect();
+        // TOML parsing order may vary; ensure we have the expected header names regardless of order.
+        let keys_set: std::collections::HashSet<&str> = keys.into_iter().collect();
+        let expected: std::collections::HashSet<&str> = vec!["Z-Header", "A-Header", "M-Header"]
+            .into_iter()
+            .collect();
+        assert_eq!(keys_set, expected);
     }
 }

@@ -34,15 +34,15 @@ impl ResponseInfo {
     }
 
     pub fn status_code(&self) -> u16 {
-        return self.status_code;
+        self.status_code
     }
 
     pub fn url(&self) -> &Url {
-        return &self.request_url;
+        &self.request_url
     }
 
     pub fn response_headers(&self) -> &HeaderMap {
-        return &self.response_headers;
+        &self.response_headers
     }
 
     /// Returns the MIME type (media type) from the response headers, if present.
@@ -109,7 +109,7 @@ impl ResponseInfo {
         if let Some(name) = self
             .request_url
             .path_segments()
-            .and_then(|segments| segments.last())
+            .and_then(|mut segments| segments.next_back())
             .filter(|s| !s.is_empty())
         {
             return name.to_string();

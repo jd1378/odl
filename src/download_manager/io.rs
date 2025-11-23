@@ -61,8 +61,7 @@ pub async fn assemble_final_file(
     }
 
     check_final_file_checksum(metadata, instruction, false).await?;
-
-    return Ok(final_path);
+    Ok(final_path)
 }
 
 /// Sums the sizes of all part files on disk for a given instruction and metadata.
@@ -87,14 +86,14 @@ pub async fn persist_metadata(
     instruction: &Download,
 ) -> io::Result<()> {
     let encoded = metadata.encode_length_delimited_to_vec();
-    persist_encoded_metadata(&encoded, instruction).await
+    persist_encoded_metadata(encoded.as_slice(), instruction).await
 }
 
-pub async fn persist_encoded_metadata(encoded: &Vec<u8>, instruction: &Download) -> io::Result<()> {
+pub async fn persist_encoded_metadata(encoded: &[u8], instruction: &Download) -> io::Result<()> {
     atomic_write(
         instruction.metadata_path(),
         instruction.metadata_temp_path(),
-        &encoded,
+        encoded,
     )
     .await
 }
