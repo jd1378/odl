@@ -201,7 +201,10 @@ impl Downloader {
         pending: &mut VecDeque<PartDetails>,
         active: &mut HashMap<String, ActiveTask>,
     ) -> Result<(), OdlError> {
-        while pending.len() < self.concurrency_limit {
+        // Only attempt to create enough pending parts to fill the spare capacity
+        // (i.e. `concurrency_limit - active.len()`)
+        let spare_capacity = self.concurrency_limit.saturating_sub(active.len());
+        while pending.len() < spare_capacity {
             if !self.try_split_active(active, pending).await? {
                 break;
             }
