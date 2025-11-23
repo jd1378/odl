@@ -379,7 +379,7 @@ mod tests {
         let tmp_data_dir = tempfile::tempdir()?;
         let tmp_save_dir = tempfile::tempdir()?;
         let cfg = crate::config::ConfigBuilder::default()
-            .config_file(tmp_data_dir.path().to_path_buf())
+            .download_dir(tmp_data_dir.path().to_path_buf())
             .max_connections(2)
             .build()
             .unwrap();
@@ -470,7 +470,7 @@ mod tests {
         tokio::fs::write(&final_path, b"x").await?;
 
         let cfg = crate::config::ConfigBuilder::default()
-            .config_file(tmp_data_dir.path().to_path_buf())
+            .download_dir(tmp_data_dir.path().to_path_buf())
             .max_connections(1)
             .build()
             .unwrap();
@@ -540,7 +540,7 @@ mod tests {
         tokio::fs::write(&final_path, b"x").await?;
 
         let cfg = crate::config::ConfigBuilder::default()
-            .config_file(tmp_data_dir.path().to_path_buf())
+            .download_dir(tmp_data_dir.path().to_path_buf())
             .max_connections(1)
             .build()
             .unwrap();
@@ -620,7 +620,7 @@ mod tests {
         let tmp_data_dir = tempfile::tempdir()?;
         let tmp_save_dir = tempfile::tempdir()?;
         let cfg = crate::config::ConfigBuilder::default()
-            .config_file(tmp_data_dir.path().to_path_buf())
+            .download_dir(tmp_data_dir.path().to_path_buf())
             .max_connections(1)
             .build()
             .unwrap();
@@ -700,7 +700,7 @@ mod tests {
         let tmp_data_dir = tempfile::tempdir()?;
         let tmp_save_dir = tempfile::tempdir()?;
         let cfg = crate::config::ConfigBuilder::default()
-            .config_file(tmp_data_dir.path().to_path_buf())
+            .download_dir(tmp_data_dir.path().to_path_buf())
             .max_connections(2)
             .build()
             .unwrap();
@@ -817,7 +817,7 @@ mod tests {
         let tmp_data_dir = tempfile::tempdir()?;
         let tmp_save_dir = tempfile::tempdir()?;
         let cfg = crate::config::ConfigBuilder::default()
-            .config_file(tmp_data_dir.path().to_path_buf())
+            .download_dir(tmp_data_dir.path().to_path_buf())
             .max_connections(2)
             .build()
             .unwrap();
@@ -921,7 +921,7 @@ mod tests {
         let tmp_data_dir = tempfile::tempdir()?;
         let tmp_save_dir = tempfile::tempdir()?;
         let cfg = crate::config::ConfigBuilder::default()
-            .config_file(tmp_data_dir.path().to_path_buf())
+            .download_dir(tmp_data_dir.path().to_path_buf())
             .max_connections(1)
             .build()
             .unwrap();
@@ -1108,7 +1108,7 @@ mod tests {
         let tmp_data_dir = tempfile::tempdir()?;
         let tmp_save_dir = tempfile::tempdir()?;
         let cfg = crate::config::ConfigBuilder::default()
-            .config_file(tmp_data_dir.path().to_path_buf())
+            .download_dir(tmp_data_dir.path().to_path_buf())
             .max_connections(1)
             .user_agent(Some(custom_ua.to_string()))
             .randomize_user_agent(false)
@@ -1201,7 +1201,7 @@ mod tests {
         let tmp_data_dir = tempfile::tempdir()?;
         let tmp_save_dir = tempfile::tempdir()?;
         let cfg = crate::config::ConfigBuilder::default()
-            .config_file(tmp_data_dir.path().to_path_buf())
+            .download_dir(tmp_data_dir.path().to_path_buf())
             .max_connections(1)
             .randomize_user_agent(true)
             .build()
