@@ -164,6 +164,7 @@ impl DownloadManager {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(true)
             .open(instruction.lockfile_path())
             .await
         {
