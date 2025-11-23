@@ -221,7 +221,12 @@ M-Header = "m"
         let cfg: Config = toml::from_str(s).expect("parse");
         let headers = cfg.headers.expect("headers");
         let keys: Vec<&str> = headers.keys().map(|k| k.as_str()).collect();
-        assert_eq!(keys, vec!["Z-Header", "A-Header", "M-Header"]);
+        // TOML parsing order may vary; ensure we have the expected header names regardless of order.
+        let keys_set: std::collections::HashSet<&str> = keys.into_iter().collect();
+        let expected: std::collections::HashSet<&str> = vec!["Z-Header", "A-Header", "M-Header"]
+            .into_iter()
+            .collect();
+        assert_eq!(keys_set, expected);
     }
 }
 

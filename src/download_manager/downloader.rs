@@ -32,7 +32,10 @@ use crate::{
 };
 
 /// Minimum chunk size we keep on a single task before attempting another split.
-const MIN_DYNAMIC_SPLIT: u64 = 256 * 1024; // 256 KB
+const MIN_DYNAMIC_SPLIT_SIZE: u64 = 3 * 1024 * 1024; // 3 MB
+/// Minimum eta needed for dynamic split to happen. any eta less than this will skip creating more chunks
+/// as it will be inefficient
+const MIN_DYNAMIC_SPLIT_ETA: Duration = Duration::from_secs(60); // 1 minutes
 
 #[cfg(not(test))]
 const STALE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -284,7 +287,7 @@ impl Downloader {
     ) -> Result<bool, OdlError> {
         let candidate = active
             .iter()
-            .filter(|(_, task)| task.remaining_bytes() >= MIN_DYNAMIC_SPLIT * 2)
+            .filter(|(_, task)| task.remaining_bytes() >= MIN_DYNAMIC_SPLIT_SIZE * 2)
             .max_by_key(|(_, task)| task.remaining_bytes())
             .map(|(ulid, task)| SplitCandidate {
                 ulid: ulid.clone(),
@@ -311,15 +314,20 @@ impl Downloader {
         &self,
         candidate: &SplitCandidate,
     ) -> Result<Option<(PartDetails, u64)>, OdlError> {
+        // If estimated time to finish entire download is <= 60s, avoid splitting as it will be inefficient
+        if self.aggregator_span.pb_eta() <= MIN_DYNAMIC_SPLIT_ETA {
+            return Ok(None);
+        }
+
         let downloaded = candidate.controller.downloaded();
         let current_limit = candidate.controller.limit();
-        if current_limit <= downloaded + MIN_DYNAMIC_SPLIT * 2 {
+        if current_limit <= downloaded + MIN_DYNAMIC_SPLIT_SIZE * 2 {
             return Ok(None);
         }
 
         let remaining = current_limit - downloaded;
         let split_size = remaining / 2;
-        if split_size < MIN_DYNAMIC_SPLIT {
+        if split_size < MIN_DYNAMIC_SPLIT_SIZE {
             return Ok(None);
         }
 
@@ -645,6 +653,8 @@ mod tests {
     use reqwest::Url;
     use tempfile::tempdir;
     use tokio::{fs, time};
+    use tracing_indicatif::IndicatifLayer;
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
     const TEST_FILENAME: &str = "test.bin";
 
@@ -757,8 +767,15 @@ mod tests {
         fs::create_dir_all(&download_dir).await?;
         fs::create_dir_all(&save_dir).await?;
 
+        // Ensure an IndicatifLayer is registered so progress-bar methods have an effect
+        // in tests. Use `try_init()` and ignore the result so repeated test runs don't panic
+        // if a global subscriber is already set.
+        tracing_subscriber::registry()
+            .with(IndicatifLayer::new())
+            .init();
+
         let mut parts = HashMap::new();
-        let original_size = MIN_DYNAMIC_SPLIT * 4;
+        let original_size = MIN_DYNAMIC_SPLIT_SIZE * 4;
         parts.insert("orig".to_string(), make_part("orig", 0, original_size));
 
         let instruction = create_instruction(
@@ -771,14 +788,24 @@ mod tests {
         )
         .await;
         let metadata = instruction.as_metadata();
+        let aggregator_span = info_span!("aggregator");
         let downloader = Downloader::new(
             Arc::clone(&instruction),
             metadata,
             reqwest::Client::builder().build()?,
             false,
-            Span::current(),
+            aggregator_span.clone(),
             None,
         );
+        // make eta larger than 1 min
+        aggregator_span.pb_start();
+        // Choose a large total length and a small progress so the computed ETA
+        // will be much larger than `MIN_DYNAMIC_SPLIT_ETA` (used by `split_task`).
+        aggregator_span.pb_set_length(120_000);
+        aggregator_span.pb_inc(1);
+        // give the progress bar a tiny moment to record elapsed time so ETA can be computed
+        time::sleep(Duration::from_millis(10)).await;
+        assert!(aggregator_span.pb_eta() > MIN_DYNAMIC_SPLIT_ETA);
 
         let controller = Arc::new(PartController::new(original_size, 0));
         let candidate = SplitCandidate {
