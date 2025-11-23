@@ -14,6 +14,22 @@ pub enum ServerConflict {
     CredentialsInvalid,
 }
 
+impl std::fmt::Display for ServerConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ServerConflict::FileChanged => write!(
+                f,
+                "file changed on server (size/etag/last-modified changed)"
+            ),
+            ServerConflict::NotResumable => {
+                write!(f, "server does not support range requests (not resumable)")
+            }
+            ServerConflict::UrlBroken => write!(f, "original URL no longer works"),
+            ServerConflict::CredentialsInvalid => write!(f, "credentials are missing or invalid"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileChangedResolution {
     Abort,
@@ -34,6 +50,20 @@ pub enum SaveConflict {
     SameDownloadExists,
     /// Happens when a file already exists at the selected path for final concatenated file
     FinalFileExists,
+}
+
+impl std::fmt::Display for SaveConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SaveConflict::SameDownloadExists => write!(
+                f,
+                "a download with the same metadata already exists in the download directory"
+            ),
+            SaveConflict::FinalFileExists => {
+                write!(f, "a final file already exists at the target path")
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

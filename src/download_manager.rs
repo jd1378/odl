@@ -31,6 +31,24 @@ use crate::{
 use crate::{credentials::Credentials, user_agents::random_user_agent};
 use crate::{download::Download, download_metadata::PartDetails, error::OdlError};
 
+/// High level manager responsible for evaluating and running downloads.
+///
+/// `DownloadManager` coordinates concurrency (via an internal semaphore),
+/// constructs HTTP clients using `Config`, resolves conflicts (save/server),
+/// and orchestrates the multi-part downloader.
+///
+/// Typical usage (illustrative):
+///
+/// ```ignore
+/// // Create manager and evaluate a URL to receive a `Download` instruction.
+/// // The manager will perform an HTTP probe and return a populated
+/// // `Download` value which can then be passed to `DownloadManager::download`.
+/// //
+/// // let cfg = Config::default();
+/// // let manager = DownloadManager::new(cfg);
+/// // let instruction = manager.evaluate(url, save_dir, None, &save_resolver).await?;
+/// // let path = manager.download(instruction, &server_resolver).await?;
+/// ```
 #[derive(Debug)]
 pub struct DownloadManager {
     /// Config to use for DownloadManager

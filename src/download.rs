@@ -21,7 +21,33 @@ use thiserror::Error;
 use tokio::sync::Semaphore;
 use ulid::Ulid;
 
-/// Represents a download instruction
+/// Represents a download instruction.
+///
+/// `Download` models all information needed to perform a single file download:
+/// the remote `url`, the local `download_dir` used to store part files and
+/// metadata, the `save_dir` and `filename` for the final assembled file, and
+/// per-download options such as `max_connections` and server-provided
+/// attributes (ETag, last-modified, size, hashes).
+///
+/// Use `Download::from_response_info` to construct a new instruction from a
+/// `ResponseInfo` (returned after probing the remote URL), or
+/// `Download::from_metadata` to recreate an instruction from persisted
+/// metadata on disk.
+///
+/// Examples
+///
+/// The canonical way to obtain a `Download` is to probe the remote URL and
+/// construct it from the HTTP response information. Consumers typically use
+/// `DownloadManager::evaluate` which performs the probe and returns a
+/// `Download` instruction ready for `DownloadManager::download`.
+///
+/// The example below is illustrative and intentionally ignored for doctests
+/// because the required `ResponseInfo` type is internal to the crate.
+///
+/// ```ignore
+/// // pseudo-code: manager.evaluate(url, save_dir, credentials, &save_resolver)
+/// // returns a Download instruction that can be passed to manager.download(...)
+/// ```
 #[derive(Builder, Debug, Clone)]
 #[builder(build_fn(validate = "Self::validate", error = "DownloadBuilderError"))]
 pub struct Download {
@@ -83,6 +109,7 @@ impl Download {
     const METADATA_TEMP_FILENAME: &'static str = "metadata.pb.temp";
     const LOCK_FILENAME: &'static str = "odl.lock";
     pub const PART_EXTENSION: &'static str = "part";
+    const MIN_PART_SIZE: u64 = 300 * 1024; // 300 KB
 
     pub fn download_dir(&self) -> &path::PathBuf {
         &self.download_dir
@@ -324,10 +351,10 @@ impl Download {
 
         let size = size.unwrap_or(0);
 
-        const MIN_PART_SIZE: u64 = 300 * 1024; // 300 KB
-
         // Always return at least one part, even if size is 0
-        if size <= MIN_PART_SIZE {
+        // If the size is small (<= MIN_PART_SIZE) we keep a single part to
+        // avoid fragmenting the download into many very small requests.
+        if size <= Self::MIN_PART_SIZE {
             let ulid = Ulid::new().to_string();
             parts.insert(
                 ulid.clone(),
@@ -342,7 +369,7 @@ impl Download {
         }
 
         let mut actual_connections = max_connections;
-        let min_connections = size.div_ceil(MIN_PART_SIZE);
+        let min_connections = size.div_ceil(Self::MIN_PART_SIZE);
         if actual_connections > min_connections {
             actual_connections = min_connections;
         }
@@ -351,6 +378,9 @@ impl Download {
         let remainder = size % actual_connections;
         let mut offset = 0;
 
+        // Split the file into `actual_connections` parts. The remainder is
+        // added to the first part so the parts remain contiguous and cover
+        // the full range.
         for i in 0..actual_connections {
             let part_size = if i == 0 {
                 base_size + remainder

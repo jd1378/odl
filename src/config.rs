@@ -37,8 +37,18 @@ mod defaults {
 }
 
 use defaults::*;
-/// Persistent download manager configuration. Fields are optional so that
-/// unspecified values can fall back to code defaults.
+/// `Config` holds user-visible defaults for the manager and is used by
+/// `DownloadManager` to build HTTP clients and control concurrency.
+///
+/// Example (loading config from disk, falling back to defaults):
+///
+/// ```no_run
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let cfg = odl::config::Config::load_from_file("/tmp/odl/config.toml").await?;
+/// println!("Using download dir: {}", cfg.download_dir.display());
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Builder, Debug, Clone, Serialize, Deserialize)]
 #[builder(
     build_fn(validate = "Self::validate", private, name = "private_build"),

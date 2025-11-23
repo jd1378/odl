@@ -24,9 +24,9 @@ pub enum NetworkError {
 
 #[derive(Error, Debug)]
 pub enum ConflictError {
-    #[error("Save conflict: {conflict:?}")]
+    #[error("Save conflict: {conflict}")]
     Save { conflict: SaveConflict },
-    #[error("Server conflict: {conflict:?}")]
+    #[error("Server conflict: {conflict}")]
     Server { conflict: ServerConflict },
     #[error("Checksum mismatch: expected `{expected}`, got `{actual}`")]
     ChecksumMismatch { expected: String, actual: String },
@@ -34,11 +34,11 @@ pub enum ConflictError {
 
 #[derive(Error, Debug)]
 pub enum MetadataError {
-    #[error("Failed to acquire metadata lock")]
+    #[error("metadata lock is held by another process (lockfile in use)")]
     LockfileInUse,
-    #[error("Failed to decode metadata: {e}")]
+    #[error("failed to decode metadata: {e}")]
     MetadataDecodeError { e: DecodeError },
-    #[error("Metadata error: {message}")]
+    #[error("metadata error: {message}")]
     Other { message: String },
 }
 
@@ -151,7 +151,7 @@ impl From<prost::DecodeError> for OdlError {
 impl From<AcquireError> for OdlError {
     fn from(e: AcquireError) -> Self {
         OdlError::Other {
-            message: "Failed to acquire semaphore permit".to_string(),
+            message: "failed to acquire semaphore permit".to_string(),
             origin: Box::new(e),
         }
     }

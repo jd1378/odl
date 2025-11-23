@@ -1,3 +1,22 @@
+//! ODL — Open-source Download Library and CLI
+//!
+//! This crate provides a flexible, resumable, and configurable download manager
+//! with a small CLI and library API. Intended for use as both a library and a
+//! standalone binary. Public types and modules expose the high-level API used
+//! by applications:
+//!
+//! - `Download` — primary download instruction type (create via `from_response_info` or
+//!   `from_metadata`).
+//! - `download_manager` — higher-level operations to evaluate and run downloads.
+//! - `config` — persistent configuration for the manager.
+//!
+//! Example (library usage):
+//!
+//! ```no_run
+//! use odl::{Download, download_manager::DownloadManager, config::Config};
+//! // create a `DownloadManager` with default `Config` and call `evaluate`/`download`.
+//! ```
+
 pub mod config;
 pub mod conflict;
 pub mod credentials;
