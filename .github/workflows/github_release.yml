@@ -51,6 +51,7 @@ jobs:
       version: ${{ steps.crate_metadata.outputs.version }}
       maintainer: ${{ steps.crate_metadata.outputs.maintainer }}
       homepage: ${{ steps.crate_metadata.outputs.homepage }}
+      tag: ${{ steps.crate_metadata.outputs.tag }}
 
   lint:
     name: Ensure code quality
