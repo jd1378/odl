@@ -18,7 +18,6 @@ use reqwest::Url;
 use tokio::{self, io::AsyncBufReadExt};
 mod args;
 use args::Args;
-use futures::future::join_all;
 use tracing::{Instrument, info_span, instrument};
 use tracing_indicatif::{IndicatifLayer, TickSettings, span_ext::IndicatifSpanExt};
 use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
@@ -258,7 +257,11 @@ async fn main() -> Result<(), OdlError> {
         }
     }
 
-    let mut futures = Vec::new();
+    // We'll spawn tasks only after acquiring a permit so we don't
+    // allocate a future per-URL up-front (which wastes resources for
+    // large remote lists). This keeps the number of active tasks
+    // bounded by the download manager's semaphore.
+    let mut handles = Vec::new();
     let parent_style = ProgressStyle::with_template(
         "{spinner} {maybe_connect} {msg:!40}   {percent:>3}%  {decimal_bytes:<10} / {decimal_total_bytes:<10} {decimal_bytes_per_sec:<12} eta {eta_precise} elapsed {elapsed}",
     )
@@ -321,26 +324,43 @@ async fn main() -> Result<(), OdlError> {
         let save_dir = save_dir.clone();
         let user_provided_filename = user_provided_filename.clone();
         let credentials = credentials.clone();
+        let resolver = resolver; // copy into loop so each task captures its own
 
-        futures.push(
+        // Wait here for a permit before spawning the task. This ensures we
+        // don't construct/spawn more tasks than permits available.
+        let permit = dlm
+            .acquire_download_permit()
+            .await
+            .expect("didn't expect the semaphore to close at this point");
+
+        // Move the permit into the spawned task so it is held for the
+        // duration of the download and released automatically when the
+        // task completes.
+        let handle = tokio::spawn(
             async move {
-                let permit = dlm
-                    .acquire_download_permit()
-                    .await
-                    .expect("didn't expect the semaphore to close at this point");
+                let _permit = permit;
                 let mut instruction = dlm.evaluate(url, save_dir, credentials, &resolver).await?;
                 if let Some(filename) = user_provided_filename {
                     instruction.set_filename(filename);
                 }
                 let result = dlm.download(instruction, &resolver).await;
-                drop(permit);
                 result
             }
             .instrument(download_span),
         );
+
+        handles.push(handle);
     }
 
-    let results: Vec<Result<PathBuf, OdlError>> = join_all(futures).await;
+    // Await all tasks and normalize JoinErrors into OdlError
+    let mut results: Vec<Result<PathBuf, OdlError>> = Vec::new();
+    for h in handles {
+        match h.await {
+            Ok(Ok(path)) => results.push(Ok(path)),
+            Ok(Err(e)) => results.push(Err(e)),
+            Err(join_err) => results.push(Err(OdlError::from(join_err))),
+        }
+    }
     for res in results {
         if let Err(e) = res {
             eprintln!("Error: {}", e);
@@ -514,7 +534,15 @@ async fn download_remote_file(dlm: &DownloadManager, url: Url) -> Result<PathBuf
         })?;
     let save_dir = tmpdir.path().to_path_buf();
 
+    // Acquire a download permit so this remote-file download counts
+    // against the same concurrency limits as other downloads
+    let _permit = dlm.acquire_download_permit().await?;
+
     let instruction = dlm.evaluate(url, save_dir, None, &resolver).await?;
 
-    dlm.download(instruction, &resolver).await
+    let path = dlm.download(instruction, &resolver).await?;
+
+    // `_permit` will be dropped here when going out of scope, releasing
+    // the semaphore permit back to the manager.
+    Ok(path)
 }

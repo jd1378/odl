@@ -13,7 +13,7 @@ use reqwest::{
     header::{HeaderMap, USER_AGENT},
 };
 
-use tokio::sync::{AcquireError, Semaphore, SemaphorePermit};
+use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore};
 use tracing::Span;
 use tracing_indicatif::span_ext::IndicatifSpanExt;
 
@@ -189,8 +189,8 @@ impl DownloadManager {
     }
 
     /// acquire a permit from this download manager's semaphore. Only up to `max_concurrent_downloads` are permitted at the same time.
-    pub async fn acquire_download_permit(&self) -> Result<SemaphorePermit<'_>, AcquireError> {
-        self.semaphore.acquire().await
+    pub async fn acquire_download_permit(&self) -> Result<OwnedSemaphorePermit, AcquireError> {
+        Arc::clone(&self.semaphore).acquire_owned().await
     }
 
     fn get_client(&self, instructions: Option<&Download>) -> Result<Client, OdlError> {
