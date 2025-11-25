@@ -142,6 +142,7 @@ jobs:
       run: |
         case ${{ matrix.job.os }} in
           ubuntu*|linux*)
+            echo "installing linux prerequisites"
             sudo apt-get -y update
             case ${{ matrix.job.target }} in
               arm-unknown-linux-*) sudo apt-get -y install gcc-arm-linux-gnueabihf protobuf-compiler ;;
@@ -154,6 +155,7 @@ jobs:
             fi
             # Export path to protoc for later steps
             echo "PROTOC=$(command -v protoc)" >> $GITHUB_ENV
+            echo "protoc is installed at $PROTOC"
             ;;
           macos*)
             brew update
@@ -200,7 +202,9 @@ jobs:
 
     - name: Build
       shell: bash
-      run: $BUILD_CMD build --locked --release --target=${{ matrix.job.target }}
+      run: |
+        echo "Path to PROTOC is: $PROTOC" 
+        $BUILD_CMD build --locked --release --target=${{ matrix.job.target }}
 
     - name: Set binary name & path
       id: bin
