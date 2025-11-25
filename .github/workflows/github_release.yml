@@ -371,9 +371,10 @@ jobs:
     - name: Publish archives and packages
       uses: softprops/action-gh-release@v2
       with:
+        name: ${{ needs.crate_metadata.outputs.tag }}
+        tag_name: ${{ needs.crate_metadata.outputs.tag }}
         files: |
           ${{ steps.package.outputs.PKG_PATH }}
           ${{ steps.debian-package.outputs.DPKG_PATH }}
-        tag_name: ${{ needs.crate_metadata.outputs.tag }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
