@@ -185,6 +185,7 @@ jobs:
           Add-Content -Path $env:GITHUB_ENV -Value "PROTOC=$proto"
           # also ensure PATH contains Chocolatey bin for processes that just call "protoc"
           Add-Content -Path $env:GITHUB_ENV -Value ("PATH=" + $env:Path + ";" + (Split-Path $proto))
+          protoc --version
         } else {
           Write-Host "PROTOC not found"
           exit 1
