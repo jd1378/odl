@@ -223,7 +223,15 @@ jobs:
         if [ -n "$PROTOC" ]; then
           echo "PROTOC env is set: $PROTOC"
         fi
-        $BUILD_CMD build --locked --release --target=${{ matrix.job.target }}
+
+        # Enable vendored-protoc when using cross builds (leave macOS/Windows alone)
+        BUILD_FEATURES=""
+        if [ "${{ matrix.job.use-cross }}" = "true" ]; then
+          echo "Enabling vendored-protoc feature for cross build"
+          BUILD_FEATURES="--features vendored-protoc"
+        fi
+
+        $BUILD_CMD build $BUILD_FEATURES --locked --release --target=${{ matrix.job.target }}
 
     - name: Set binary name & path
       id: bin
@@ -250,16 +258,23 @@ jobs:
         # test only library unit tests and binary for arm-type targets
         unset CARGO_TEST_OPTIONS
         unset CARGO_TEST_OPTIONS ; case ${{ matrix.job.target }} in arm-* | aarch64-*) CARGO_TEST_OPTIONS="--lib --bin ${{ needs.crate_metadata.outputs.name }}" ;; esac;
+        # If we're using cross, enable vendored-protoc for tests as well
+        CARGO_TEST_FEATURES=""
+        if [ "${{ matrix.job.use-cross }}" = "true" ]; then
+          CARGO_TEST_FEATURES="--features vendored-protoc"
+        fi
+
         echo "CARGO_TEST_OPTIONS=${CARGO_TEST_OPTIONS}" >> $GITHUB_OUTPUT
+        echo "CARGO_TEST_FEATURES=${CARGO_TEST_FEATURES}" >> $GITHUB_OUTPUT
 
     - name: Run tests
       shell: bash
       run: |
         if [[ ${{ matrix.job.os }} = windows-* ]]
         then
-          powershell.exe -command "$BUILD_CMD test --locked --target=${{ matrix.job.target }} ${{ steps.test-options.outputs.CARGO_TEST_OPTIONS}}"
+          powershell.exe -command "$BUILD_CMD test --locked --target=${{ matrix.job.target }} ${{ steps.test-options.outputs.CARGO_TEST_OPTIONS}} ${{ steps.test-options.outputs.CARGO_TEST_FEATURES}}"
         else
-          $BUILD_CMD test --locked --target=${{ matrix.job.target }} ${{ steps.test-options.outputs.CARGO_TEST_OPTIONS}}
+          $BUILD_CMD test --locked --target=${{ matrix.job.target }} ${{ steps.test-options.outputs.CARGO_TEST_OPTIONS}} ${{ steps.test-options.outputs.CARGO_TEST_FEATURES}}
         fi
 
     - name: Create tarball
