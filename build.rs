@@ -1,6 +1,6 @@
 extern crate prost_build;
 
-use std::{path::PathBuf, process::Command};
+use std::process::Command;
 
 use os_info::Type;
 
@@ -11,15 +11,8 @@ fn main() {
     // `prost-build`.
     let info = os_info::get();
 
-    if std::env::var_os("PROTOC").is_none() {
-        let mut protoc_command = if info.os_type() == Type::Windows {
-            // windows is annoying
-            Command::new(PathBuf::from("protoc"))
-        } else {
-            Command::new("protoc")
-        };
-
-        let protoc_available = protoc_command
+    if info.os_type() != Type::Windows && std::env::var_os("PROTOC").is_none() {
+        let protoc_available = Command::new("protoc")
             .arg("--version")
             .status()
             .map(|s| s.success())
