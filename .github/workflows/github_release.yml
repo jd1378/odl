@@ -136,12 +136,11 @@ jobs:
     steps:
     - name: Checkout source code
       uses: actions/checkout@v5
-      with:
-        fetch-depth: 0
-        ref: ${{ needs.crate_metadata.outputs.tag }}
+      # with:
+      #   fetch-depth: 0
+      #   ref: ${{ needs.crate_metadata.outputs.tag }}
 
     - name: Install prerequisites
-      id: prerequisites
       shell: bash
       run: |
         case ${{ matrix.job.os }} in
