@@ -1,6 +1,6 @@
 extern crate prost_build;
 
-use std::process::Command;
+use std::{path::PathBuf, process::Command};
 
 fn main() {
     // If the `PROTOC` env var is not set and the `protoc` command cannot
@@ -8,7 +8,7 @@ fn main() {
     // `protobuf-src` and export its path via `PROTOC` as required by
     // `prost-build`.
     if std::env::var_os("PROTOC").is_none() {
-        let protoc_available = Command::new("protoc")
+        let protoc_available = Command::new(PathBuf::from("protoc"))
             .arg("--version")
             .output()
             .map(|o| o.status.success())
