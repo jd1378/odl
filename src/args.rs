@@ -4,6 +4,32 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
+#[derive(clap::ValueEnum, Clone, Debug)]
+pub enum FileChangedAction {
+    Abort,
+    Restart,
+}
+
+#[derive(clap::ValueEnum, Clone, Debug)]
+pub enum NotResumableAction {
+    Abort,
+    Restart,
+}
+
+#[derive(clap::ValueEnum, Clone, Debug)]
+pub enum SameDownloadAction {
+    Abort,
+    Resume,
+    AddNumberToNameAndContinue,
+}
+
+#[derive(clap::ValueEnum, Clone, Debug)]
+pub enum FinalFileAction {
+    Abort,
+    ReplaceAndContinue,
+    AddNumberToNameAndContinue,
+}
+
 fn parse_speed(s: &str) -> Result<u64, String> {
     let s = s.trim();
     if s.is_empty() {
@@ -216,6 +242,16 @@ pub struct Args {
     #[arg(short, long)]
     pub use_server_time: Option<bool>,
 
+    /// How to handle a server file-changed conflict. Possible values: `abort`, `restart`.
+    /// Default: `restart` (restart the download and warn).
+    #[arg(long, value_enum, default_value_t = FileChangedAction::Restart)]
+    pub on_file_changed: FileChangedAction,
+
+    /// How to handle a server not-resumable conflict. Possible values: `abort`, `restart`.
+    /// Default: `restart` (restart the download and warn).
+    #[arg(long, value_enum, default_value_t = NotResumableAction::Restart)]
+    pub on_not_resumable: NotResumableAction,
+
     /// Should we accept invalid SSL certificates? Do not use unless you are absolutely sure of what you are doing.
     #[arg(long)]
     pub accept_invalid_certs: Option<bool>,
@@ -224,10 +260,15 @@ pub struct Args {
     #[arg(long = "header", value_name = "KEY:VALUE", num_args = 0.., action = clap::ArgAction::Append)]
     pub headers: Vec<String>,
 
-    /// If set, tries to replace existing files and continue without aborting.
-    /// Default behavior is to abort on any kind of conflict.
-    #[arg(short, long, default_value_t = false)]
-    pub force: bool,
+    /// How to handle a save conflict when the same download structure exists. Possible values: `abort`, `resume`, `add-number-to-name-and-continue`.
+    /// Default: `resume`.
+    #[arg(long, value_enum, default_value_t = SameDownloadAction::Resume)]
+    pub on_same_download_exists: SameDownloadAction,
+
+    /// How to handle a save conflict when a final file already exists. Possible values: `abort`, `replace-and-continue`, `add-number-to-name-and-continue`.
+    /// Default: `replace-and-continue`.
+    #[arg(long, value_enum, default_value_t = FinalFileAction::ReplaceAndContinue)]
+    pub on_final_file_exists: FinalFileAction,
 
     /// HTTP basic authentication username.
     #[arg(long, value_name = "USER")]

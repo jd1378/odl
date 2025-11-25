@@ -30,21 +30,25 @@ pub enum DownloadType {
     FileAtUrl(Url),
 }
 
+#[derive(Copy, Clone)]
 struct CliResolver {
-    force: bool,
+    file_changed: FileChangedResolution,
+    not_resumable: NotResumableResolution,
+    same_download_exists: SameDownloadExistsResolution,
+    final_file_exists: FinalFileExistsResolution,
 }
 
 #[async_trait]
 impl ServerConflictResolver for CliResolver {
     async fn resolve_file_changed(&self, _: &Download) -> FileChangedResolution {
-        if self.force {
+        if self.file_changed == FileChangedResolution::Restart {
             FileChangedResolution::Restart
         } else {
             FileChangedResolution::Abort
         }
     }
     async fn resolve_not_resumable(&self, _: &Download) -> NotResumableResolution {
-        if self.force {
+        if self.not_resumable == NotResumableResolution::Restart {
             NotResumableResolution::Restart
         } else {
             NotResumableResolution::Abort
@@ -55,11 +59,14 @@ impl ServerConflictResolver for CliResolver {
 #[async_trait]
 impl SaveConflictResolver for CliResolver {
     async fn same_download_exists(&self, _: &Download) -> SameDownloadExistsResolution {
-        SameDownloadExistsResolution::Resume
+        // explicit CLI choice takes precedence
+        self.same_download_exists.clone()
     }
     async fn final_file_exists(&self, _: &Download) -> FinalFileExistsResolution {
-        if self.force {
+        if self.final_file_exists == FinalFileExistsResolution::ReplaceAndContinue {
             FinalFileExistsResolution::ReplaceAndContinue
+        } else if self.final_file_exists == FinalFileExistsResolution::AddNumberToNameAndContinue {
+            FinalFileExistsResolution::AddNumberToNameAndContinue
         } else {
             FinalFileExistsResolution::Abort
         }
@@ -270,13 +277,47 @@ async fn main() -> Result<(), OdlError> {
         None
     };
 
+    let resolver = {
+        // map CLI enum choices to internal conflict enums
+        let file_changed = match args.on_file_changed {
+            args::FileChangedAction::Abort => FileChangedResolution::Abort,
+            args::FileChangedAction::Restart => FileChangedResolution::Restart,
+        };
+        let not_resumable = match args.on_not_resumable {
+            args::NotResumableAction::Abort => NotResumableResolution::Abort,
+            args::NotResumableAction::Restart => NotResumableResolution::Restart,
+        };
+        let same_download_exists = match args.on_same_download_exists {
+            args::SameDownloadAction::Abort => SameDownloadExistsResolution::Abort,
+            args::SameDownloadAction::Resume => SameDownloadExistsResolution::Resume,
+            args::SameDownloadAction::AddNumberToNameAndContinue => {
+                SameDownloadExistsResolution::AddNumberToNameAndContinue
+            }
+        };
+        let final_file_exists = match args.on_final_file_exists {
+            args::FinalFileAction::Abort => FinalFileExistsResolution::Abort,
+            args::FinalFileAction::ReplaceAndContinue => {
+                FinalFileExistsResolution::ReplaceAndContinue
+            }
+            args::FinalFileAction::AddNumberToNameAndContinue => {
+                FinalFileExistsResolution::AddNumberToNameAndContinue
+            }
+        };
+
+        CliResolver {
+            file_changed,
+            not_resumable,
+            same_download_exists,
+            final_file_exists,
+        }
+    };
+
     for url in urls.into_iter() {
         let download_span = info_span!("download", url = %url);
         download_span.pb_set_style(&parent_style);
         download_span.pb_set_message("Warming up");
         download_span.pb_start();
         let dlm = Arc::clone(&dlm);
-        let resolver = CliResolver { force: args.force };
         let save_dir = save_dir.clone();
         let user_provided_filename = user_provided_filename.clone();
         let credentials = credentials.clone();

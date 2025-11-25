@@ -2,7 +2,7 @@ use async_trait::async_trait;
 
 use crate::download::Download;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum ServerConflict {
     /// File changed on server. Either of "size", "etag", "last-modified" headers have been changed
     FileChanged,
@@ -30,19 +30,19 @@ impl std::fmt::Display for ServerConflict {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum FileChangedResolution {
     Abort,
     Restart,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum NotResumableResolution {
     Abort,
     Restart,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum SaveConflict {
     /// Happens when a download is about to begin, but
     /// we find that we already have the same download structure
@@ -66,7 +66,7 @@ impl std::fmt::Display for SaveConflict {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum SameDownloadExistsResolution {
     Abort,
     AddNumberToNameAndContinue,
@@ -75,7 +75,7 @@ pub enum SameDownloadExistsResolution {
     Resume,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum FinalFileExistsResolution {
     Abort,
     ReplaceAndContinue,
