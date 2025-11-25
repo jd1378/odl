@@ -344,9 +344,10 @@ mod tests {
         {
             use std::os::windows::fs::MetadataExt;
             let filetime = metadata.last_write_time();
-            let expected = filetime::FileTime::from_unix_time(unix_time, 0).seconds();
-            // Windows returns 100-nanosecond intervals since 1601-01-01, so just check it's close
-            assert!((filetime as i64 - expected).abs() < 5);
+            // Convert Windows FILETIME (100-nanosecond intervals since 1601-01-01)
+            // to UNIX seconds and compare directly.
+            let actual_unix_secs = (filetime / 10_000_000) as i64 - 11_644_473_600i64;
+            assert_eq!(actual_unix_secs, unix_time);
         }
     }
 
