@@ -160,12 +160,12 @@ jobs:
               echo "protoc not installed properly on macOS, exiting with error..."
               exit 1
             fi
-            PROTOC_PATH=$(command -v protoc || true)
+            PROTOC_PATH=$(command -v protoc)
             chmod 755 "$PROTOC_PATH" || true
             ;;
           windows-*)
             choco install protoc -y --no-progress
-            PROTOC_PATH=$(powershell -NoProfile -NonInteractive -Command "(Get-Command protoc -ErrorAction Stop).Source" 2>/dev/null || true)
+            PROTOC_PATH=$(powershell -NoProfile -NonInteractive -Command "(Get-Command protoc -ErrorAction Stop).Source" 2>/dev/null)
             ;;
         esac
 
