@@ -140,7 +140,8 @@ jobs:
       #   fetch-depth: 0
       #   ref: ${{ needs.crate_metadata.outputs.tag }}
 
-    - name: Install prerequisites
+    - name: Install prerequisites (linux / macos)
+      if: startsWith(matrix.job.os, 'ubuntu') || startsWith(matrix.job.os, 'macos')
       shell: bash
       run: |
         case ${{ matrix.job.os }} in
@@ -162,10 +163,6 @@ jobs:
             PROTOC_PATH=$(command -v protoc)
             chmod 755 "$PROTOC_PATH" || true
             ;;
-          windows-*)
-            choco install protoc -y --no-progress
-            PROTOC_PATH=$(powershell -NoProfile -NonInteractive -Command "(Get-Command protoc -ErrorAction Stop).Source" 2>/dev/null)
-            ;;
         esac
 
         if [ -n "$PROTOC_PATH" ]; then
@@ -174,6 +171,24 @@ jobs:
         else
           echo "PROTOC not found"
         fi
+
+    - name: Install prerequisites (windows)
+      if: startsWith(matrix.job.os, 'windows-')
+      shell: pwsh
+      run: |
+        choco install protoc -y --no-progress
+        # refresh environment so current session sees updated PATH
+        refreshenv
+        $proto = (Get-Command protoc -ErrorAction SilentlyContinue).Source
+        if (-not [string]::IsNullOrEmpty($proto)) {
+          Write-Host "PROTOC found at: $proto"
+          Add-Content -Path $env:GITHUB_ENV -Value "PROTOC=$proto"
+          # also ensure PATH contains Chocolatey bin for processes that just call "protoc"
+          Add-Content -Path $env:GITHUB_ENV -Value ("PATH=" + $env:Path + ";" + (Split-Path $proto))
+        } else {
+          Write-Host "PROTOC not found"
+          exit 1
+        }
 
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
