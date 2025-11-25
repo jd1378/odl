@@ -1,15 +1,25 @@
 extern crate prost_build;
 
-use std::process::Command;
+use std::{path::PathBuf, process::Command};
+
+use os_info::Type;
 
 fn main() {
     // If the `PROTOC` env var is not set and the `protoc` command cannot
     // be executed/found, fall back to the bundled protoc provided by
     // `protobuf-src` and export its path via `PROTOC` as required by
     // `prost-build`.
-    // windows is excepted from this rule for now as it seems buggy
-    if !cfg!(windows) && std::env::var_os("PROTOC").is_none() {
-        let protoc_available = Command::new("protoc")
+    let info = os_info::get();
+
+    if std::env::var_os("PROTOC").is_none() {
+        let mut protoc_command = if info.os_type() == Type::Windows {
+            // windows is annoying
+            Command::new(PathBuf::from("protoc"))
+        } else {
+            Command::new("protoc")
+        };
+
+        let protoc_available = protoc_command
             .arg("--version")
             .status()
             .map(|s| s.success())
