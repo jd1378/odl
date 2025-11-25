@@ -770,7 +770,6 @@ mod tests {
                 FileChangedResolution::Abort
             }
             async fn resolve_not_resumable(&self, _: &Download) -> NotResumableResolution {
-                assert!(true, "NotResumable conflict should be triggered");
                 NotResumableResolution::Abort
             }
         }
@@ -887,7 +886,6 @@ mod tests {
                 FileChangedResolution::Restart
             }
             async fn resolve_not_resumable(&self, _: &Download) -> NotResumableResolution {
-                assert!(true, "NotResumable conflict should be triggered");
                 NotResumableResolution::Restart
             }
         }
