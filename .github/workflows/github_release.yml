@@ -402,6 +402,7 @@ jobs:
         omitBodyDuringUpdate: true
         omitName: true
         allowUpdates: true
+        prerelease: true
         replacesArtifacts: true
         updateOnlyUnreleased: false
         artifacts: ${{ steps.package.outputs.PKG_PATH }},${{ steps.debian-package.outputs.DPKG_PATH }}
