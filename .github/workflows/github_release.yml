@@ -139,6 +139,22 @@ jobs:
               aarch64-unknown-linux-gnu) sudo apt-get -y install gcc-aarch64-linux-gnu protobuf-compiler ;;
               *) sudo apt-get -y install protobuf-compiler ;;
             esac
+            if ! command -v protoc >/dev/null 2>&1; then
+              echo "protoc not installed properly exiting with error..."
+              exit 1
+            fi
+            ;;
+          macos*)
+            brew update
+            brew install protobuf
+            if ! command -v protoc >/dev/null 2>&1; then
+              echo "protoc not installed properly on macOS, exiting with error..."
+              exit 1
+            fi
+            ;;
+          windows-*)
+            powershell -NoProfile -NonInteractive -Command "choco install protoc -y --no-progress"
+            powershell -NoProfile -NonInteractive -Command "if (-not (Get-Command protoc -ErrorAction SilentlyContinue)) { Write-Error 'protoc not installed properly on Windows, exiting with error...'; exit 1 }"
             ;;
         esac
 
