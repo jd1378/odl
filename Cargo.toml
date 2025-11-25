@@ -10,7 +10,7 @@ authors = ["jd1378 <javad.mnjd@hotmail.com>"]
 categories = ["command-line-utilities"]
 
 [dependencies]
-reqwest = { version = "0.12.19", default-features = false, features = ["http2", "gzip", "brotli", "native-tls", "socks", "stream"] }
+reqwest = { version = "0.12.24", default-features = false, features = ["http2", "gzip", "brotli", "native-tls", "native-tls-vendored", "native-tls-alpn", "socks", "stream"] }
 reqwest-middleware = "0.4.2"
 reqwest-retry = "0.7.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
