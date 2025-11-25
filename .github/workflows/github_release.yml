@@ -108,6 +108,8 @@ jobs:
           ref: ${{ needs.crate_metadata.outputs.tag }}
       - run: cargo audit
   build:
+    permissions:
+      contents: write
     name: ${{ matrix.job.target }} (${{ matrix.job.os }})
     runs-on: ${{ matrix.job.os }}
     needs: crate_metadata
