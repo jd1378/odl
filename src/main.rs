@@ -59,7 +59,7 @@ impl ServerConflictResolver for CliResolver {
 impl SaveConflictResolver for CliResolver {
     async fn same_download_exists(&self, _: &Download) -> SameDownloadExistsResolution {
         // explicit CLI choice takes precedence
-        self.same_download_exists.clone()
+        self.same_download_exists
     }
     async fn final_file_exists(&self, _: &Download) -> FinalFileExistsResolution {
         if self.final_file_exists == FinalFileExistsResolution::ReplaceAndContinue {
@@ -324,7 +324,7 @@ async fn main() -> Result<(), OdlError> {
         let save_dir = save_dir.clone();
         let user_provided_filename = user_provided_filename.clone();
         let credentials = credentials.clone();
-        let resolver = resolver; // copy into loop so each task captures its own
+        // `resolver` is `Copy`, closures will capture by value; no extra binding needed
 
         // Wait here for a permit before spawning the task. This ensures we
         // don't construct/spawn more tasks than permits available.
@@ -343,8 +343,7 @@ async fn main() -> Result<(), OdlError> {
                 if let Some(filename) = user_provided_filename {
                     instruction.set_filename(filename);
                 }
-                let result = dlm.download(instruction, &resolver).await;
-                result
+                dlm.download(instruction, &resolver).await
             }
             .instrument(download_span),
         );
