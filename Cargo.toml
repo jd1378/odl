@@ -8,6 +8,7 @@ homepage = "https://github.com/jd1378/odl"
 license = "MIT"
 authors = ["jd1378 <javad.mnjd@hotmail.com>"]
 categories = ["command-line-utilities"]
+keywords = ["download", "manager", "idm", "dl", "download-manager"]
 
 [dependencies]
 reqwest = { version = "0.12.24", default-features = false, features = ["http2", "gzip", "brotli", "native-tls", "native-tls-vendored", "native-tls-alpn", "socks", "stream"] }
