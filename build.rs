@@ -10,7 +10,7 @@ fn main() {
     if std::env::var_os("PROTOC").is_none() {
         let mut protoc_command = if cfg!(windows) {
             // windows is annoying
-            Command::new(PathBuf::from("protoc.exe"))
+            Command::new(PathBuf::from("protoc"))
         } else {
             Command::new("protoc")
         };
