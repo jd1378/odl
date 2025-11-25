@@ -153,6 +153,7 @@ jobs:
               echo "protoc not installed properly exiting with error..."
               exit 1
             fi
+            chmod 755 $(command -v protoc)
             # Export path to protoc for later steps
             echo "PROTOC=$(command -v protoc)" >> $GITHUB_ENV
             echo "protoc is installed at $PROTOC"
@@ -164,7 +165,9 @@ jobs:
               echo "protoc not installed properly on macOS, exiting with error..."
               exit 1
             fi
+            chmod 755 $(command -v protoc)
             echo "PROTOC=$(command -v protoc)" >> $GITHUB_ENV
+            echo "protoc is installed at $PROTOC"
             ;;
           windows-*)
             powershell -NoProfile -NonInteractive -Command 'choco install protoc -y --no-progress'
