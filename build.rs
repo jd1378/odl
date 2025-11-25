@@ -1,6 +1,6 @@
 extern crate prost_build;
 
-use std::{path::PathBuf, process::Command};
+use std::process::Command;
 
 fn main() {
     // If the `PROTOC` env var is not set and the `protoc` command cannot
@@ -8,10 +8,10 @@ fn main() {
     // `protobuf-src` and export its path via `PROTOC` as required by
     // `prost-build`.
     if std::env::var_os("PROTOC").is_none() {
-        let protoc_available = Command::new(PathBuf::from("protoc"))
+        let protoc_available = Command::new("protoc")
             .arg("--version")
-            .output()
-            .map(|o| o.status.success())
+            .status()
+            .map(|o| o.success())
             .unwrap_or(false);
 
         if !protoc_available {
@@ -19,8 +19,9 @@ fn main() {
             // - This build script runs in its own process and does not spawn
             //   threads before this point, so setting the process environment
             //   is safe on Unix.
+            let vendored_protoc = protobuf_src::protoc();
             unsafe {
-                std::env::set_var("PROTOC", protobuf_src::protoc());
+                std::env::set_var("PROTOC", vendored_protoc);
             }
         }
     }

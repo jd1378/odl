@@ -141,6 +141,7 @@ jobs:
         ref: ${{ needs.crate_metadata.outputs.tag }}
 
     - name: Install prerequisites
+      id: prerequisites
       shell: bash
       run: |
         case ${{ matrix.job.os }} in
@@ -159,17 +160,21 @@ jobs:
               echo "protoc not installed properly on macOS, exiting with error..."
               exit 1
             fi
-            chmod 755 $(command -v protoc)
-            echo "PROTOC=$(command -v protoc)" >> $GITHUB_ENV
-            echo "protoc is installed at $PROTOC"
+            PROTOC_PATH=$(command -v protoc || true)
+            chmod 755 "$PROTOC_PATH" || true
             ;;
           windows-*)
-            powershell -NoProfile -NonInteractive -Command 'choco install protoc -y --no-progress'
-            powershell -NoProfile -NonInteractive -Command 'if (-not (Get-Command protoc -ErrorAction SilentlyContinue)) { Write-Error "protoc not installed properly on Windows, exiting with error..."; exit 1 }'
-            powershell -NoProfile -NonInteractive -Command 'Add-Content -Path $Env:GITHUB_ENV -Value ("PROTOC=" + (Get-Command protoc -ErrorAction Stop).Source)'
-            echo "Windows protoc: $PROTOC"
+            choco install protoc -y --no-progress
+            PROTOC_PATH=$(powershell -NoProfile -NonInteractive -Command "(Get-Command protoc -ErrorAction Stop).Source" 2>/dev/null || true)
             ;;
         esac
+
+        if [ -n "$PROTOC_PATH" ]; then
+          echo "PROTOC found at: $PROTOC_PATH"
+          echo "PROTOC=$PROTOC_PATH" >> $GITHUB_ENV
+        else
+          echo "PROTOC not found"
+        fi
 
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
@@ -200,6 +205,9 @@ jobs:
     - name: Build
       shell: bash
       run: |
+        if [ -n "$PROTOC" ]; then
+          echo "PROTOC env is set: $PROTOC"
+        fi
         $BUILD_CMD build --locked --release --target=${{ matrix.job.target }}
 
     - name: Set binary name & path
