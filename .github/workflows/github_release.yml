@@ -131,9 +131,15 @@ jobs:
     - name: Install prerequisites
       shell: bash
       run: |
-        case ${{ matrix.job.target }} in
-          arm-unknown-linux-*) sudo apt-get -y update ; sudo apt-get -y install gcc-arm-linux-gnueabihf protobuf-compiler ;;
-          aarch64-unknown-linux-gnu) sudo apt-get -y update ; sudo apt-get -y install gcc-aarch64-linux-gnu protobuf-compiler ;;
+        case ${{ matrix.job.os }} in
+          ubuntu*|linux*)
+            sudo apt-get -y update
+            case ${{ matrix.job.target }} in
+              arm-unknown-linux-*) sudo apt-get -y install gcc-arm-linux-gnueabihf protobuf-compiler ;;
+              aarch64-unknown-linux-gnu) sudo apt-get -y install gcc-aarch64-linux-gnu protobuf-compiler ;;
+              *) sudo apt-get -y install protobuf-compiler ;;
+            esac
+            ;;
         esac
 
     - name: Install Rust toolchain
