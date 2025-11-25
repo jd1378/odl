@@ -370,12 +370,13 @@ jobs:
         path: ${{ steps.debian-package.outputs.DPKG_PATH }}
 
     - name: Publish archives and packages
-      uses: softprops/action-gh-release@v2
+      uses: ncipollo/release-action@v1
       with:
-        name: ${{ needs.crate_metadata.outputs.tag }}
-        tag_name: ${{ needs.crate_metadata.outputs.tag }}
-        files: |
-          ${{ steps.package.outputs.PKG_PATH }}
-          ${{ steps.debian-package.outputs.DPKG_PATH }}
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        tag: ${{ needs.crate_metadata.outputs.tag }}
+        omitBody: true
+        omitBodyDuringUpdate: true
+        omitName: true
+        allowUpdates: true
+        replacesArtifacts: true
+        updateOnlyUnreleased: false
+        artifacts: ${{ steps.package.outputs.PKG_PATH }},${{ steps.debian-package.outputs.DPKG_PATH }}
