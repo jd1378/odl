@@ -94,10 +94,10 @@ jobs:
     steps:
       - run: cargo install cargo-audit --locked
       - uses: actions/checkout@v5
-      - run: cargo audit
         with:
           fetch-depth: 0
           ref: ${{ needs.crate_metadata.outputs.tag }}
+      - run: cargo audit
   build:
     name: ${{ matrix.job.target }} (${{ matrix.job.os }})
     runs-on: ${{ matrix.job.os }}
