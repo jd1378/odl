@@ -2,7 +2,7 @@
 name = "odl"
 version = "0.1.0"
 edition = "2024"
-description = "wip"
+description = "Open-source, flexible download library and CLI intended to be fast, reliable, and easy to use."
 repository = "https://github.com/jd1378/odl"
 license = "MIT"
 
