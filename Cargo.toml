@@ -53,3 +53,4 @@ mockito = "1.7.0"
 
 [build-dependencies]
 prost-build = "0.14"
+protobuf-src = "2.1"

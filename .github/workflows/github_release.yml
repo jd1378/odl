@@ -140,31 +140,9 @@ jobs:
     - name: Install prerequisites
       shell: bash
       run: |
-        case ${{ matrix.job.os }} in
-          ubuntu*|linux*)
-            echo "installing linux prerequisites"
-            sudo apt-get -y update
-            case ${{ matrix.job.target }} in
-              arm-unknown-linux-*) sudo apt-get -y install gcc-arm-linux-gnueabihf ;;
-              aarch64-unknown-linux-gnu) sudo apt-get -y install gcc-aarch64-linux-gnu ;;
-            esac
-            ;;
-          macos*)
-            brew update
-            brew install protobuf
-            if ! command -v protoc >/dev/null 2>&1; then
-              echo "protoc not installed properly on macOS, exiting with error..."
-              exit 1
-            fi
-            chmod 755 $(command -v protoc)
-            echo "PROTOC=$(command -v protoc)" >> $GITHUB_ENV
-            echo "protoc is installed at $PROTOC"
-            ;;
-          windows-*)
-            powershell -NoProfile -NonInteractive -Command 'choco install protoc -y --no-progress'
-            powershell -NoProfile -NonInteractive -Command 'if (-not (Get-Command protoc -ErrorAction SilentlyContinue)) { Write-Error "protoc not installed properly on Windows, exiting with error..."; exit 1 }'
-            powershell -NoProfile -NonInteractive -Command 'Add-Content -Path $Env:GITHUB_ENV -Value ("PROTOC=" + (Get-Command protoc -ErrorAction Stop).Source)'
-            ;;
+        case ${{ matrix.job.target }} in
+          arm-unknown-linux-*) sudo apt-get -y update ; sudo apt-get -y install gcc-arm-linux-gnueabihf ;;
+          aarch64-unknown-linux-gnu) sudo apt-get -y update ; sudo apt-get -y install gcc-aarch64-linux-gnu ;;
         esac
 
     - name: Install Rust toolchain
@@ -196,7 +174,6 @@ jobs:
     - name: Build
       shell: bash
       run: |
-        echo "Path to PROTOC is: $PROTOC"
         $BUILD_CMD build --locked --release --target=${{ matrix.job.target }}
 
     - name: Set binary name & path
