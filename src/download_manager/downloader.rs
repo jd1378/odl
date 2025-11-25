@@ -35,7 +35,8 @@ use crate::{
 const MIN_DYNAMIC_SPLIT_SIZE: u64 = 3 * 1024 * 1024; // 3 MB
 /// Minimum eta needed for dynamic split to happen. any eta less than this will skip creating more chunks
 /// as it will be inefficient
-const MIN_DYNAMIC_SPLIT_ETA: Duration = Duration::from_secs(60); // 1 minutes
+const MIN_DYNAMIC_SPLIT_ETA: Duration = Duration::from_secs(60);
+const MIN_DYNAMIC_SPLIT_ELAPSED: Duration = Duration::from_secs(15);
 
 #[cfg(not(test))]
 const STALE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -317,8 +318,12 @@ impl Downloader {
         &self,
         candidate: &SplitCandidate,
     ) -> Result<Option<(PartDetails, u64)>, OdlError> {
-        // If estimated time to finish entire download is <= 60s, avoid splitting as it will be inefficient
-        if self.aggregator_span.pb_eta() <= MIN_DYNAMIC_SPLIT_ETA {
+        // If estimated time to finish entire download is <= 60s,
+        // Or if elapsed time is under 15 seconds
+        // avoid splitting as it will be inefficient
+        if self.aggregator_span.pb_elapsed() <= MIN_DYNAMIC_SPLIT_ELAPSED
+            || self.aggregator_span.pb_eta() <= MIN_DYNAMIC_SPLIT_ETA
+        {
             return Ok(None);
         }
 
