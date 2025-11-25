@@ -1,6 +1,6 @@
 # ODL
 
-Open-source, flexible download library and CLI intended to be fast, reliable, and easy to use.
+Flexible download library and CLI intended to be fast, reliable, and easy to use.
 
 ## Quick Start
 
