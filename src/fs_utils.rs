@@ -333,22 +333,13 @@ mod tests {
         let unix_time = 1_600_000_000i64;
         set_file_mtime_async(&file_path, unix_time).await.unwrap();
 
-        // Check mtime
+        // Check mtime in a platform-independent way by using `modified()`
+        // which returns a `SystemTime` that can be converted to UNIX seconds.
         let metadata = fs::metadata(&file_path).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            assert_eq!(metadata.mtime(), unix_time);
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::MetadataExt;
-            let filetime = metadata.last_write_time();
-            // Convert Windows FILETIME (100-nanosecond intervals since 1601-01-01)
-            // to UNIX seconds and compare directly.
-            let actual_unix_secs = (filetime / 10_000_000) as i64 - 11_644_473_600i64;
-            assert_eq!(actual_unix_secs, unix_time);
-        }
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let modified: SystemTime = metadata.modified().unwrap();
+        let actual_unix_secs = modified.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        assert_eq!(actual_unix_secs, unix_time);
     }
 
     #[tokio::test]
