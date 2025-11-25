@@ -808,7 +808,7 @@ mod tests {
         aggregator_span.pb_set_length(120_000);
         aggregator_span.pb_inc(1);
         // give the progress bar a tiny moment to record elapsed time so ETA can be computed
-        time::sleep(Duration::from_millis(10)).await;
+        time::sleep(Duration::from_millis(100)).await;
         assert!(aggregator_span.pb_eta() > MIN_DYNAMIC_SPLIT_ETA);
 
         let controller = Arc::new(PartController::new(original_size, 0));
