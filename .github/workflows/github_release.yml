@@ -167,6 +167,7 @@ jobs:
             powershell -NoProfile -NonInteractive -Command 'choco install protoc -y --no-progress'
             powershell -NoProfile -NonInteractive -Command 'if (-not (Get-Command protoc -ErrorAction SilentlyContinue)) { Write-Error "protoc not installed properly on Windows, exiting with error..."; exit 1 }'
             powershell -NoProfile -NonInteractive -Command 'Add-Content -Path $Env:GITHUB_ENV -Value ("PROTOC=" + (Get-Command protoc -ErrorAction Stop).Source)'
+            echo "Windows protoc: $PROTOC"
             ;;
         esac
 
