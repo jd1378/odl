@@ -145,18 +145,9 @@ jobs:
             echo "installing linux prerequisites"
             sudo apt-get -y update
             case ${{ matrix.job.target }} in
-              arm-unknown-linux-*) sudo apt-get -y install gcc-arm-linux-gnueabihf protobuf-compiler ;;
-              aarch64-unknown-linux-gnu) sudo apt-get -y install gcc-aarch64-linux-gnu protobuf-compiler ;;
-              *) sudo apt-get -y install protobuf-compiler ;;
+              arm-unknown-linux-*) sudo apt-get -y install gcc-arm-linux-gnueabihf ;;
+              aarch64-unknown-linux-gnu) sudo apt-get -y install gcc-aarch64-linux-gnu ;;
             esac
-            if ! command -v protoc >/dev/null 2>&1; then
-              echo "protoc not installed properly exiting with error..."
-              exit 1
-            fi
-            chmod 755 $(command -v protoc)
-            # Export path to protoc for later steps
-            echo "PROTOC=$(command -v protoc)" >> $GITHUB_ENV
-            echo "protoc is installed at $PROTOC"
             ;;
           macos*)
             brew update
@@ -175,7 +166,6 @@ jobs:
             powershell -NoProfile -NonInteractive -Command 'Add-Content -Path $Env:GITHUB_ENV -Value ("PROTOC=" + (Get-Command protoc -ErrorAction Stop).Source)'
             ;;
         esac
-        echo "protoc has been installed successfully"
 
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
@@ -206,7 +196,7 @@ jobs:
     - name: Build
       shell: bash
       run: |
-        echo "Path to PROTOC is: $PROTOC" 
+        echo "Path to PROTOC is: $PROTOC"
         $BUILD_CMD build --locked --release --target=${{ matrix.job.target }}
 
     - name: Set binary name & path
@@ -255,7 +245,7 @@ jobs:
         PKG_NAME=${PKG_BASENAME}${PKG_suffix}
         echo "PKG_NAME=${PKG_NAME}" >> $GITHUB_OUTPUT
 
-        PKG_STAGING="${{ env.CICD_INTERMEDIATES_DIR }}/package"
+        PKG_STAGING="_cicd-intermediates/package"
         ARCHIVE_DIR="${PKG_STAGING}/${PKG_BASENAME}/"
         mkdir -p "${ARCHIVE_DIR}"
         mkdir -p "${ARCHIVE_DIR}/autocomplete"
@@ -283,7 +273,7 @@ jobs:
       if: startsWith(matrix.job.os, 'ubuntu')
       run: |
         COPYRIGHT_YEARS="2018 - "$(date "+%Y")
-        DPKG_STAGING="${{ env.CICD_INTERMEDIATES_DIR }}/debian-package"
+        DPKG_STAGING="_cicd-intermediates/debian-package"
         DPKG_DIR="${DPKG_STAGING}/dpkg"
         mkdir -p "${DPKG_DIR}"
 
