@@ -35,8 +35,15 @@ use crate::{
 const MIN_DYNAMIC_SPLIT_SIZE: u64 = 3 * 1024 * 1024; // 3 MB
 /// Minimum eta needed for dynamic split to happen. any eta less than this will skip creating more chunks
 /// as it will be inefficient
+#[cfg(not(test))]
 const MIN_DYNAMIC_SPLIT_ETA: Duration = Duration::from_secs(60);
+#[cfg(test)]
+const MIN_DYNAMIC_SPLIT_ETA: Duration = Duration::from_secs(0);
+
+#[cfg(not(test))]
 const MIN_DYNAMIC_SPLIT_ELAPSED: Duration = Duration::from_secs(15);
+#[cfg(test)]
+const MIN_DYNAMIC_SPLIT_ELAPSED: Duration = Duration::from_millis(0);
 
 #[cfg(not(test))]
 const STALE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
