@@ -1,10 +1,12 @@
 [package]
 name = "odl"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
-description = "Open-source, flexible download library and CLI intended to be fast, reliable, and easy to use."
+description = "flexible download library and CLI intended to be fast, reliable, and easy to use."
 repository = "https://github.com/jd1378/odl"
 license = "MIT"
+authors = ["jd1378 <javad.mnjd@hotmail.com>"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 reqwest = { version = "0.12.19", default-features = false, features = ["http2", "gzip", "brotli", "native-tls", "socks", "stream"] }
