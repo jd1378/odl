@@ -130,18 +130,6 @@ impl From<crate::download::DownloadBuilderError> for OdlError {
     }
 }
 
-impl From<reqwest_middleware::Error> for OdlError {
-    fn from(value: reqwest_middleware::Error) -> Self {
-        match value {
-            reqwest_middleware::Error::Middleware(error) => Self::Other {
-                message: error.to_string(),
-                origin: error.into_boxed_dyn_error(),
-            },
-            reqwest_middleware::Error::Reqwest(error) => OdlError::from(error),
-        }
-    }
-}
-
 impl From<prost::DecodeError> for OdlError {
     fn from(e: prost::DecodeError) -> Self {
         OdlError::MetadataError(MetadataError::MetadataDecodeError { e })
