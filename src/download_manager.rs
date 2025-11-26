@@ -243,7 +243,12 @@ impl DownloadManager {
         let mut metadata = resolve_server_conflicts(&instruction, conflict_resolver).await?;
 
         if let Some(sum_of_parts_sizes) = sum_parts_on_disk(&instruction, &metadata).await {
+            let size: Option<u64> = metadata.size.or_else(|| instruction.size());
             let current_span = Span::current();
+            current_span.pb_reset();
+            if let Some(size) = size {
+                current_span.pb_set_length(size);
+            }
             current_span.pb_set_position(sum_of_parts_sizes);
             current_span.pb_reset_eta();
         }
