@@ -13,7 +13,6 @@ keywords = ["download", "manager", "idm", "dl", "download-manager"]
 [dependencies]
 reqwest = { version = "0.12.24", default-features = false, features = ["http2", "gzip", "brotli", "native-tls", "native-tls-vendored", "native-tls-alpn", "socks", "stream"] }
 reqwest-middleware = "0.4.2"
-reqwest-retry = "0.7.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
 thiserror = "2.0.12"
 chrono = "0.4.41"
