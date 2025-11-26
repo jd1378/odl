@@ -163,37 +163,37 @@ impl ConfigBuilder {
                 "max_concurrent_downloads",
             ));
         }
-        if let Some(max_connections) = self.max_connections {
-            if max_connections == 0 {
-                return Err(ConfigBuilderError::UninitializedField("max_connections"));
-            }
+        if let Some(max_connections) = self.max_connections
+            && max_connections == 0
+        {
+            return Err(ConfigBuilderError::UninitializedField("max_connections"));
         }
-        if let Some(wait_between_retries) = self.wait_between_retries {
-            if wait_between_retries == Duration::from_millis(0) {
-                return Err(ConfigBuilderError::UninitializedField(
-                    "wait_between_retries",
-                ));
-            }
+        if let Some(wait_between_retries) = self.wait_between_retries
+            && wait_between_retries == Duration::from_millis(0)
+        {
+            return Err(ConfigBuilderError::UninitializedField(
+                "wait_between_retries",
+            ));
         }
-        if let Some(n_fixed) = self.n_fixed_retries {
-            if n_fixed == 0 {
-                return Err(ConfigBuilderError::UninitializedField("n_fixed_retries"));
-            }
+        if let Some(n_fixed) = self.n_fixed_retries
+            && n_fixed == 0
+        {
+            return Err(ConfigBuilderError::UninitializedField("n_fixed_retries"));
         }
-        if let Some(Some(limit)) = self.speed_limit {
-            if limit == 0 {
-                return Err(ConfigBuilderError::UninitializedField("speed_limit"));
-            }
+        if let Some(Some(limit)) = self.speed_limit
+            && limit == 0
+        {
+            return Err(ConfigBuilderError::UninitializedField("speed_limit"));
         }
-        if let Some(Some(timeout)) = self.connect_timeout {
-            if timeout == Duration::from_millis(0) {
-                return Err(ConfigBuilderError::UninitializedField("request_timeout"));
-            }
+        if let Some(Some(timeout)) = self.connect_timeout
+            && timeout == Duration::from_millis(0)
+        {
+            return Err(ConfigBuilderError::UninitializedField("request_timeout"));
         }
-        if let Some(Some(proxy)) = self.proxy.as_ref() {
-            if Proxy::all(proxy).is_err() {
-                return Err(ConfigBuilderError::ValidationError("proxy".to_owned()));
-            }
+        if let Some(Some(proxy)) = self.proxy.as_ref()
+            && Proxy::all(proxy).is_err()
+        {
+            return Err(ConfigBuilderError::ValidationError("proxy".to_owned()));
         }
 
         if let Some(Some(headers)) = self.headers.as_ref() {
@@ -272,10 +272,10 @@ impl From<&Config> for HeaderMap {
         if let Some(headers) = &cfg.headers {
             for (k, v) in headers.iter() {
                 // ignore invalid header names/values instead of returning an error
-                if let Ok(name) = HeaderName::from_bytes(k.as_bytes()) {
-                    if let Ok(value) = HeaderValue::from_str(v) {
-                        map.insert(name, value);
-                    }
+                if let Ok(name) = HeaderName::from_bytes(k.as_bytes())
+                    && let Ok(value) = HeaderValue::from_str(v)
+                {
+                    map.insert(name, value);
                 }
             }
         }

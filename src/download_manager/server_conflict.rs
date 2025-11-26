@@ -122,10 +122,8 @@ where
 
         let results = join_all(finished_parts).await;
         for (ulid, exists) in results {
-            if !exists {
-                if let Some(part) = metadata.parts.get_mut(&ulid) {
-                    part.finished = false;
-                }
+            if !exists && let Some(part) = metadata.parts.get_mut(&ulid) {
+                part.finished = false;
             }
         }
 

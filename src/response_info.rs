@@ -70,10 +70,10 @@ impl ResponseInfo {
 
     /// Returns the total length of the resource, even if this is a partial response.
     pub fn total_length(&self) -> Option<u64> {
-        if let Some(content_range) = self.content_range() {
-            if content_range.total.is_some() {
-                return content_range.total;
-            }
+        if let Some(content_range) = self.content_range()
+            && content_range.total.is_some()
+        {
+            return content_range.total;
         }
         self.content_length()
     }
@@ -89,19 +89,19 @@ impl ResponseInfo {
     /// Extracts filename from response headers or request url. if both fail, returns "download"
     pub fn extract_filename(&self) -> String {
         // Try to extract filename from Content-Disposition header
-        if let Some(header) = self.response_headers.get(CONTENT_DISPOSITION) {
-            if let Ok(header_str) = header.to_str() {
-                // Look for filename*= (RFC 5987), then fallback to filename=
-                for part in header_str.split(';').map(str::trim) {
-                    if let Some(val) = part.strip_prefix("filename*=") {
-                        // e.g. filename*=UTF-8''%E2%82%AC%20rates
-                        let value = val.trim_matches('"').trim_start_matches("UTF-8''");
-                        if let Ok(decoded) = percent_decode_str(value).decode_utf8() {
-                            return decoded.into_owned();
-                        }
-                    } else if let Some(val) = part.strip_prefix("filename=") {
-                        return val.trim_matches('"').to_string();
+        if let Some(header) = self.response_headers.get(CONTENT_DISPOSITION)
+            && let Ok(header_str) = header.to_str()
+        {
+            // Look for filename*= (RFC 5987), then fallback to filename=
+            for part in header_str.split(';').map(str::trim) {
+                if let Some(val) = part.strip_prefix("filename*=") {
+                    // e.g. filename*=UTF-8''%E2%82%AC%20rates
+                    let value = val.trim_matches('"').trim_start_matches("UTF-8''");
+                    if let Ok(decoded) = percent_decode_str(value).decode_utf8() {
+                        return decoded.into_owned();
                     }
+                } else if let Some(val) = part.strip_prefix("filename=") {
+                    return val.trim_matches('"').to_string();
                 }
             }
         }
@@ -194,45 +194,45 @@ impl ResponseInfo {
         let mut hashes = Vec::new();
 
         // Digest (RFC 3230, e.g. "SHA-256=abc..., md5=xyz...")
-        if let Some(val) = self.response_headers.get("Digest") {
-            if let Ok(s) = val.to_str() {
-                for part in s.split(',') {
-                    let part = part.trim();
-                    if let Some((alg, value)) = part.split_once('=') {
-                        let value = value.trim();
-                        match alg.trim().to_ascii_lowercase().as_str() {
-                            "sha-512" => {
-                                hashes.push(HashDigest::SHA512(
-                                    value.to_string(),
-                                    crate::hash::HashEncoding::Base64,
-                                ));
-                                return hashes;
-                            }
-                            "sha-384" => {
-                                hashes.push(HashDigest::SHA384(
-                                    value.to_string(),
-                                    crate::hash::HashEncoding::Base64,
-                                ));
-                                return hashes;
-                            }
-                            "sha-256" => {
-                                hashes.push(HashDigest::SHA256(
-                                    value.to_string(),
-                                    crate::hash::HashEncoding::Base64,
-                                ));
-                                return hashes;
-                            }
-                            "sha" | "sha1" | "sha-1" => hashes.push(HashDigest::SHA1(
+        if let Some(val) = self.response_headers.get("Digest")
+            && let Ok(s) = val.to_str()
+        {
+            for part in s.split(',') {
+                let part = part.trim();
+                if let Some((alg, value)) = part.split_once('=') {
+                    let value = value.trim();
+                    match alg.trim().to_ascii_lowercase().as_str() {
+                        "sha-512" => {
+                            hashes.push(HashDigest::SHA512(
                                 value.to_string(),
                                 crate::hash::HashEncoding::Base64,
-                            )),
-                            "md5" => hashes.push(HashDigest::MD5(
-                                value.to_string(),
-                                crate::hash::HashEncoding::Base64,
-                            )),
-
-                            _ => {}
+                            ));
+                            return hashes;
                         }
+                        "sha-384" => {
+                            hashes.push(HashDigest::SHA384(
+                                value.to_string(),
+                                crate::hash::HashEncoding::Base64,
+                            ));
+                            return hashes;
+                        }
+                        "sha-256" => {
+                            hashes.push(HashDigest::SHA256(
+                                value.to_string(),
+                                crate::hash::HashEncoding::Base64,
+                            ));
+                            return hashes;
+                        }
+                        "sha" | "sha1" | "sha-1" => hashes.push(HashDigest::SHA1(
+                            value.to_string(),
+                            crate::hash::HashEncoding::Base64,
+                        )),
+                        "md5" => hashes.push(HashDigest::MD5(
+                            value.to_string(),
+                            crate::hash::HashEncoding::Base64,
+                        )),
+
+                        _ => {}
                     }
                 }
             }
@@ -241,61 +241,61 @@ impl ResponseInfo {
         // X-Checksum-*
         for (name, value) in self.response_headers.iter() {
             let name_str = name.as_str().to_ascii_lowercase();
-            if let Some(suffix) = name_str.strip_prefix("x-checksum-") {
-                if let Ok(val_str) = value.to_str() {
-                    let val_trimmed = val_str.trim();
-                    // It's usually hex,
-                    // If it's not hex, It's base64
-                    fn is_hex(s: &str) -> bool {
-                        s.len() % 2 == 0 && s.chars().all(|c| c.is_ascii_hexdigit())
+            if let Some(suffix) = name_str.strip_prefix("x-checksum-")
+                && let Ok(val_str) = value.to_str()
+            {
+                let val_trimmed = val_str.trim();
+                // It's usually hex,
+                // If it's not hex, It's base64
+                fn is_hex(s: &str) -> bool {
+                    s.len().is_multiple_of(2) && s.chars().all(|c| c.is_ascii_hexdigit())
+                }
+                let encoding = if is_hex(val_trimmed) {
+                    crate::hash::HashEncoding::Hex
+                } else {
+                    crate::hash::HashEncoding::Base64
+                };
+                match suffix {
+                    "sha512" => {
+                        hashes.push(HashDigest::SHA512(val_trimmed.to_string(), encoding));
+                        return hashes;
                     }
-                    let encoding = if is_hex(val_trimmed) {
-                        crate::hash::HashEncoding::Hex
-                    } else {
-                        crate::hash::HashEncoding::Base64
-                    };
-                    match suffix {
-                        "sha512" => {
-                            hashes.push(HashDigest::SHA512(val_trimmed.to_string(), encoding));
-                            return hashes;
-                        }
-                        "sha384" => {
-                            hashes.push(HashDigest::SHA384(val_trimmed.to_string(), encoding));
-                            return hashes;
-                        }
-                        "sha256" => {
-                            hashes.push(HashDigest::SHA256(val_trimmed.to_string(), encoding));
-                            return hashes;
-                        }
-                        "sha" | "sha1" | "sha-1" => {
-                            hashes.push(HashDigest::SHA1(val_trimmed.to_string(), encoding))
-                        }
-                        "md5" => hashes.push(HashDigest::MD5(val_trimmed.to_string(), encoding)),
-                        _ => {}
+                    "sha384" => {
+                        hashes.push(HashDigest::SHA384(val_trimmed.to_string(), encoding));
+                        return hashes;
                     }
+                    "sha256" => {
+                        hashes.push(HashDigest::SHA256(val_trimmed.to_string(), encoding));
+                        return hashes;
+                    }
+                    "sha" | "sha1" | "sha-1" => {
+                        hashes.push(HashDigest::SHA1(val_trimmed.to_string(), encoding))
+                    }
+                    "md5" => hashes.push(HashDigest::MD5(val_trimmed.to_string(), encoding)),
+                    _ => {}
                 }
             }
         }
 
         // Content-SHA256
-        if let Some(val) = self.response_headers.get("Content-SHA256") {
-            if let Ok(s) = val.to_str() {
-                hashes.push(HashDigest::SHA256(
-                    s.trim().to_string(),
-                    crate::hash::HashEncoding::Hex,
-                ));
-                return hashes;
-            }
+        if let Some(val) = self.response_headers.get("Content-SHA256")
+            && let Ok(s) = val.to_str()
+        {
+            hashes.push(HashDigest::SHA256(
+                s.trim().to_string(),
+                crate::hash::HashEncoding::Hex,
+            ));
+            return hashes;
         }
 
         // Content-MD5 rfc1864
-        if let Some(val) = self.response_headers.get("Content-MD5") {
-            if let Ok(s) = val.to_str() {
-                hashes.push(HashDigest::MD5(
-                    s.trim().to_string(),
-                    crate::hash::HashEncoding::Base64,
-                ));
-            }
+        if let Some(val) = self.response_headers.get("Content-MD5")
+            && let Ok(s) = val.to_str()
+        {
+            hashes.push(HashDigest::MD5(
+                s.trim().to_string(),
+                crate::hash::HashEncoding::Base64,
+            ));
         }
 
         // Prefer Content-Digest (RFC 9530) over Repr-Digest if present
@@ -342,46 +342,46 @@ impl ResponseInfo {
                     }
                 }
             }
-        } else if let Some(val) = self.response_headers.get("Repr-Digest") {
-            if let Ok(s) = val.to_str() {
-                for part in s.split(',') {
-                    let part = part.trim();
-                    if let Some((alg, value)) = part.split_once('=') {
-                        let value = value.trim();
-                        // Repr-Digest values are surrounded by colons, e.g. ":base64value:"
-                        let value = value.trim_matches(':');
-                        match alg.trim().to_ascii_lowercase().as_str() {
-                            "sha-512" => {
-                                hashes.push(HashDigest::SHA512(
-                                    value.to_string(),
-                                    crate::hash::HashEncoding::Base64,
-                                ));
-                                return hashes;
-                            }
-                            "sha-384" => {
-                                hashes.push(HashDigest::SHA384(
-                                    value.to_string(),
-                                    crate::hash::HashEncoding::Base64,
-                                ));
-                                return hashes;
-                            }
-                            "sha-256" => {
-                                hashes.push(HashDigest::SHA256(
-                                    value.to_string(),
-                                    crate::hash::HashEncoding::Base64,
-                                ));
-                                return hashes;
-                            }
-                            "sha" | "sha1" | "sha-1" => hashes.push(HashDigest::SHA1(
+        } else if let Some(val) = self.response_headers.get("Repr-Digest")
+            && let Ok(s) = val.to_str()
+        {
+            for part in s.split(',') {
+                let part = part.trim();
+                if let Some((alg, value)) = part.split_once('=') {
+                    let value = value.trim();
+                    // Repr-Digest values are surrounded by colons, e.g. ":base64value:"
+                    let value = value.trim_matches(':');
+                    match alg.trim().to_ascii_lowercase().as_str() {
+                        "sha-512" => {
+                            hashes.push(HashDigest::SHA512(
                                 value.to_string(),
                                 crate::hash::HashEncoding::Base64,
-                            )),
-                            "md5" => hashes.push(HashDigest::MD5(
-                                value.to_string(),
-                                crate::hash::HashEncoding::Base64,
-                            )),
-                            _ => {}
+                            ));
+                            return hashes;
                         }
+                        "sha-384" => {
+                            hashes.push(HashDigest::SHA384(
+                                value.to_string(),
+                                crate::hash::HashEncoding::Base64,
+                            ));
+                            return hashes;
+                        }
+                        "sha-256" => {
+                            hashes.push(HashDigest::SHA256(
+                                value.to_string(),
+                                crate::hash::HashEncoding::Base64,
+                            ));
+                            return hashes;
+                        }
+                        "sha" | "sha1" | "sha-1" => hashes.push(HashDigest::SHA1(
+                            value.to_string(),
+                            crate::hash::HashEncoding::Base64,
+                        )),
+                        "md5" => hashes.push(HashDigest::MD5(
+                            value.to_string(),
+                            crate::hash::HashEncoding::Base64,
+                        )),
+                        _ => {}
                     }
                 }
             }

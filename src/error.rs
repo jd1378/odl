@@ -72,12 +72,12 @@ pub enum OdlError {
 
 impl From<reqwest::Error> for OdlError {
     fn from(e: reqwest::Error) -> Self {
-        if let Some(status) = e.status() {
-            if !status.is_success() {
-                return Self::Network(NetworkError::Status {
-                    status_code: status.as_u16(),
-                });
-            }
+        if let Some(status) = e.status()
+            && !status.is_success()
+        {
+            return Self::Network(NetworkError::Status {
+                status_code: status.as_u16(),
+            });
         }
         if e.is_timeout() {
             return OdlError::Network(NetworkError::Timeout);
@@ -91,10 +91,10 @@ impl From<reqwest::Error> for OdlError {
             return OdlError::Network(NetworkError::Connect);
         }
 
-        if let Some(io_err) = e.source().and_then(|s| s.downcast_ref::<std::io::Error>()) {
-            if io_err.kind() == std::io::ErrorKind::TimedOut {
-                return OdlError::Network(NetworkError::Timeout);
-            }
+        if let Some(io_err) = e.source().and_then(|s| s.downcast_ref::<std::io::Error>())
+            && io_err.kind() == std::io::ErrorKind::TimedOut
+        {
+            return OdlError::Network(NetworkError::Timeout);
         }
 
         Self::Network(NetworkError::Other {

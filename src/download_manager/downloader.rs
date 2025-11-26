@@ -244,7 +244,7 @@ impl Downloader {
         let speed_limiter = self.speed_limiter.clone();
         let span_ulid = task_part.ulid.clone();
         let part_span = info_span!("part", ulid = span_ulid.as_str());
-        let retry_policy = self.retry_policy.clone();
+        let retry_policy = self.retry_policy;
 
         // Pass through the optional probe notifier to the download task. The notifier
         // will be signalled when the task starts receiving data (first chunk).
@@ -514,12 +514,13 @@ impl BandwidthLimiter {
             state.refill(self.rate);
 
             // If we're at the front of the queue and enough tokens are available, consume and go.
-            if let Some(&front) = state.queue.front() {
-                if front == my_seq && state.available >= amount {
-                    state.available -= amount;
-                    state.queue.pop_front();
-                    return;
-                }
+            if let Some(&front) = state.queue.front()
+                && front == my_seq
+                && state.available >= amount
+            {
+                state.available -= amount;
+                state.queue.pop_front();
+                return;
             }
 
             // Compute a sensible sleep time. If there's a deficit for our request, wait

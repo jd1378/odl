@@ -19,10 +19,10 @@ pub async fn remove_all_parts(download_dir: &PathBuf) {
     if let Ok(mut entries) = tokio::fs::read_dir(&download_dir).await {
         while let Ok(Some(entry)) = entries.next_entry().await {
             let path = entry.path();
-            if let Some(ext) = path.extension() {
-                if ext == Download::PART_EXTENSION {
-                    let _ = tokio::fs::remove_file(&path).await;
-                }
+            if let Some(ext) = path.extension()
+                && ext == Download::PART_EXTENSION
+            {
+                let _ = tokio::fs::remove_file(&path).await;
             }
         }
     }
@@ -48,16 +48,15 @@ pub async fn assemble_final_file(
         tokio::io::copy(&mut part_file, &mut final_file).await?;
     }
 
-    if metadata.use_server_time {
-        if let Some(last_modified) = metadata.last_modified {
-            if let Err(e) = set_file_mtime_async(&final_path, last_modified).await {
-                tracing::error!(
-                    "Failed to set file mtime for {}: {}",
-                    final_path.display(),
-                    e
-                );
-            }
-        }
+    if metadata.use_server_time
+        && let Some(last_modified) = metadata.last_modified
+        && let Err(e) = set_file_mtime_async(&final_path, last_modified).await
+    {
+        tracing::error!(
+            "Failed to set file mtime for {}: {}",
+            final_path.display(),
+            e
+        );
     }
 
     check_final_file_checksum(metadata, instruction, false).await?;

@@ -57,10 +57,10 @@ where
                 let mut entries = tokio::fs::read_dir(instruction.download_dir()).await?;
                 while let Some(entry) = entries.next_entry().await? {
                     let path = entry.path();
-                    if let Some(ext) = path.extension() {
-                        if ext == Download::PART_EXTENSION {
-                            tokio::fs::remove_file(&path).await?;
-                        }
+                    if let Some(ext) = path.extension()
+                        && ext == Download::PART_EXTENSION
+                    {
+                        tokio::fs::remove_file(&path).await?;
                     }
                 }
             }
