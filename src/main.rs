@@ -390,7 +390,7 @@ async fn build_download_manager(args: &Args) -> Result<DownloadManager, OdlError
     let max_concurrent_downloads: usize = args
         .max_concurrent_downloads
         .unwrap_or(cfg.max_concurrent_downloads);
-    let max_retries: u64 = args.retry.unwrap_or(cfg.max_retries);
+    let max_retries: u64 = args.max_retries.unwrap_or(cfg.max_retries);
     let wait_between_retries: Duration = args
         .wait_between_retries
         .or(Some(cfg.wait_between_retries))

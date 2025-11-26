@@ -232,7 +232,7 @@ pub struct Args {
 
     /// Max number of retries in case of a network error
     #[arg(long, value_name = "COUNT")]
-    pub retry: Option<u64>,
+    pub max_retries: Option<u64>,
 
     /// Wait number of seconds after a network error before retry. Fractions are supported.
     #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
