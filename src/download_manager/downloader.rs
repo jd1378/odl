@@ -697,7 +697,6 @@ async fn download_part(
                     attempts,
                     attempts + 1,
                     &current_span,
-                    "after error",
                     &ulid,
                 )
                 .await
@@ -718,7 +717,6 @@ async fn download_part(
                     attempts,
                     attempts + 1,
                     &current_span,
-                    "after timeout",
                     &ulid,
                 )
                 .await
@@ -752,7 +750,6 @@ async fn download_part(
                             attempts,
                             attempts + 1,
                             &current_span,
-                            "after response error",
                             &ulid,
                         )
                         .await
@@ -773,7 +770,6 @@ async fn download_part(
                         attempts,
                         attempts + 1,
                         &current_span,
-                        "after timeout",
                         &ulid,
                     )
                     .await
@@ -842,16 +838,7 @@ async fn download_part(
         // The attempts counter may have been incremented in the branches above.
         // If no retry happened (shouldn't happen), increment to avoid infinite loop.
         attempts = attempts.saturating_add(1);
-        match retry_sleep_or_fail_part(
-            &policy,
-            attempts,
-            attempts,
-            &current_span,
-            "before reschedule",
-            &ulid,
-        )
-        .await
-        {
+        match retry_sleep_or_fail_part(&policy, attempts, attempts, &current_span, &ulid).await {
             Ok(()) => continue,
             Err(failed) => return Ok(failed),
         }
@@ -866,7 +853,6 @@ async fn retry_sleep_or_fail_part(
     attempts_for_policy: u32,
     attempts_display: u32,
     span: &Span,
-    suffix: &str,
     ulid: &str,
 ) -> Result<(), PartEvent> {
     match policy.should_retry(SystemTime::now(), attempts_for_policy) {
@@ -874,20 +860,64 @@ async fn retry_sleep_or_fail_part(
             let wait = execute_after
                 .duration_since(SystemTime::now())
                 .unwrap_or_default();
-            span.pb_set_message(&format!(
-                " Retrying part {}/{} {} , waiting {:.1}s",
-                attempts_display,
-                policy.max_n_retries,
-                suffix,
-                wait.as_secs_f32()
-            ));
-            time::sleep(wait).await;
+
+            // Pin the sleep so we can await it and also update the message periodically.
+            let sleep = time::sleep(wait);
+            tokio::pin!(sleep);
+            let start = Instant::now();
+
+            loop {
+                // Remaining time (zero if passed)
+                let remaining = wait.checked_sub(start.elapsed()).unwrap_or_default();
+
+                span.pb_set_message(&format!(
+                    " Retrying {}/{} in {}",
+                    attempts_display,
+                    policy.max_n_retries,
+                    format_wait(remaining)
+                ));
+
+                tokio::select! {
+                    _ = &mut sleep => break,
+                    _ = time::sleep(Duration::from_millis(200)) => {},
+                }
+            }
+
+            span.pb_set_message("");
+
             Ok(())
         }
         RetryDecision::DoNotRetry => Err(PartEvent::Failed {
             ulid: ulid.to_string(),
             attempts: attempts_display,
         }),
+    }
+}
+
+// Format a `Duration` compactly: fractional seconds (1 decimal) for < 1h,
+// otherwise hours and minutes (e.g. "1h 2m").
+fn format_wait(dur: Duration) -> String {
+    let total_secs = dur.as_secs();
+
+    // If <= 60s: show fractional seconds (1 decimal place)
+    if total_secs <= 60 {
+        return format!("{:.1}s", dur.as_secs_f32());
+    }
+
+    // If under an hour: show minutes and seconds (no fractional seconds)
+    if total_secs < 3600 {
+        let mins = total_secs / 60;
+        let secs = total_secs % 60;
+        return format!("{}m {}s", mins, secs);
+    }
+
+    // Otherwise show hours and minutes
+    let hours = total_secs / 3600;
+    let mins = (total_secs % 3600) / 60;
+    if mins > 0 {
+        format!("{}h {}m", hours, mins)
+    } else {
+        format!("{}h", hours)
     }
 }
 
