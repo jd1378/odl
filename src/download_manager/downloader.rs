@@ -10,6 +10,7 @@ use reqwest::{
     Client,
     header::{HeaderValue, RANGE, USER_AGENT},
 };
+use std::time::SystemTime;
 use tokio::{
     fs,
     io::{AsyncWriteExt, BufWriter},
@@ -23,6 +24,7 @@ use ulid::Ulid;
 
 use prost::Message;
 
+use crate::retry_policies::FixedThenExponentialRetry;
 use crate::{
     download::Download,
     download_manager::io::persist_encoded_metadata,
@@ -30,6 +32,7 @@ use crate::{
     error::{MetadataError, OdlError},
     user_agents::random_user_agent,
 };
+use reqwest_retry::{RetryDecision, RetryPolicy};
 
 /// Minimum chunk size we keep on a single task before attempting another split.
 const MIN_DYNAMIC_SPLIT_SIZE: u64 = 3 * 1024 * 1024; // 3 MB
@@ -60,6 +63,7 @@ pub struct Downloader {
     concurrency_limit: usize,
     aggregator_span: Span,
     speed_limiter: Option<Arc<BandwidthLimiter>>,
+    retry_policy: FixedThenExponentialRetry,
     persist_mutex: Arc<Mutex<()>>,
 }
 
@@ -71,6 +75,7 @@ impl Downloader {
         randomize_user_agent: bool,
         aggregator_span: Span,
         speed_limit: Option<u64>,
+        retry_policy: FixedThenExponentialRetry,
     ) -> Self {
         let concurrency_limit = metadata.max_connections as usize;
         let speed_limiter = speed_limit
@@ -88,6 +93,7 @@ impl Downloader {
             },
             aggregator_span,
             speed_limiter,
+            retry_policy,
             persist_mutex: Arc::new(Mutex::new(())),
         }
     }
@@ -238,6 +244,7 @@ impl Downloader {
         let speed_limiter = self.speed_limiter.clone();
         let span_ulid = task_part.ulid.clone();
         let part_span = info_span!("part", ulid = span_ulid.as_str());
+        let retry_policy = self.retry_policy.clone();
 
         // Pass through the optional probe notifier to the download task. The notifier
         // will be signalled when the task starts receiving data (first chunk).
@@ -253,6 +260,7 @@ impl Downloader {
                     aggregator_span,
                     speed_limiter,
                     probe_for_task,
+                    retry_policy,
                 )
                 .await
             }
@@ -560,6 +568,7 @@ async fn download_part(
     aggregator_span: Span,
     speed_limiter: Option<Arc<BandwidthLimiter>>,
     probe_notify: Option<Arc<Notify>>,
+    policy: FixedThenExponentialRetry,
 ) -> Result<PartEvent, OdlError> {
     let PartDetails {
         offset, size, ulid, ..
@@ -574,89 +583,225 @@ async fn download_part(
     current_span.pb_set_position(current_size);
     current_span.pb_reset_eta();
 
-    let file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&part_path)
-        .await?;
+    let mut attempts: u32 = 0;
 
-    if current_size >= target_size {
-        return Ok(PartEvent::Completed(PartOutcome {
-            ulid,
-            final_size: target_size,
-        }));
-    }
-
-    let mut file = BufWriter::new(file);
-
-    let mut req = client.get(url);
-    let range_header = format!("bytes={}-{}", offset + current_size, offset + size - 1,);
-    let range_value = HeaderValue::from_str(&range_header).map_err(|e| OdlError::Other {
-        message: "Internal Error: Invalid range header".to_string(),
-        origin: Box::new(e),
-    })?;
-    req = req.header(RANGE, range_value);
-    if randomize_user_agent {
-        req = req.header(USER_AGENT, random_user_agent())
-    }
-
-    let mut resp = req.send().await.map_err(OdlError::from)?;
-
-    let mut started_notified = false;
     loop {
-        let allow_until = controller.limit();
-        if controller.downloaded() >= allow_until {
-            break;
-        }
+        // Recompute current size (in case previous attempts wrote some bytes)
+        current_size = controller.downloaded();
 
-        let chunk_result = time::timeout(STALE_CONNECTION_TIMEOUT, resp.chunk()).await;
-        let maybe_chunk = match chunk_result {
-            Ok(chunk) => chunk.map_err(OdlError::from)?,
-            Err(_) => {
-                file.flush().await?;
-                return Ok(PartEvent::NeedsReschedule { ulid });
+        // Open file for this attempt (append so we resume). We open the file
+        // early (even for zero-length parts) so that an empty part file exists
+        // on disk — callers expect part files to be present when assembling.
+        let file_open = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&part_path)
+            .await;
+        let mut file = match file_open {
+            Ok(f) => BufWriter::new(f),
+            Err(e) => {
+                return Err(OdlError::StdIoError {
+                    e,
+                    extra_info: Some(format!("Failed to open part file {}", part_path.display())),
+                });
             }
         };
 
-        let mut chunk = match maybe_chunk {
-            Some(chunk) => chunk,
-            None => break,
+        if current_size >= target_size {
+            return Ok(PartEvent::Completed(PartOutcome {
+                ulid,
+                final_size: target_size,
+            }));
+        }
+
+        // build request for the remaining range
+        let mut req = client.get(url.clone());
+        let range_header = format!("bytes={}-{}", offset + current_size, offset + size - 1,);
+        let range_value = match HeaderValue::from_str(&range_header) {
+            Ok(v) => v,
+            Err(e) => {
+                return Err(OdlError::Other {
+                    message: "Internal Error: Invalid range header".to_string(),
+                    origin: Box::new(e),
+                });
+            }
+        };
+        req = req.header(RANGE, range_value);
+        if randomize_user_agent {
+            req = req.header(USER_AGENT, random_user_agent())
+        }
+
+        // send request
+        let resp_result = req.send().await.map_err(OdlError::from);
+
+        let mut resp = match resp_result {
+            Ok(r) => r,
+            Err(_e) => {
+                if maybe_retry_sleep(
+                    &policy,
+                    attempts,
+                    attempts + 1,
+                    &current_span,
+                    "after error",
+                )
+                .await
+                {
+                    attempts = attempts.saturating_add(1);
+                    continue;
+                } else {
+                    return Ok(PartEvent::NeedsReschedule { ulid });
+                }
+            }
         };
 
-        // Signal that we've started receiving data for this probe connection.
-        if !started_notified {
-            if let Some(n) = probe_notify.as_ref() {
-                n.notify_one();
+        let mut started_notified = false;
+        let mut saw_eof = false;
+        loop {
+            let allow_until = controller.limit();
+            if controller.downloaded() >= allow_until {
+                break;
             }
-            started_notified = true;
+
+            let chunk_result = time::timeout(STALE_CONNECTION_TIMEOUT, resp.chunk()).await;
+            let maybe_chunk = match chunk_result {
+                Ok(chunk_res) => match chunk_res.map_err(OdlError::from) {
+                    Ok(opt) => opt,
+                    Err(_e) => {
+                        // network/body error -> consider retrying
+                        file.flush().await?;
+                        if maybe_retry_sleep(
+                            &policy,
+                            attempts,
+                            attempts + 1,
+                            &current_span,
+                            "after response error",
+                        )
+                        .await
+                        {
+                            attempts = attempts.saturating_add(1);
+                            break;
+                        } else {
+                            return Ok(PartEvent::NeedsReschedule { ulid });
+                        }
+                    }
+                },
+                Err(_) => {
+                    // timeout reading chunk -> retry according to policy
+                    file.flush().await?;
+                    if maybe_retry_sleep(
+                        &policy,
+                        attempts,
+                        attempts + 1,
+                        &current_span,
+                        "after timeout",
+                    )
+                    .await
+                    {
+                        attempts = attempts.saturating_add(1);
+                        break;
+                    } else {
+                        return Ok(PartEvent::NeedsReschedule { ulid });
+                    }
+                }
+            };
+
+            let mut chunk = match maybe_chunk {
+                Some(chunk) => chunk,
+                None => {
+                    // EOF / short body — do not attempt automatic retry here;
+                    // match previous behavior and allow caller to reschedule.
+                    saw_eof = true;
+                    break;
+                }
+            };
+
+            // Signal that we've started receiving data for this probe connection.
+            if !started_notified {
+                if let Some(n) = probe_notify.as_ref() {
+                    n.notify_one();
+                }
+                started_notified = true;
+            }
+
+            let downloaded = controller.downloaded();
+            let remaining = allow_until.saturating_sub(downloaded);
+            if chunk.len() as u64 > remaining {
+                chunk = chunk.split_to(remaining as usize);
+            }
+
+            let len = chunk.len() as u64;
+            if let Some(limiter) = speed_limiter.as_ref() {
+                limiter.acquire(len).await;
+            }
+            file.write_all(&chunk).await?;
+            aggregator_span.pb_inc(len);
+            current_span.pb_inc(len);
+            controller.record_progress(len);
+            current_size += len;
         }
 
-        let downloaded = controller.downloaded();
-        let remaining = allow_until.saturating_sub(downloaded);
-        if chunk.len() as u64 > remaining {
-            chunk = chunk.split_to(remaining as usize);
+        file.flush().await?;
+
+        if controller.downloaded() >= controller.limit() {
+            return Ok(PartEvent::Completed(PartOutcome {
+                ulid,
+                final_size: controller.limit(),
+            }));
         }
 
-        let len = chunk.len() as u64;
-        if let Some(limiter) = speed_limiter.as_ref() {
-            limiter.acquire(len).await;
+        // If we observed EOF (server closed the connection with less data
+        // than requested), follow previous behavior: return NeedsReschedule
+        // immediately so scheduler can handle rescheduling.
+        if saw_eof {
+            return Ok(PartEvent::NeedsReschedule { ulid });
         }
-        file.write_all(&chunk).await?;
-        aggregator_span.pb_inc(len);
-        current_span.pb_inc(len);
-        controller.record_progress(len);
-        current_size += len;
+
+        // If we get here, it means we broke the inner loop to retry; loop again
+        // The attempts counter may have been incremented in the branches above.
+        // If no retry happened (shouldn't happen), increment to avoid infinite loop.
+        attempts = attempts.saturating_add(1);
+        if maybe_retry_sleep(
+            &policy,
+            attempts,
+            attempts,
+            &current_span,
+            "before reschedule",
+        )
+        .await
+        {
+            continue;
+        } else {
+            return Ok(PartEvent::NeedsReschedule { ulid });
+        }
     }
+}
 
-    file.flush().await?;
-
-    if controller.downloaded() >= controller.limit() {
-        Ok(PartEvent::Completed(PartOutcome {
-            ulid,
-            final_size: controller.limit(),
-        }))
-    } else {
-        Ok(PartEvent::NeedsReschedule { ulid })
+// Centralize retry decision, progress message and sleeping so callers can avoid
+// duplicating the same logic. Returns `true` if the policy says to retry (and
+// the helper slept), or `false` when the policy says `DoNotRetry`.
+async fn maybe_retry_sleep(
+    policy: &FixedThenExponentialRetry,
+    attempts_for_policy: u32,
+    attempts_display: u32,
+    span: &Span,
+    suffix: &str,
+) -> bool {
+    match policy.should_retry(SystemTime::now(), attempts_for_policy) {
+        RetryDecision::Retry { execute_after } => {
+            let wait = execute_after
+                .duration_since(SystemTime::now())
+                .unwrap_or_default();
+            span.pb_set_message(&format!(
+                "Retrying part {}/{} {} , waiting {}s",
+                attempts_display,
+                policy.max_n_retries,
+                suffix,
+                wait.as_secs_f32()
+            ));
+            time::sleep(wait).await;
+            true
+        }
+        RetryDecision::DoNotRetry => false,
     }
 }
 
@@ -758,6 +903,7 @@ mod tests {
             false,
             Span::current(),
             None,
+            FixedThenExponentialRetry::default(),
         );
         let updated_metadata = downloader.run().await?;
 
@@ -812,6 +958,7 @@ mod tests {
             false,
             aggregator_span.clone(),
             None,
+            FixedThenExponentialRetry::default(),
         );
         // make eta larger than 1 min
         aggregator_span.pb_start();
@@ -865,6 +1012,7 @@ mod tests {
             false,
             Span::current(),
             None,
+            FixedThenExponentialRetry::default(),
         );
 
         let outcome = PartOutcome {
@@ -923,6 +1071,7 @@ mod tests {
             Span::current(),
             None,
             None,
+            FixedThenExponentialRetry::default(),
         )
         .await?;
 

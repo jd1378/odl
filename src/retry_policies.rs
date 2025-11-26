@@ -64,46 +64,6 @@ impl RetryPolicy for FixedThenExponentialRetry {
     }
 }
 
-/// Retry policy that always waits a fixed duration between retries, up to a maximum number of retries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct FixedRetry {
-    /// Maximum number of allowed retry attempts.
-    pub max_n_retries: u32,
-    /// Fixed wait time between retries.
-    pub wait_time: Duration,
-}
-
-impl FixedRetry {
-    fn too_many_attempts(&self, n_past_retries: u32) -> bool {
-        n_past_retries >= self.max_n_retries
-    }
-}
-
-impl Default for FixedRetry {
-    fn default() -> Self {
-        Self {
-            max_n_retries: 5,
-            wait_time: Duration::from_millis(100),
-        }
-    }
-}
-
-impl RetryPolicy for FixedRetry {
-    fn should_retry(
-        &self,
-        _request_start_time: SystemTime,
-        n_past_retries: u32,
-    ) -> reqwest_retry::RetryDecision {
-        if self.too_many_attempts(n_past_retries) {
-            RetryDecision::DoNotRetry
-        } else {
-            let execute_after = SystemTime::now() + self.wait_time;
-            RetryDecision::Retry { execute_after }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,75 +198,5 @@ mod tests {
                 panic!("Expected Retry, got {:?}", decision);
             }
         }
-    }
-
-    fn get_fixed_retry_policy() -> FixedRetry {
-        FixedRetry {
-            max_n_retries: 4,
-            wait_time: Duration::from_millis(250),
-        }
-    }
-
-    #[test]
-    fn fixed_retry_retries_below_max() {
-        let policy = get_fixed_retry_policy();
-        for n_past_retries in 0..policy.max_n_retries {
-            let decision = policy.should_retry(SystemTime::now(), n_past_retries);
-            assert!(
-                matches!(decision, RetryDecision::Retry { .. }),
-                "Expected Retry for n_past_retries={}",
-                n_past_retries
-            );
-        }
-    }
-
-    #[test]
-    fn fixed_retry_does_not_retry_at_max() {
-        let policy = get_fixed_retry_policy();
-        let n_past_retries = policy.max_n_retries;
-        let decision = policy.should_retry(SystemTime::now(), n_past_retries);
-        assert!(matches!(decision, RetryDecision::DoNotRetry));
-    }
-
-    #[test]
-    fn fixed_retry_wait_time_is_correct() {
-        let policy = get_fixed_retry_policy();
-        let tolerance = Duration::from_millis(10);
-        for n_past_retries in 0..policy.max_n_retries {
-            let before = SystemTime::now();
-            let decision = policy.should_retry(before, n_past_retries);
-            if let RetryDecision::Retry { execute_after } = decision {
-                let duration = execute_after.duration_since(before).unwrap();
-                let diff = duration.abs_diff(policy.wait_time);
-                assert!(
-                    diff <= tolerance,
-                    "n_past_retries={}, expected {:?}, got {:?}, diff {:?}",
-                    n_past_retries,
-                    policy.wait_time,
-                    duration,
-                    diff
-                );
-            } else {
-                panic!("Expected Retry, got {:?}", decision);
-            }
-        }
-    }
-
-    #[test]
-    fn fixed_retry_zero_max_never_retries() {
-        let policy = FixedRetry {
-            max_n_retries: 0,
-            wait_time: Duration::from_millis(100),
-        };
-        let decision = policy.should_retry(SystemTime::now(), 0);
-        assert!(matches!(decision, RetryDecision::DoNotRetry));
-    }
-
-    #[test]
-    fn fixed_retry_negative_n_past_retries_is_retry() {
-        // n_past_retries is u32, so can't be negative, but test zero
-        let policy = get_fixed_retry_policy();
-        let decision = policy.should_retry(SystemTime::now(), 0);
-        assert!(matches!(decision, RetryDecision::Retry { .. }));
     }
 }

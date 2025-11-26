@@ -99,6 +99,7 @@ async fn main() -> Result<(), OdlError> {
                 max_concurrent_downloads,
                 max_retries,
                 wait_between_retries,
+                n_fixed_retries,
                 speed_limit,
                 user_agent,
                 randomize_user_agent,
@@ -147,6 +148,9 @@ async fn main() -> Result<(), OdlError> {
                 }
                 if let Some(v) = max_retries {
                     cfg.max_retries = *v;
+                }
+                if let Some(v) = n_fixed_retries {
+                    cfg.n_fixed_retries = *v;
                 }
                 if let Some(v) = wait_between_retries {
                     cfg.wait_between_retries = *v;
@@ -390,7 +394,7 @@ async fn build_download_manager(args: &Args) -> Result<DownloadManager, OdlError
     let max_concurrent_downloads: usize = args
         .max_concurrent_downloads
         .unwrap_or(cfg.max_concurrent_downloads);
-    let max_retries: u64 = args.max_retries.unwrap_or(cfg.max_retries);
+    let max_retries: u32 = args.max_retries.unwrap_or(cfg.max_retries);
     let wait_between_retries: Duration = args
         .wait_between_retries
         .or(Some(cfg.wait_between_retries))
@@ -403,6 +407,7 @@ async fn build_download_manager(args: &Args) -> Result<DownloadManager, OdlError
             }
         })
         .unwrap_or(Config::default_wait_between_retries());
+    let n_fixed_retries = args.n_fixed_retries.unwrap_or(cfg.n_fixed_retries);
     let user_agent = args.user_agent.clone().or(cfg.user_agent);
     let randomize_user_agent = args
         .randomize_user_agent
@@ -431,6 +436,7 @@ async fn build_download_manager(args: &Args) -> Result<DownloadManager, OdlError
         .max_connections(max_connections)
         .max_concurrent_downloads(max_concurrent_downloads)
         .max_retries(max_retries)
+        .n_fixed_retries(n_fixed_retries)
         .wait_between_retries(wait_between_retries)
         .user_agent(user_agent)
         .randomize_user_agent(randomize_user_agent)

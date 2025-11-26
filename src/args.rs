@@ -232,7 +232,11 @@ pub struct Args {
 
     /// Max number of retries in case of a network error
     #[arg(long, value_name = "COUNT")]
-    pub max_retries: Option<u64>,
+    pub max_retries: Option<u32>,
+
+    /// Number of fixed (non-exponential) retries before exponential backoff starts
+    #[arg(long, value_name = "COUNT")]
+    pub n_fixed_retries: Option<u32>,
 
     /// Wait number of seconds after a network error before retry. Fractions are supported.
     #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
@@ -314,7 +318,11 @@ pub enum Commands {
 
         /// Set max retries
         #[arg(long, value_name = "COUNT")]
-        max_retries: Option<u64>,
+        max_retries: Option<u32>,
+
+        /// Number of fixed (non-exponential) retries before exponential backoff starts
+        #[arg(long, value_name = "COUNT")]
+        n_fixed_retries: Option<u32>,
 
         /// Wait between retries. Accepts suffixes like `30s`, `5m`, `2h`, `1d` or long forms (`seconds`, `minutes`, `hours`, `days`). Default `5s`. Default Unit is seconds if omitted.
         #[arg(long, value_name = "DURATION", value_parser = parse_duration)]

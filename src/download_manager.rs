@@ -264,6 +264,11 @@ impl DownloadManager {
                 };
 
                 let client = self.get_client(Some(&instruction))?;
+                let retry_policy = crate::retry_policies::FixedThenExponentialRetry {
+                    max_n_retries: self.config.max_retries,
+                    wait_time: self.config.wait_between_retries,
+                    n_fixed_retries: self.config.n_fixed_retries,
+                };
                 let downloader = Downloader::new(
                     Arc::new(instruction.clone()),
                     metadata,
@@ -271,6 +276,7 @@ impl DownloadManager {
                     randomize_user_agent,
                     Span::current(),
                     self.config.speed_limit,
+                    retry_policy,
                 );
 
                 let mut mdata = downloader.run().await?;
@@ -1051,6 +1057,11 @@ mod tests {
 
         let metadata = instruction.as_metadata();
         let client = reqwest::Client::builder().build()?;
+        let retry_policy = crate::retry_policies::FixedThenExponentialRetry {
+            max_n_retries: 6,
+            wait_time: std::time::Duration::from_millis(100),
+            n_fixed_retries: 3,
+        };
         let downloader = Downloader::new(
             Arc::new(instruction.clone()),
             metadata,
@@ -1058,6 +1069,7 @@ mod tests {
             false,
             Span::current(),
             None,
+            retry_policy,
         );
 
         let updated_metadata = downloader.run().await?;

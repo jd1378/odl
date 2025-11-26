@@ -24,8 +24,9 @@ mod defaults {
     pub fn default_download_dir() -> PathBuf { fs_utils::get_odl_dir() }
     pub fn default_max_connections() -> u64 { 4 }
     pub fn default_max_concurrent_downloads() -> usize { 3 }
-    pub fn default_max_retries() -> u64 { 3 }
+    pub fn default_max_retries() -> u32 { 3 }
     pub fn default_wait_between_retries() -> Duration { Duration::from_millis(700) }
+    pub fn default_n_fixed_retries() -> u32 { 3 }
     pub fn default_user_agent() -> Option<String> { None }
     pub fn default_randomize_user_agent() -> bool { false }
     pub fn default_proxy() -> Option<String> { None }
@@ -81,11 +82,15 @@ pub struct Config {
     /// For example the time for max_retries=6 and wait_between_retries=500ms will be:
     /// 500ms, 500ms, 500ms, 1000ms, 2000ms, 4000ms
     #[serde(default = "default_max_retries")]
-    pub max_retries: u64,
+    pub max_retries: u32,
 
     /// Amount of time to wait between retries. After third retry it increases exponentially.
     #[serde(default = "default_wait_between_retries")]
     pub wait_between_retries: Duration,
+
+    /// Number of fixed (non-exponential) retries before exponential backoff starts.
+    #[serde(default = "default_n_fixed_retries")]
+    pub n_fixed_retries: u32,
 
     /// Custom user agent. Setting this option overrides `randomize_user_agent` to false
     #[serde(default = "default_user_agent")]
@@ -135,6 +140,7 @@ impl Default for Config {
             max_concurrent_downloads: default_max_concurrent_downloads(),
             max_retries: default_max_retries(),
             wait_between_retries: default_wait_between_retries(),
+            n_fixed_retries: default_n_fixed_retries(),
             user_agent: default_user_agent(),
             randomize_user_agent: default_randomize_user_agent(),
             proxy: default_proxy(),
@@ -167,6 +173,11 @@ impl ConfigBuilder {
                 return Err(ConfigBuilderError::UninitializedField(
                     "wait_between_retries",
                 ));
+            }
+        }
+        if let Some(n_fixed) = self.n_fixed_retries {
+            if n_fixed == 0 {
+                return Err(ConfigBuilderError::UninitializedField("n_fixed_retries"));
             }
         }
         if let Some(Some(limit)) = self.speed_limit {
