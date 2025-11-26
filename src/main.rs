@@ -186,14 +186,14 @@ async fn main() -> Result<(), OdlError> {
         }
     }
     let child_style = ProgressStyle::with_template(
-            "{span_child_prefix}{spinner} {bar:40.cyan/blue} {percent:>3}%  {decimal_bytes:<10} / {decimal_total_bytes:<10} {decimal_bytes_per_sec:<12}"
+            "{span_child_prefix}{spinner} {bar:40.cyan/blue} {percent:>3}%  {decimal_bytes:<10} / {decimal_total_bytes:<10} {decimal_bytes_per_sec:<12}{msg}"
         )
         .expect("templating progress bar should not fail").progress_chars(PROGRESS_CHARS);
     let indicatif_layer = IndicatifLayer::new()
         .with_progress_style(child_style)
         .with_tick_settings(TickSettings {
             term_draw_hz: 10,
-            default_tick_interval: None,
+            default_tick_interval: Some(Duration::from_millis(100)),
             footer_tick_interval: None,
             ..Default::default()
         })

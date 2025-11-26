@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, VecDeque},
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
 };
 
@@ -60,7 +60,7 @@ pub struct Downloader {
     metadata: Arc<Mutex<DownloadMetadata>>,
     client: Arc<Client>,
     randomize_user_agent: bool,
-    concurrency_limit: usize,
+    concurrency_limit: Arc<AtomicUsize>,
     aggregator_span: Span,
     speed_limiter: Option<Arc<BandwidthLimiter>>,
     retry_policy: FixedThenExponentialRetry,
@@ -86,11 +86,11 @@ impl Downloader {
             metadata: Arc::new(Mutex::new(metadata)),
             client: Arc::new(client),
             randomize_user_agent,
-            concurrency_limit: if concurrency_limit == 0 {
+            concurrency_limit: Arc::new(AtomicUsize::new(if concurrency_limit == 0 {
                 1
             } else {
                 concurrency_limit
-            },
+            })),
             aggregator_span,
             speed_limiter,
             retry_policy,
@@ -159,13 +159,14 @@ impl Downloader {
         active: &mut HashMap<String, ActiveTask>,
         join_set: &mut JoinSet<Result<PartEvent, OdlError>>,
     ) -> Result<(), OdlError> {
-        if self.concurrency_limit == 0 {
+        let cap = self.concurrency_limit.load(Ordering::SeqCst);
+        if cap == 0 {
             return Ok(());
         }
 
         self.ensure_pending_pool(pending, active).await?;
 
-        while active.len() < self.concurrency_limit {
+        while active.len() < cap {
             if let Some(part) = pending.pop_front() {
                 self.schedule_part(part, active, join_set, None).await?;
             } else {
@@ -194,6 +195,52 @@ impl Downloader {
                         pending.push_back(task.details);
                     }
                 }
+                PartEvent::Failed { ulid, attempts } => {
+                    // Remove from active and attempt to reschedule this part
+                    // later if there are other unfinished parts. If this was
+                    // the last unfinished part, fail the overall download.
+                    if let Some(task) = active.remove(&ulid) {
+                        if pending.is_empty() && active.is_empty() {
+                            // No other work to do — all parts have failed
+                            join_set.shutdown().await;
+                            return Err(OdlError::Other {
+                                message: format!(
+                                    "All parts failed; last part {} failed after {} attempts",
+                                    ulid, attempts
+                                ),
+                                origin: Box::new(std::io::Error::other("all parts failed")),
+                            });
+                        } else {
+                            // There are other pending/active parts; requeue this
+                            // failed part so it will be retried later (one-by-one
+                            // as capacity frees up when other parts finish).
+                            pending.push_back(task.details);
+                            // Reduce concurrency to avoid scheduling too many
+                            // simultaneous connections if the server only
+                            // allows a small number. Ensure minimum of 1.
+                            let _ = self.concurrency_limit.fetch_update(
+                                Ordering::SeqCst,
+                                Ordering::SeqCst,
+                                |cur| {
+                                    if cur > 1 { Some(cur - 1) } else { Some(1) }
+                                },
+                            );
+                        }
+                    } else {
+                        // If the task wasn't in `active`, still check whether
+                        // everything else is done and fail if so.
+                        if pending.is_empty() && active.is_empty() {
+                            join_set.shutdown().await;
+                            return Err(OdlError::Other {
+                                message: format!(
+                                    "All parts failed; last part {} failed after {} attempts",
+                                    ulid, attempts
+                                ),
+                                origin: Box::new(std::io::Error::other("all parts failed")),
+                            });
+                        }
+                    }
+                }
             },
             Ok(Err(e)) => {
                 join_set.shutdown().await;
@@ -217,7 +264,10 @@ impl Downloader {
     ) -> Result<(), OdlError> {
         // Only attempt to create enough pending parts to fill the spare capacity
         // (i.e. `concurrency_limit - active.len()`)
-        let spare_capacity = self.concurrency_limit.saturating_sub(active.len());
+        let spare_capacity = self
+            .concurrency_limit
+            .load(Ordering::SeqCst)
+            .saturating_sub(active.len());
         while pending.len() < spare_capacity {
             if !self.try_split_active(active, pending).await? {
                 break;
@@ -471,6 +521,7 @@ struct PartOutcome {
 enum PartEvent {
     Completed(PartOutcome),
     NeedsReschedule { ulid: String },
+    Failed { ulid: String, attempts: u32 },
 }
 
 struct BandwidthLimiter {
@@ -632,25 +683,51 @@ async fn download_part(
             req = req.header(USER_AGENT, random_user_agent())
         }
 
-        // send request
-        let resp_result = req.send().await.map_err(OdlError::from);
+        // send request. wrap send in a timeout so network/connect hangs are
+        // treated like other transient network errors and retried by policy.
+        let send_result = time::timeout(STALE_CONNECTION_TIMEOUT, req.send()).await;
 
-        let mut resp = match resp_result {
-            Ok(r) => r,
-            Err(_e) => {
-                if maybe_retry_sleep(
+        let mut resp = match send_result {
+            // request completed and returned a response
+            Ok(Ok(r)) => r,
+            // request completed but returned an error (network error)
+            Ok(Err(_e)) => {
+                match retry_sleep_or_fail_part(
                     &policy,
                     attempts,
                     attempts + 1,
                     &current_span,
                     "after error",
+                    &ulid,
                 )
                 .await
                 {
-                    attempts = attempts.saturating_add(1);
-                    continue;
-                } else {
-                    return Ok(PartEvent::NeedsReschedule { ulid });
+                    Ok(()) => {
+                        attempts = attempts.saturating_add(1);
+                        continue;
+                    }
+                    Err(failed) => return Ok(failed),
+                }
+            }
+            // send timed out
+            Err(_) => {
+                // flush any partial progress to disk before retrying
+                file.flush().await?;
+                match retry_sleep_or_fail_part(
+                    &policy,
+                    attempts,
+                    attempts + 1,
+                    &current_span,
+                    "after timeout",
+                    &ulid,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        attempts = attempts.saturating_add(1);
+                        continue;
+                    }
+                    Err(failed) => return Ok(failed),
                 }
             }
         };
@@ -670,38 +747,42 @@ async fn download_part(
                     Err(_e) => {
                         // network/body error -> consider retrying
                         file.flush().await?;
-                        if maybe_retry_sleep(
+                        match retry_sleep_or_fail_part(
                             &policy,
                             attempts,
                             attempts + 1,
                             &current_span,
                             "after response error",
+                            &ulid,
                         )
                         .await
                         {
-                            attempts = attempts.saturating_add(1);
-                            break;
-                        } else {
-                            return Ok(PartEvent::NeedsReschedule { ulid });
+                            Ok(()) => {
+                                attempts = attempts.saturating_add(1);
+                                break;
+                            }
+                            Err(failed) => return Ok(failed),
                         }
                     }
                 },
                 Err(_) => {
                     // timeout reading chunk -> retry according to policy
                     file.flush().await?;
-                    if maybe_retry_sleep(
+                    match retry_sleep_or_fail_part(
                         &policy,
                         attempts,
                         attempts + 1,
                         &current_span,
                         "after timeout",
+                        &ulid,
                     )
                     .await
                     {
-                        attempts = attempts.saturating_add(1);
-                        break;
-                    } else {
-                        return Ok(PartEvent::NeedsReschedule { ulid });
+                        Ok(()) => {
+                            attempts = attempts.saturating_add(1);
+                            break;
+                        }
+                        Err(failed) => return Ok(failed),
                     }
                 }
             };
@@ -761,48 +842,52 @@ async fn download_part(
         // The attempts counter may have been incremented in the branches above.
         // If no retry happened (shouldn't happen), increment to avoid infinite loop.
         attempts = attempts.saturating_add(1);
-        if maybe_retry_sleep(
+        match retry_sleep_or_fail_part(
             &policy,
             attempts,
             attempts,
             &current_span,
             "before reschedule",
+            &ulid,
         )
         .await
         {
-            continue;
-        } else {
-            return Ok(PartEvent::NeedsReschedule { ulid });
+            Ok(()) => continue,
+            Err(failed) => return Ok(failed),
         }
     }
 }
 
-// Centralize retry decision, progress message and sleeping so callers can avoid
-// duplicating the same logic. Returns `true` if the policy says to retry (and
-// the helper slept), or `false` when the policy says `DoNotRetry`.
-async fn maybe_retry_sleep(
+// Apply the retry policy: if it says `Retry` this sleeps until the retry
+// time then returns `Ok(())`. If the policy says `DoNotRetry` it returns
+// a `PartEvent::Failed` for the caller to surface/handle.
+async fn retry_sleep_or_fail_part(
     policy: &FixedThenExponentialRetry,
     attempts_for_policy: u32,
     attempts_display: u32,
     span: &Span,
     suffix: &str,
-) -> bool {
+    ulid: &str,
+) -> Result<(), PartEvent> {
     match policy.should_retry(SystemTime::now(), attempts_for_policy) {
         RetryDecision::Retry { execute_after } => {
             let wait = execute_after
                 .duration_since(SystemTime::now())
                 .unwrap_or_default();
             span.pb_set_message(&format!(
-                "Retrying part {}/{} {} , waiting {}s",
+                " Retrying part {}/{} {} , waiting {:.1}s",
                 attempts_display,
                 policy.max_n_retries,
                 suffix,
                 wait.as_secs_f32()
             ));
             time::sleep(wait).await;
-            true
+            Ok(())
         }
-        RetryDecision::DoNotRetry => false,
+        RetryDecision::DoNotRetry => Err(PartEvent::Failed {
+            ulid: ulid.to_string(),
+            attempts: attempts_display,
+        }),
     }
 }
 
@@ -1079,6 +1164,10 @@ mod tests {
         match event {
             PartEvent::NeedsReschedule { ulid } => assert_eq!(ulid, "part"),
             PartEvent::Completed(_) => panic!("expected reschedule"),
+            PartEvent::Failed { ulid, attempts } => panic!(
+                "unexpected failed part {} after {} attempts",
+                ulid, attempts
+            ),
         }
         get_mock.assert_async().await;
         Ok(())
