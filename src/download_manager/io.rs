@@ -202,9 +202,16 @@ fn assemble_blocking(
         // Reflink requires both endpoints on a cluster boundary, except the
         // very last part may have an unaligned tail (Linux ficlonerange allows
         // a final extent that does not exceed the source file length).
+        // Windows FSCTL_DUPLICATE_EXTENTS_TO_FILE has no such tail exception:
+        // every range must be cluster-aligned, so the last part falls back to
+        // a byte copy when its size is unaligned.
         let aligned_offset = offset & cluster_mask == 0;
         let aligned_size = size & cluster_mask == 0;
-        let reflinkable = !reflink_disabled && aligned_offset && (aligned_size || is_last);
+        #[cfg(windows)]
+        let tail_reflinkable = false;
+        #[cfg(not(windows))]
+        let tail_reflinkable = is_last;
+        let reflinkable = !reflink_disabled && aligned_offset && (aligned_size || tail_reflinkable);
 
         let reflinked = if reflinkable && let Some(len_nz) = NonZeroU64::new(size) {
             let res = ReflinkBlockBuilder::new(&part_file, &final_file, len_nz)
