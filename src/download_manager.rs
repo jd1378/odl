@@ -1741,8 +1741,7 @@ mod tests {
     #[tokio::test]
     async fn test_resumes_assembly_after_interrupt_with_no_server_checksum()
     -> Result<(), Box<dyn std::error::Error>> {
-        let file_content =
-            b"AssemblyResumePayload-NoChecksumScenario-0123456789abcdefghijklmnop";
+        let file_content = b"AssemblyResumePayload-NoChecksumScenario-0123456789abcdefghijklmnop";
 
         let tmp_data_dir = tempfile::tempdir()?;
         let tmp_save_dir = tempfile::tempdir()?;
@@ -2012,11 +2011,7 @@ mod tests {
         fs::write(instruction.part_path(part_ulid), file_content).await?;
         // Final on disk: same length as payload, but content is zeros
         // (typical mid-assembly carcass after `set_len`).
-        fs::write(
-            instruction.final_file_path(),
-            vec![0u8; file_content.len()],
-        )
-        .await?;
+        fs::write(instruction.final_file_path(), vec![0u8; file_content.len()]).await?;
 
         let metadata = instruction.as_metadata();
         persist_metadata(&metadata, &instruction).await?;
@@ -2041,8 +2036,8 @@ mod tests {
     /// Same scenario but the partial final file is missing entirely
     /// (interrupted before `set_len` ran). Must still re-assemble.
     #[tokio::test]
-    async fn test_resumes_assembly_when_final_file_absent()
-    -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_resumes_assembly_when_final_file_absent() -> Result<(), Box<dyn std::error::Error>>
+    {
         let file_content = b"AnotherResumePayload-FinalFileAbsent";
 
         let tmp_data_dir = tempfile::tempdir()?;
