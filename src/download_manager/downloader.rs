@@ -402,12 +402,19 @@ impl Downloader {
         }
 
         let remaining = current_limit - downloaded;
-        let split_size = remaining / 2;
-        if split_size < MIN_DYNAMIC_SPLIT_SIZE {
+        // Round new_limit down to a cluster boundary so the new part's absolute
+        // offset stays aligned for reflink-based assembly.
+        let mask = Download::ASSEMBLY_CLUSTER_SIZE - 1;
+        let new_limit = (downloaded + remaining / 2) & !mask;
+        if new_limit <= downloaded {
             return Ok(None);
         }
-
-        let new_limit = current_limit - split_size;
+        let split_size = current_limit - new_limit;
+        if split_size < MIN_DYNAMIC_SPLIT_SIZE
+            || new_limit - downloaded < MIN_DYNAMIC_SPLIT_SIZE
+        {
+            return Ok(None);
+        }
         candidate.controller.set_limit(new_limit);
 
         let (new_part, encoded_metadata) = {

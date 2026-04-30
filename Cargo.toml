@@ -47,6 +47,7 @@ toml = "0.9"
 indexmap = { version = "2", features = ["serde"] }
 humantime = "2"
 tracing-indicatif = "0.3.14"
+reflink-copy = { version = "0.1.29", features = ["tracing"] }
 
 [dev-dependencies]
 reqwest = { version = "0.12.19", default-features = false, features = ["http2", "gzip", "brotli", "native-tls", "socks", "stream", "blocking"] }

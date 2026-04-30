@@ -110,6 +110,28 @@ impl Download {
     const LOCK_FILENAME: &'static str = "odl.lock";
     pub const PART_EXTENSION: &'static str = "part";
     const MIN_PART_SIZE: u64 = 300 * 1024; // 300 KB
+    /// Assumed filesystem cluster size used to keep part boundaries aligned
+    /// so the assembler can reflink parts into the final file.
+    ///
+    /// 4 KiB matches the page/cluster size on btrfs, xfs, ext4 and ReFS.
+    /// On filesystems with larger clusters (e.g. ZFS recordsize 128 KiB)
+    /// reflink fails the alignment check and the assembler falls back to
+    /// a buffered copy — correct, just no CoW share.
+    ///
+    /// Three call sites depend on this constant; keep them in sync:
+    ///   * `Download::split_parts` — initial split offsets/sizes
+    ///   * `Downloader::try_split_dynamic` — mid-flight split boundary
+    ///   * `download_manager::io::assemble_blocking` — reflink alignment check
+    pub const ASSEMBLY_CLUSTER_SIZE: u64 = 4096;
+
+    // Bit-mask trick (`x & !(N-1)`) used to align values requires a
+    // power-of-two cluster size. The split logic also assumes the minimum
+    // part size is at least one cluster, otherwise `base_size` could round
+    // down to zero and produce empty leading parts.
+    const _ASSERT_CLUSTER_POW2: () =
+        assert!(Self::ASSEMBLY_CLUSTER_SIZE.is_power_of_two());
+    const _ASSERT_MIN_PART_GE_CLUSTER: () =
+        assert!(Self::MIN_PART_SIZE >= Self::ASSEMBLY_CLUSTER_SIZE);
 
     pub fn download_dir(&self) -> &path::PathBuf {
         &self.download_dir
@@ -374,16 +396,16 @@ impl Download {
             actual_connections = min_connections;
         }
 
-        let base_size = size / actual_connections;
-        let remainder = size % actual_connections;
+        let mask = Self::ASSEMBLY_CLUSTER_SIZE - 1;
+        let base_size = (size / actual_connections) & !mask;
         let mut offset = 0;
 
-        // Split the file into `actual_connections` parts. The remainder is
-        // added to the first part so the parts remain contiguous and cover
-        // the full range.
+        // Cluster-aligned base size lets the assembler reflink each part at its
+        // offset. Remainder + alignment slack go on the last part, whose tail
+        // is allowed to be unaligned (the trailing copy handles it).
         for i in 0..actual_connections {
-            let part_size = if i == 0 {
-                base_size + remainder
+            let part_size = if i == actual_connections - 1 {
+                size - offset
             } else {
                 base_size
             };
@@ -549,8 +571,10 @@ mod tests {
         part_vec.sort_by_key(|p| p.offset);
         let total: u64 = part_vec.iter().map(|p| p.size).sum();
         assert_eq!(total, size);
-        // The first part should get the remainder
-        assert!(part_vec[0].size > part_vec[1].size);
+        // The last part absorbs the remainder so middle offsets stay
+        // cluster-aligned for reflink-based assembly.
+        assert!(part_vec[2].size >= part_vec[1].size);
+        assert_eq!(part_vec[0].size, part_vec[1].size);
     }
 
     #[test]
@@ -585,8 +609,12 @@ mod tests {
         assert_eq!(part_vec[1].offset, part_vec[0].offset + part_vec[0].size);
         assert_eq!(part_vec[2].offset, part_vec[1].offset + part_vec[1].size);
 
-        // The first part should get the remainder
-        assert!(part_vec[0].size >= part_vec[1].size);
-        assert!(part_vec[1].size >= part_vec[2].size);
+        // The last part absorbs the remainder; preceding parts share the
+        // cluster-aligned base size.
+        assert_eq!(part_vec[0].size, part_vec[1].size);
+        assert!(part_vec[2].size >= part_vec[1].size);
+        assert_eq!(part_vec[0].offset % Download::ASSEMBLY_CLUSTER_SIZE, 0);
+        assert_eq!(part_vec[1].offset % Download::ASSEMBLY_CLUSTER_SIZE, 0);
+        assert_eq!(part_vec[2].offset % Download::ASSEMBLY_CLUSTER_SIZE, 0);
     }
 }
