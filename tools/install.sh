@@ -74,8 +74,12 @@ case "$OS" in
 esac
 
 if [ "$VERSION" = latest ]; then
-  TAG="$($DL "https://api.github.com/repos/$REPO/releases/latest" \
-    | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')"
+  REL_JSON="$($DL "https://api.github.com/repos/$REPO/releases/latest")" \
+    || err "failed to query latest release"
+  TAG="$(printf '%s\n' "$REL_JSON" \
+    | grep '"tag_name"' \
+    | head -n1 \
+    | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')"
   [ -n "$TAG" ] || err "could not resolve latest tag"
 else
   TAG="$VERSION"
