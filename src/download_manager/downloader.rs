@@ -10,7 +10,6 @@ use reqwest::{
     Client,
     header::{HeaderValue, RANGE, USER_AGENT},
 };
-use std::time::SystemTime;
 use tokio::{
     fs,
     io::{AsyncWriteExt, BufWriter},
@@ -24,7 +23,7 @@ use ulid::Ulid;
 
 use prost::Message;
 
-use crate::retry_policies::FixedThenExponentialRetry;
+use crate::retry_policies::{FixedThenExponentialRetry, wait_for_retry};
 use crate::{
     download::Download,
     download_manager::io::persist_encoded_metadata,
@@ -32,7 +31,6 @@ use crate::{
     error::{MetadataError, OdlError},
     user_agents::random_user_agent,
 };
-use reqwest_retry::{RetryDecision, RetryPolicy};
 
 /// Minimum chunk size we keep on a single task before attempting another split.
 const MIN_DYNAMIC_SPLIT_SIZE: u64 = 3 * 1024 * 1024; // 3 MB
@@ -850,74 +848,18 @@ async fn download_part(
 // a `PartEvent::Failed` for the caller to surface/handle.
 async fn retry_sleep_or_fail_part(
     policy: &FixedThenExponentialRetry,
-    attempts_for_policy: u32,
+    _attempts_for_policy: u32,
     attempts_display: u32,
     span: &Span,
     ulid: &str,
 ) -> Result<(), PartEvent> {
-    match policy.should_retry(SystemTime::now(), attempts_for_policy) {
-        RetryDecision::Retry { execute_after } => {
-            let wait = execute_after
-                .duration_since(SystemTime::now())
-                .unwrap_or_default();
-
-            // Pin the sleep so we can await it and also update the message periodically.
-            let sleep = time::sleep(wait);
-            tokio::pin!(sleep);
-            let start = Instant::now();
-
-            loop {
-                // Remaining time (zero if passed)
-                let remaining = wait.checked_sub(start.elapsed()).unwrap_or_default();
-
-                span.pb_set_message(&format!(
-                    " Retrying {}/{} in {}",
-                    attempts_display,
-                    policy.max_n_retries,
-                    format_wait(remaining)
-                ));
-
-                tokio::select! {
-                    _ = &mut sleep => break,
-                    _ = time::sleep(Duration::from_millis(200)) => {},
-                }
-            }
-
-            span.pb_set_message("");
-
-            Ok(())
-        }
-        RetryDecision::DoNotRetry => Err(PartEvent::Failed {
+    if wait_for_retry(policy, attempts_display, span).await {
+        Ok(())
+    } else {
+        Err(PartEvent::Failed {
             ulid: ulid.to_string(),
             attempts: attempts_display,
-        }),
-    }
-}
-
-// Format a `Duration` compactly: fractional seconds (1 decimal) for < 1h,
-// otherwise hours and minutes (e.g. "1h 2m").
-fn format_wait(dur: Duration) -> String {
-    let total_secs = dur.as_secs();
-
-    // If <= 60s: show fractional seconds (1 decimal place)
-    if total_secs <= 60 {
-        return format!("{:.1}s", dur.as_secs_f32());
-    }
-
-    // If under an hour: show minutes and seconds (no fractional seconds)
-    if total_secs < 3600 {
-        let mins = total_secs / 60;
-        let secs = total_secs % 60;
-        return format!("{}m {}s", mins, secs);
-    }
-
-    // Otherwise show hours and minutes
-    let hours = total_secs / 3600;
-    let mins = (total_secs % 3600) / 60;
-    if mins > 0 {
-        format!("{}h {}m", hours, mins)
-    } else {
-        format!("{}h", hours)
+        })
     }
 }
 

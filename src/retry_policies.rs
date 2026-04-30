@@ -3,6 +3,9 @@ use std::{
     cmp,
     time::{Duration, SystemTime},
 };
+use tokio::time::{self, Instant};
+use tracing::Span;
+use tracing_indicatif::span_ext::IndicatifSpanExt;
 
 /// Calculate exponential using base and number of past retries
 fn calculate_exponential(base: u32, n_past_retries: u32) -> u32 {
@@ -61,6 +64,72 @@ impl RetryPolicy for FixedThenExponentialRetry {
             let execute_after = SystemTime::now() + wait_time;
             RetryDecision::Retry { execute_after }
         }
+    }
+}
+
+/// Consult the retry policy after a failed attempt. If retry is allowed,
+/// sleeps until the scheduled retry time while updating `span` with a
+/// human-readable countdown message. Returns `true` if caller should retry,
+/// `false` if no further retries are allowed.
+///
+/// `attempts_so_far` is the number of attempts already made (>= 1 after a
+/// failure). The policy is queried with `attempts_so_far - 1` as
+/// `n_past_retries`.
+pub async fn wait_for_retry(
+    policy: &FixedThenExponentialRetry,
+    attempts_so_far: u32,
+    span: &Span,
+) -> bool {
+    let n_past = attempts_so_far.saturating_sub(1);
+    match policy.should_retry(SystemTime::now(), n_past) {
+        RetryDecision::Retry { execute_after } => {
+            let wait = execute_after
+                .duration_since(SystemTime::now())
+                .unwrap_or_default();
+
+            let sleep = time::sleep(wait);
+            tokio::pin!(sleep);
+            let start = Instant::now();
+
+            loop {
+                let remaining = wait.checked_sub(start.elapsed()).unwrap_or_default();
+                span.pb_set_message(&format!(
+                    " Retrying {}/{} in {}",
+                    attempts_so_far,
+                    policy.max_n_retries,
+                    format_wait(remaining)
+                ));
+
+                tokio::select! {
+                    _ = &mut sleep => break,
+                    _ = time::sleep(Duration::from_millis(200)) => {},
+                }
+            }
+
+            span.pb_set_message("");
+            true
+        }
+        RetryDecision::DoNotRetry => false,
+    }
+}
+
+/// Format a `Duration` compactly for retry countdown display.
+pub fn format_wait(dur: Duration) -> String {
+    let total_secs = dur.as_secs();
+    if total_secs <= 60 {
+        return format!("{:.1}s", dur.as_secs_f32());
+    }
+    if total_secs < 3600 {
+        let mins = total_secs / 60;
+        let secs = total_secs % 60;
+        return format!("{}m {}s", mins, secs);
+    }
+    let hours = total_secs / 3600;
+    let mins = (total_secs % 3600) / 60;
+    if mins > 0 {
+        format!("{}h {}m", hours, mins)
+    } else {
+        format!("{}h", hours)
     }
 }
 

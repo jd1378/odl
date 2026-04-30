@@ -19,6 +19,7 @@ use tracing_indicatif::span_ext::IndicatifSpanExt;
 
 use crate::config::Config;
 use crate::download_manager::recover_metadata::recover_metadata;
+use crate::retry_policies::{FixedThenExponentialRetry, wait_for_retry};
 use crate::download_manager::{downloader::Downloader, io::persist_metadata};
 use crate::download_manager::{io::assemble_final_file, server_conflict::resolve_server_conflicts};
 use crate::download_manager::{io::remove_all_parts, save_conflict::resolve_save_conflicts};
@@ -104,26 +105,44 @@ impl DownloadManager {
         current_span.pb_set_message("Evaluating");
         let client = self.get_client(None)?;
 
-        let mut req = client
-            .head(url)
-            // we request hash just in case server implements and responds
-            // we will use this later for checking the final file against
-            .header(
-                "Want-Repr-Digest",
-                "sha-512=9, sha-384=8, sha-256=7, sha-1=1, md5=1",
-            )
-            .header(
-                "Want-Content-Digest",
-                "sha-512=9, sha-384=8, sha-256=7, sha-1=1, md5=1",
-            );
-        if let Some(creds) = &credentials {
-            req = req.basic_auth(creds.username(), creds.password());
-        }
-        if self.config.user_agent.is_none() && self.config.randomize_user_agent {
-            req = req.header(USER_AGENT, random_user_agent());
-        }
+        let retry_policy = FixedThenExponentialRetry {
+            max_n_retries: self.config.max_retries,
+            wait_time: self.config.wait_between_retries,
+            n_fixed_retries: self.config.n_fixed_retries,
+        };
 
-        let resp = req.send().await?;
+        let mut attempts: u32 = 0;
+        let resp = loop {
+            let mut req = client
+                .head(url.clone())
+                // we request hash just in case server implements and responds
+                // we will use this later for checking the final file against
+                .header(
+                    "Want-Repr-Digest",
+                    "sha-512=9, sha-384=8, sha-256=7, sha-1=1, md5=1",
+                )
+                .header(
+                    "Want-Content-Digest",
+                    "sha-512=9, sha-384=8, sha-256=7, sha-1=1, md5=1",
+                );
+            if let Some(creds) = &credentials {
+                req = req.basic_auth(creds.username(), creds.password());
+            }
+            if self.config.user_agent.is_none() && self.config.randomize_user_agent {
+                req = req.header(USER_AGENT, random_user_agent());
+            }
+
+            match req.send().await {
+                Ok(r) => break r,
+                Err(e) => {
+                    attempts = attempts.saturating_add(1);
+                    if !wait_for_retry(&retry_policy, attempts, &current_span).await {
+                        return Err(OdlError::from(e));
+                    }
+                    current_span.pb_set_message("Evaluating");
+                }
+            }
+        };
         let info = ResponseInfo::from(resp);
         let instruction = Download::from_response_info(
             &self.config.download_dir,
@@ -1188,6 +1207,272 @@ mod tests {
         head_mock.assert_async().await;
         get_mock.assert_async().await;
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_e2e_evaluate_download_assemble_with_checksum()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use base64::Engine;
+        use sha2::{Digest, Sha256};
+
+        let file_content = b"E2E full pipeline payload: evaluate -> download -> assemble -> verify";
+
+        let mut hasher = Sha256::new();
+        hasher.update(file_content);
+        let sha256_b64 =
+            base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
+        let repr_digest_value = format!("sha-256=:{}:", sha256_b64);
+
+        let mut server = Server::new_async().await;
+        let url = server.url();
+
+        let head_mock = server
+            .mock("HEAD", "/payload.bin")
+            .with_status(200)
+            .with_header("content-length", &file_content.len().to_string())
+            .with_header("accept-ranges", "bytes")
+            .with_header("etag", "e2eetag")
+            .with_header("last-modified", "Tue, 27 Oct 2015 07:28:00 GMT")
+            .with_header("Repr-Digest", &repr_digest_value)
+            .create_async()
+            .await;
+
+        let get_mock = server
+            .mock("GET", "/payload.bin")
+            .match_header(
+                "range",
+                Matcher::Exact(format!("bytes=0-{}", file_content.len() - 1)),
+            )
+            .with_status(206)
+            .with_body(file_content)
+            .create_async()
+            .await;
+
+        let tmp_data_dir = tempfile::tempdir()?;
+        let tmp_save_dir = tempfile::tempdir()?;
+        let cfg = crate::config::ConfigBuilder::default()
+            .download_dir(tmp_data_dir.path().to_path_buf())
+            .max_connections(1)
+            .build()
+            .unwrap();
+        let dlm = DownloadManager::new(cfg);
+
+        let save_resolver = AlwaysReplaceResolver {};
+        let instruction = dlm
+            .evaluate(
+                Url::parse(&format!("{}/payload.bin", url)).unwrap(),
+                tmp_save_dir.path().to_path_buf(),
+                None,
+                &save_resolver,
+            )
+            .await?;
+
+        // checksum must have been picked up from Repr-Digest during evaluate
+        assert!(
+            !instruction.as_metadata().checksums.is_empty(),
+            "evaluate did not extract checksum from Repr-Digest"
+        );
+        assert_eq!(instruction.size(), Some(file_content.len() as u64));
+
+        let resolver = AlwaysAbortResolver {};
+        let final_path = dlm.download(instruction, &resolver).await?;
+
+        let on_disk = fs::read(&final_path).await?;
+        assert_eq!(on_disk, file_content, "final file content mismatch");
+
+        // Independently verify SHA-256 of the assembled file.
+        let mut hasher = Sha256::new();
+        hasher.update(&on_disk);
+        let actual_b64 =
+            base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
+        assert_eq!(actual_b64, sha256_b64);
+
+        head_mock.assert_async().await;
+        get_mock.assert_async().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_e2e_download_fails_on_checksum_mismatch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let file_content = b"payload-served-by-server";
+        // Advertise a digest that does NOT match the body
+        let bogus_repr_digest = "sha-256=:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=:";
+
+        let mut server = Server::new_async().await;
+        let url = server.url();
+
+        let head_mock = server
+            .mock("HEAD", "/bad.bin")
+            .with_status(200)
+            .with_header("content-length", &file_content.len().to_string())
+            .with_header("accept-ranges", "bytes")
+            .with_header("Repr-Digest", bogus_repr_digest)
+            .create_async()
+            .await;
+
+        let get_mock = server
+            .mock("GET", "/bad.bin")
+            .match_header(
+                "range",
+                Matcher::Exact(format!("bytes=0-{}", file_content.len() - 1)),
+            )
+            .with_status(206)
+            .with_body(file_content)
+            .create_async()
+            .await;
+
+        let tmp_data_dir = tempfile::tempdir()?;
+        let tmp_save_dir = tempfile::tempdir()?;
+        let cfg = crate::config::ConfigBuilder::default()
+            .download_dir(tmp_data_dir.path().to_path_buf())
+            .max_connections(1)
+            .build()
+            .unwrap();
+        let dlm = DownloadManager::new(cfg);
+
+        let save_resolver = AlwaysReplaceResolver {};
+        let instruction = dlm
+            .evaluate(
+                Url::parse(&format!("{}/bad.bin", url)).unwrap(),
+                tmp_save_dir.path().to_path_buf(),
+                None,
+                &save_resolver,
+            )
+            .await?;
+
+        let resolver = AlwaysAbortResolver {};
+        let result = dlm.download(instruction, &resolver).await;
+        assert!(
+            matches!(
+                result,
+                Err(OdlError::Conflict(ConflictError::ChecksumMismatch { .. }))
+            ),
+            "expected ChecksumMismatch, got {:?}",
+            result
+        );
+
+        head_mock.assert_async().await;
+        get_mock.assert_async().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_e2e_multipart_evaluate_download_assemble_with_checksum()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use base64::Engine;
+        use sha2::{Digest, Sha256};
+
+        use rand::{RngCore, SeedableRng, rngs::StdRng};
+
+        // 900 KiB → with MIN_PART_SIZE = 300 KiB and max_connections = 3
+        // determine_parts produces exactly 3 contiguous parts of 300 KiB each.
+        let size: usize = 900 * 1024;
+        let mut rng = StdRng::seed_from_u64(0xC0FFEE_F00D);
+        let mut file_content = vec![0u8; size];
+        rng.fill_bytes(&mut file_content);
+
+        let mut hasher = Sha256::new();
+        hasher.update(&file_content);
+        let sha256_b64 =
+            base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
+        let repr_digest_value = format!("sha-256=:{}:", sha256_b64);
+
+        let mut server = Server::new_async().await;
+        let url = server.url();
+
+        let head_mock = server
+            .mock("HEAD", "/big.bin")
+            .with_status(200)
+            .with_header("content-length", &size.to_string())
+            .with_header("accept-ranges", "bytes")
+            .with_header("etag", "bigetag")
+            .with_header("Repr-Digest", &repr_digest_value)
+            .create_async()
+            .await;
+
+        // Three contiguous range mocks, one per part. mockito will route each
+        // GET to the mock whose range header matches, so the order in which
+        // the downloader issues them does not matter.
+        let part_size = size / 3;
+        let mut get_mocks = Vec::new();
+        for i in 0..3 {
+            let start = i * part_size;
+            let end = if i == 2 { size - 1 } else { start + part_size - 1 };
+            let body = file_content[start..=end].to_vec();
+            let m = server
+                .mock("GET", "/big.bin")
+                .match_header(
+                    "range",
+                    Matcher::Exact(format!("bytes={}-{}", start, end)),
+                )
+                .with_status(206)
+                .with_body(body)
+                .create_async()
+                .await;
+            get_mocks.push(m);
+        }
+
+        let tmp_data_dir = tempfile::tempdir()?;
+        let tmp_save_dir = tempfile::tempdir()?;
+        let cfg = crate::config::ConfigBuilder::default()
+            .download_dir(tmp_data_dir.path().to_path_buf())
+            .max_connections(3)
+            .build()
+            .unwrap();
+        let dlm = DownloadManager::new(cfg);
+
+        let save_resolver = AlwaysReplaceResolver {};
+        let instruction = dlm
+            .evaluate(
+                Url::parse(&format!("{}/big.bin", url)).unwrap(),
+                tmp_save_dir.path().to_path_buf(),
+                None,
+                &save_resolver,
+            )
+            .await?;
+
+        // Verify evaluate produced exactly 3 parts before any download work.
+        let metadata = instruction.as_metadata();
+        assert_eq!(
+            metadata.parts.len(),
+            3,
+            "expected 3 parts, got {}",
+            metadata.parts.len()
+        );
+        // Parts must be contiguous and cover the full size.
+        let mut offsets: Vec<(u64, u64)> = metadata
+            .parts
+            .values()
+            .map(|p| (p.offset, p.size))
+            .collect();
+        offsets.sort_by_key(|(o, _)| *o);
+        let mut covered: u64 = 0;
+        for (off, sz) in &offsets {
+            assert_eq!(*off, covered);
+            covered += sz;
+        }
+        assert_eq!(covered, size as u64);
+        assert!(!metadata.checksums.is_empty());
+
+        let resolver = AlwaysAbortResolver {};
+        let final_path = dlm.download(instruction, &resolver).await?;
+
+        let on_disk = fs::read(&final_path).await?;
+        assert_eq!(on_disk.len(), file_content.len());
+        assert_eq!(on_disk, file_content, "assembled file bytes mismatch");
+
+        let mut hasher = Sha256::new();
+        hasher.update(&on_disk);
+        let actual_b64 =
+            base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
+        assert_eq!(actual_b64, sha256_b64);
+
+        head_mock.assert_async().await;
+        for m in &get_mocks {
+            m.assert_async().await;
+        }
         Ok(())
     }
 

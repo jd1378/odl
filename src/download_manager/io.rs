@@ -1,8 +1,12 @@
 use std::path::PathBuf;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use futures::io;
 use prost::Message;
-use tokio::io::BufWriter;
+use tokio::io::{AsyncWrite, AsyncWriteExt, BufWriter};
+use tracing::Span;
+use tracing_indicatif::span_ext::IndicatifSpanExt;
 
 use crate::{
     Download,
@@ -42,11 +46,25 @@ pub async fn assemble_final_file(
     let mut final_file = BufWriter::new(final_file);
     let mut sorted_parts: Vec<&PartDetails> = metadata.parts.values().collect();
     sorted_parts.sort_by_key(|p| p.offset);
+
+    let total: u64 = sorted_parts.iter().map(|p| p.size).sum();
+    let span = Span::current();
+    span.pb_reset();
+    span.pb_set_length(total);
+    span.pb_set_position(0);
+    span.pb_set_message("Assembling");
+    span.pb_reset_eta();
+
+    let mut progress_writer = ProgressWriter {
+        inner: &mut final_file,
+        span: &span,
+    };
     for p in sorted_parts.iter() {
         let part_path = instruction.part_path(&p.ulid);
         let mut part_file = tokio::fs::File::open(&part_path).await?;
-        tokio::io::copy(&mut part_file, &mut final_file).await?;
+        tokio::io::copy(&mut part_file, &mut progress_writer).await?;
     }
+    final_file.flush().await?;
 
     if metadata.use_server_time
         && let Some(last_modified) = metadata.last_modified
@@ -95,4 +113,42 @@ pub async fn persist_encoded_metadata(encoded: &[u8], instruction: &Download) ->
         encoded,
     )
     .await
+}
+
+/// AsyncWrite adapter that increments a tracing-indicatif progress bar by
+/// the number of bytes successfully written on each `poll_write`.
+struct ProgressWriter<'a, W> {
+    inner: &'a mut W,
+    span: &'a Span,
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for ProgressWriter<'_, W> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let poll = Pin::new(&mut *this.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = &poll {
+            this.span.pb_inc(*n as u64);
+        }
+        poll
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        Pin::new(&mut *this.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        Pin::new(&mut *this.inner).poll_shutdown(cx)
+    }
 }
