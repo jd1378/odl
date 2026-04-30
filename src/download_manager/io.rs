@@ -55,15 +55,17 @@ pub async fn assemble_final_file(
     // File length is determined by the highest end offset, not the sum.
     // Parts are contiguous from 0 today, so sum == end, but using `end`
     // keeps `set_len` correct if a future split ever leaves gaps.
-    let final_end: u64 = sorted_parts
-        .last()
-        .map(|p| p.offset + p.size)
-        .unwrap_or(0);
+    let final_end: u64 = sorted_parts.last().map(|p| p.offset + p.size).unwrap_or(0);
     let final_path_for_blocking = final_path.clone();
     let span_for_blocking = span.clone();
 
     tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-        assemble_blocking(&final_path_for_blocking, final_end, parts, span_for_blocking)
+        assemble_blocking(
+            &final_path_for_blocking,
+            final_end,
+            parts,
+            span_for_blocking,
+        )
     })
     .await??;
 
@@ -101,8 +103,8 @@ fn assemble_blocking(
         final_file.set_len(final_end)?;
     }
 
-    let cluster_size = NonZeroU64::new(Download::ASSEMBLY_CLUSTER_SIZE)
-        .expect("ASSEMBLY_CLUSTER_SIZE non-zero");
+    let cluster_size =
+        NonZeroU64::new(Download::ASSEMBLY_CLUSTER_SIZE).expect("ASSEMBLY_CLUSTER_SIZE non-zero");
     let cluster_mask = Download::ASSEMBLY_CLUSTER_SIZE - 1;
     let mut reflink_disabled = false;
     let mut buf = vec![0u8; COPY_BUF_SIZE];
@@ -122,9 +124,7 @@ fn assemble_blocking(
         let aligned_size = size & cluster_mask == 0;
         let reflinkable = !reflink_disabled && aligned_offset && (aligned_size || is_last);
 
-        let reflinked = if reflinkable
-            && let Some(len_nz) = NonZeroU64::new(size)
-        {
+        let reflinked = if reflinkable && let Some(len_nz) = NonZeroU64::new(size) {
             let res = ReflinkBlockBuilder::new(&part_file, &final_file, len_nz)
                 .from_offset(0)
                 .to_offset(offset)
@@ -252,4 +252,3 @@ pub async fn persist_encoded_metadata(encoded: &[u8], instruction: &Download) ->
     )
     .await
 }
-

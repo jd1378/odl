@@ -19,12 +19,12 @@ use tracing_indicatif::span_ext::IndicatifSpanExt;
 
 use crate::config::Config;
 use crate::download_manager::recover_metadata::recover_metadata;
-use crate::retry_policies::{FixedThenExponentialRetry, wait_for_retry};
 use crate::download_manager::{downloader::Downloader, io::persist_metadata};
 use crate::download_manager::{io::assemble_final_file, server_conflict::resolve_server_conflicts};
 use crate::download_manager::{io::remove_all_parts, save_conflict::resolve_save_conflicts};
 use crate::error::MetadataError;
 use crate::response_info::ResponseInfo;
+use crate::retry_policies::{FixedThenExponentialRetry, wait_for_retry};
 use crate::{
     conflict::{SaveConflictResolver, ServerConflictResolver},
     download_manager::io::sum_parts_on_disk,
@@ -1220,8 +1220,7 @@ mod tests {
 
         let mut hasher = Sha256::new();
         hasher.update(file_content);
-        let sha256_b64 =
-            base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
+        let sha256_b64 = base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
         let repr_digest_value = format!("sha-256=:{}:", sha256_b64);
 
         let mut server = Server::new_async().await;
@@ -1284,8 +1283,7 @@ mod tests {
         // Independently verify SHA-256 of the assembled file.
         let mut hasher = Sha256::new();
         hasher.update(&on_disk);
-        let actual_b64 =
-            base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
+        let actual_b64 = base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
         assert_eq!(actual_b64, sha256_b64);
 
         head_mock.assert_async().await;
@@ -1294,8 +1292,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_e2e_download_fails_on_checksum_mismatch()
-    -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_e2e_download_fails_on_checksum_mismatch() -> Result<(), Box<dyn std::error::Error>>
+    {
         let file_content = b"payload-served-by-server";
         // Advertise a digest that does NOT match the body
         let bogus_repr_digest = "sha-256=:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=:";
@@ -1375,8 +1373,7 @@ mod tests {
 
         let mut hasher = Sha256::new();
         hasher.update(&file_content);
-        let sha256_b64 =
-            base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
+        let sha256_b64 = base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
         let repr_digest_value = format!("sha-256=:{}:", sha256_b64);
 
         let mut server = Server::new_async().await;
@@ -1399,14 +1396,15 @@ mod tests {
         let mut get_mocks = Vec::new();
         for i in 0..3 {
             let start = i * part_size;
-            let end = if i == 2 { size - 1 } else { start + part_size - 1 };
+            let end = if i == 2 {
+                size - 1
+            } else {
+                start + part_size - 1
+            };
             let body = file_content[start..=end].to_vec();
             let m = server
                 .mock("GET", "/big.bin")
-                .match_header(
-                    "range",
-                    Matcher::Exact(format!("bytes={}-{}", start, end)),
-                )
+                .match_header("range", Matcher::Exact(format!("bytes={}-{}", start, end)))
                 .with_status(206)
                 .with_body(body)
                 .create_async()
@@ -1465,8 +1463,7 @@ mod tests {
 
         let mut hasher = Sha256::new();
         hasher.update(&on_disk);
-        let actual_b64 =
-            base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
+        let actual_b64 = base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
         assert_eq!(actual_b64, sha256_b64);
 
         head_mock.assert_async().await;

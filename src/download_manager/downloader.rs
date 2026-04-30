@@ -410,9 +410,7 @@ impl Downloader {
             return Ok(None);
         }
         let split_size = current_limit - new_limit;
-        if split_size < MIN_DYNAMIC_SPLIT_SIZE
-            || new_limit - downloaded < MIN_DYNAMIC_SPLIT_SIZE
-        {
+        if split_size < MIN_DYNAMIC_SPLIT_SIZE || new_limit - downloaded < MIN_DYNAMIC_SPLIT_SIZE {
             return Ok(None);
         }
         candidate.controller.set_limit(new_limit);

@@ -128,8 +128,7 @@ impl Download {
     // power-of-two cluster size. The split logic also assumes the minimum
     // part size is at least one cluster, otherwise `base_size` could round
     // down to zero and produce empty leading parts.
-    const _ASSERT_CLUSTER_POW2: () =
-        assert!(Self::ASSEMBLY_CLUSTER_SIZE.is_power_of_two());
+    const _ASSERT_CLUSTER_POW2: () = assert!(Self::ASSEMBLY_CLUSTER_SIZE.is_power_of_two());
     const _ASSERT_MIN_PART_GE_CLUSTER: () =
         assert!(Self::MIN_PART_SIZE >= Self::ASSEMBLY_CLUSTER_SIZE);
 
