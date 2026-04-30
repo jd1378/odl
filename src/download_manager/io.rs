@@ -5,7 +5,7 @@ use std::task::{Context, Poll};
 use futures::io;
 use prost::Message;
 use tokio::io::{AsyncWrite, AsyncWriteExt, BufWriter};
-use tracing::Span;
+use tracing::{Span, info_span};
 use tracing_indicatif::span_ext::IndicatifSpanExt;
 
 use crate::{
@@ -48,12 +48,11 @@ pub async fn assemble_final_file(
     sorted_parts.sort_by_key(|p| p.offset);
 
     let total: u64 = sorted_parts.iter().map(|p| p.size).sum();
-    let span = Span::current();
-    span.pb_reset();
+    let span = info_span!("assemble");
     span.pb_set_length(total);
     span.pb_set_position(0);
     span.pb_set_message("Assembling");
-    span.pb_reset_eta();
+    span.pb_start();
 
     let mut progress_writer = ProgressWriter {
         inner: &mut final_file,

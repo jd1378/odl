@@ -205,7 +205,7 @@ async fn main() -> Result<(), OdlError> {
                 .with_writer(indicatif_layer.get_stderr_writer())
                 .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
         )
-        .with(indicatif_layer)
+        .with(indicatif_layer.with_filter(tracing_subscriber::filter::Targets::new().with_target("odl", tracing::Level::INFO)))
         .init();
 
     let dlm = build_download_manager(&args).await?;

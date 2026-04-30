@@ -292,6 +292,11 @@ impl Downloader {
         let speed_limiter = self.speed_limiter.clone();
         let span_ulid = task_part.ulid.clone();
         let part_span = info_span!("part", ulid = span_ulid.as_str());
+        // Initialize length/position immediately so the bar never renders as
+        // 0/0 in the gap between span creation and the spawned task's first
+        // poll (where `download_part` would otherwise set these).
+        part_span.pb_set_length(controller.limit());
+        part_span.pb_set_position(controller.downloaded());
         let retry_policy = self.retry_policy;
 
         // Pass through the optional probe notifier to the download task. The notifier
