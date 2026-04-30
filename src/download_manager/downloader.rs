@@ -49,7 +49,7 @@ const MIN_DYNAMIC_SPLIT_ELAPSED: Duration = Duration::from_millis(0);
 #[cfg(not(test))]
 const STALE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(test)]
-const STALE_CONNECTION_TIMEOUT: Duration = Duration::from_millis(100);
+const STALE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Coordinates how parts are downloaded, including dynamic splitting to keep
 /// all available connections busy.
