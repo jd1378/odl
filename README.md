@@ -4,9 +4,51 @@ Flexible download library and CLI intended to be fast, reliable, and easy to use
 
 ## Quick Start
 
+### Install
+
+**Linux / macOS** (installs to `~/.local/bin` by default):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jd1378/odl/main/tools/install.sh | sh
+```
+
+Custom directory:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jd1378/odl/main/tools/install.sh | sh -s -- --dir /usr/local/bin
+```
+
+**Windows** (PowerShell, installs to `%LOCALAPPDATA%\Programs\odl` and adds it to user PATH):
+
+```powershell
+irm https://raw.githubusercontent.com/jd1378/odl/main/tools/install.ps1 | iex
+```
+
+**From source** (any platform with Rust toolchain):
+
 ```bash
 cargo install odl
+```
 
+### Uninstall
+
+**Linux / macOS:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jd1378/odl/main/tools/uninstall.sh | sh
+# also drop user config
+curl -fsSL https://raw.githubusercontent.com/jd1378/odl/main/tools/uninstall.sh | sh -s -- --purge
+```
+
+**Windows** (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/jd1378/odl/main/tools/uninstall.ps1 | iex
+```
+
+### Use
+
+```bash
 odl https://example.com/file.zip
 ```
 
