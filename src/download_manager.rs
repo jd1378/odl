@@ -132,7 +132,7 @@ impl DownloadManager {
                 req = req.header(USER_AGENT, random_user_agent());
             }
 
-            match req.send().await {
+            match req.send().await.and_then(|r| r.error_for_status()) {
                 Ok(r) => break r,
                 Err(e) => {
                     attempts = attempts.saturating_add(1);
