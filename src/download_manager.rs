@@ -1367,7 +1367,7 @@ mod tests {
         // 900 KiB → with MIN_PART_SIZE = 300 KiB and max_connections = 3
         // determine_parts produces exactly 3 contiguous parts of 300 KiB each.
         let size: usize = 900 * 1024;
-        let mut rng = StdRng::seed_from_u64(0xC0FFEE_F00D);
+        let mut rng = StdRng::seed_from_u64(0x00C0_FFEE_F00D);
         let mut file_content = vec![0u8; size];
         rng.fill_bytes(&mut file_content);
 
