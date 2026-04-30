@@ -952,7 +952,6 @@ async fn download_part(
             }
             file.write_all(&chunk).await?;
             controller.record_progress(len);
-            current_size += len;
             tracker.advance(len);
             // Per-chunk progress events are intentionally NOT emitted here:
             // the sampler emits both aggregate and per-part progress at a

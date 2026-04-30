@@ -392,8 +392,8 @@ impl DownloadManager {
 
             let to_download = metadata
                 .parts
-                .iter()
-                .filter_map(|(_, p)| if !p.finished { Some(p.clone()) } else { None })
+                .values()
+                .filter_map(|p| if !p.finished { Some(p.clone()) } else { None })
                 .collect::<Vec<PartDetails>>();
 
             if !to_download.is_empty() {
