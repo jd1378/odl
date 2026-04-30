@@ -54,13 +54,26 @@ where
                 // deleting the wrong files.
                 let _ = tokio::fs::remove_file(instruction.metadata_path()).await;
                 let _ = tokio::fs::remove_file(instruction.metadata_temp_path()).await;
-                let mut entries = tokio::fs::read_dir(instruction.download_dir()).await?;
-                while let Some(entry) = entries.next_entry().await? {
-                    let path = entry.path();
-                    if let Some(ext) = path.extension()
-                        && ext == Download::PART_EXTENSION
-                    {
-                        tokio::fs::remove_file(&path).await?;
+                match tokio::fs::read_dir(instruction.download_dir()).await {
+                    Ok(mut entries) => {
+                        while let Some(entry) = entries.next_entry().await? {
+                            let path = entry.path();
+                            if let Some(ext) = path.extension()
+                                && ext == Download::PART_EXTENSION
+                            {
+                                tokio::fs::remove_file(&path).await?;
+                            }
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        return Err(OdlError::StdIoError {
+                            e,
+                            extra_info: Some(format!(
+                                "Failed to list download dir at {}",
+                                instruction.download_dir().display(),
+                            )),
+                        });
                     }
                 }
             }
