@@ -14,15 +14,15 @@ use reqwest::{
 };
 
 use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore};
-use tracing::Span;
-use tracing_indicatif::span_ext::IndicatifSpanExt;
 
 use crate::config::Config;
+use crate::download_manager::checksum::check_final_file_checksum;
 use crate::download_manager::recover_metadata::recover_metadata;
 use crate::download_manager::{downloader::Downloader, io::persist_metadata};
 use crate::download_manager::{io::assemble_final_file, server_conflict::resolve_server_conflicts};
 use crate::download_manager::{io::remove_all_parts, save_conflict::resolve_save_conflicts};
 use crate::error::MetadataError;
+use crate::progress::{DownloadContext, Phase, ProgressEvent};
 use crate::response_info::ResponseInfo;
 use crate::retry_policies::{FixedThenExponentialRetry, wait_for_retry};
 use crate::{
@@ -91,6 +91,11 @@ impl DownloadManager {
         Ok(())
     }
 
+    /// Probe the remote URL and resolve save conflicts, returning a
+    /// [`Download`] ready for [`Self::download`].
+    ///
+    /// Use [`Self::evaluate_with`] to attach a progress reporter or
+    /// cancellation token.
     pub async fn evaluate<CR>(
         &self,
         url: Url,
@@ -101,8 +106,33 @@ impl DownloadManager {
     where
         CR: SaveConflictResolver,
     {
-        let current_span = Span::current();
-        current_span.pb_set_message("Evaluating");
+        self.evaluate_with(
+            url,
+            save_dir,
+            credentials,
+            conflict_resolver,
+            &DownloadContext::new(),
+        )
+        .await
+    }
+
+    /// Same as [`Self::evaluate`] with an explicit [`DownloadContext`] for
+    /// progress reporting and cancellation.
+    pub async fn evaluate_with<CR>(
+        &self,
+        url: Url,
+        save_dir: PathBuf,
+        credentials: Option<Credentials>,
+        conflict_resolver: &CR,
+        ctx: &DownloadContext,
+    ) -> Result<Download, OdlError>
+    where
+        CR: SaveConflictResolver,
+    {
+        ctx.emit(ProgressEvent::PhaseChanged(Phase::Evaluating));
+        if ctx.is_cancelled() {
+            return Err(OdlError::Cancelled);
+        }
         let client = self.get_client(None)?;
 
         let retry_policy = FixedThenExponentialRetry {
@@ -136,10 +166,12 @@ impl DownloadManager {
                 Ok(r) => break r,
                 Err(e) => {
                     attempts = attempts.saturating_add(1);
-                    if !wait_for_retry(&retry_policy, attempts, &current_span).await {
+                    if !wait_for_retry(&retry_policy, attempts, ctx).await {
                         return Err(OdlError::from(e));
                     }
-                    current_span.pb_set_message("Evaluating");
+                    if ctx.is_cancelled() {
+                        return Err(OdlError::Cancelled);
+                    }
                 }
             }
         };
@@ -155,19 +187,24 @@ impl DownloadManager {
             Some(HeaderMap::from(&self.config)),
         );
 
+        ctx.emit(ProgressEvent::PhaseChanged(Phase::ResolvingConflicts));
         let instruction = resolve_save_conflicts(instruction, conflict_resolver).await?;
 
-        current_span.pb_set_message(instruction.filename());
-        if let Some(size) = instruction.size() {
-            current_span.pb_set_length(size);
-        } else {
-            current_span.pb_set_length(0);
-        }
+        ctx.emit(ProgressEvent::FilenameResolved(
+            instruction.filename().to_string(),
+        ));
+        ctx.emit(ProgressEvent::Progress {
+            downloaded: 0,
+            total: instruction.size(),
+        });
 
         Ok(instruction)
     }
 
-    /// Immediately starts a download using the given instruction and conflict_resolver
+    /// Immediately starts a download using the given instruction and conflict_resolver.
+    ///
+    /// Use [`Self::download_with`] to attach a progress reporter or
+    /// cancellation token.
     pub async fn download<CR>(
         &self,
         instruction: Download,
@@ -176,35 +213,74 @@ impl DownloadManager {
     where
         CR: ServerConflictResolver,
     {
+        self.download_with(instruction, conflict_resolver, &DownloadContext::new())
+            .await
+    }
+
+    /// Same as [`Self::download`] with an explicit [`DownloadContext`] for
+    /// live progress and cancellation.
+    pub async fn download_with<CR>(
+        &self,
+        instruction: Download,
+        conflict_resolver: &CR,
+        ctx: &DownloadContext,
+    ) -> Result<PathBuf, OdlError>
+    where
+        CR: ServerConflictResolver,
+    {
+        let result = self
+            .download_with_inner(instruction, conflict_resolver, ctx)
+            .await;
+        // Success emission lives in `process_download` so the
+        // already-on-disk branch can be flagged distinctly. Failure /
+        // cancellation are surfaced uniformly here so every error path
+        // (including lockfile open / dir-create) reaches the reporter.
+        match &result {
+            Ok(_) => {}
+            Err(OdlError::Cancelled) => ctx.emit(ProgressEvent::Cancelled),
+            Err(e) => ctx.emit(ProgressEvent::Failed {
+                message: e.to_string(),
+            }),
+        }
+        result
+    }
+
+    async fn download_with_inner<CR>(
+        &self,
+        instruction: Download,
+        conflict_resolver: &CR,
+        ctx: &DownloadContext,
+    ) -> Result<PathBuf, OdlError>
+    where
+        CR: ServerConflictResolver,
+    {
         // we want to know issues about directory creation very early.
         tokio::fs::create_dir_all(instruction.download_dir()).await?;
 
-        match tokio::fs::OpenOptions::new()
+        let f = tokio::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(true)
             .open(instruction.lockfile_path())
             .await
-        {
-            Ok(f) => {
-                let f = f.into_std().await;
-                if f.try_lock_exclusive().is_err() {
-                    return Err(OdlError::MetadataError(MetadataError::LockfileInUse));
-                }
-
-                let result = self.process_download(instruction, conflict_resolver).await;
-                let _ = FileExt::unlock(&f);
-                result
-            }
-            Err(e) => Err(OdlError::StdIoError {
+            .map_err(|e| OdlError::StdIoError {
                 e,
                 extra_info: Some(format!(
                     "Failed to open lockfile for exclusive locking at {}",
                     instruction.lockfile_path().display(),
                 )),
-            }),
+            })?;
+        let f = f.into_std().await;
+        if f.try_lock_exclusive().is_err() {
+            return Err(OdlError::MetadataError(MetadataError::LockfileInUse));
         }
+
+        let result = self
+            .process_download(instruction, conflict_resolver, ctx)
+            .await;
+        let _ = FileExt::unlock(&f);
+        result
     }
 
     /// acquire a permit from this download manager's semaphore. Only up to `max_concurrent_downloads` are permitted at the same time.
@@ -250,30 +326,70 @@ impl DownloadManager {
         &self,
         instruction: Download,
         conflict_resolver: &CR,
+        ctx: &DownloadContext,
     ) -> Result<PathBuf, OdlError>
     where
         CR: ServerConflictResolver,
     {
+        if ctx.is_cancelled() {
+            return Err(OdlError::Cancelled);
+        }
         // early directory creation check to fail fast
         tokio::fs::create_dir_all(instruction.save_dir()).await?;
 
         recover_metadata(&instruction).await?;
 
+        ctx.emit(ProgressEvent::PhaseChanged(Phase::ResolvingConflicts));
         let mut metadata = resolve_server_conflicts(&instruction, conflict_resolver).await?;
 
-        if let Some(sum_of_parts_sizes) = sum_parts_on_disk(&instruction, &metadata).await {
+        // Best-effort early progress notice. The downloader's per-part
+        // scheduler will re-emit a precise tracker-backed Progress as
+        // each part is scheduled, so this is just for the case where the
+        // download is already finished and the downloader never runs.
+        let initial_on_disk = if metadata.finished {
+            sum_parts_on_disk(&instruction, &metadata).await
+        } else {
+            None
+        };
+        if let Some(sum_of_parts_sizes) = initial_on_disk {
             let size: Option<u64> = metadata.size.or_else(|| instruction.size());
-            let current_span = Span::current();
-            current_span.pb_reset();
-            if let Some(size) = size {
-                current_span.pb_set_length(size);
-            }
-            current_span.pb_set_position(sum_of_parts_sizes);
-            current_span.pb_reset_eta();
+            ctx.emit(ProgressEvent::Progress {
+                downloaded: sum_of_parts_sizes,
+                total: size,
+            });
         }
 
         // we skip over download parts if we already finished downloading
         if !metadata.finished {
+            // Crash-recovery fast path. The aggregate `metadata.finished`
+            // flag is only persisted after `assemble_final_file` returns
+            // Ok (which includes checksum verification). If a prior run
+            // crashed AFTER assembly but BEFORE that flag write, a fully
+            // correct final file may already be on disk. Trust it only
+            // when the server provided checksums and they verify — with
+            // no checksum we cannot distinguish a good final file from a
+            // zero-padded partial left by an even earlier interrupted
+            // assembly (`assemble_blocking` calls `set_len(final_end)`
+            // up front, so the size check alone is not safe).
+            let final_path_recovery = instruction.final_file_path();
+            if !metadata.checksums.is_empty()
+                && tokio::fs::try_exists(&final_path_recovery)
+                    .await
+                    .unwrap_or(false)
+                && check_final_file_checksum(&metadata, &instruction, false)
+                    .await
+                    .is_ok()
+            {
+                metadata.finished = true;
+                persist_metadata(&metadata, &instruction).await?;
+                remove_all_parts(instruction.download_dir()).await;
+                ctx.emit(ProgressEvent::Completed {
+                    path: final_path_recovery.clone(),
+                    already_complete: true,
+                });
+                return Ok(final_path_recovery);
+            }
+
             let to_download = metadata
                 .parts
                 .iter()
@@ -293,28 +409,70 @@ impl DownloadManager {
                     wait_time: self.config.wait_between_retries,
                     n_fixed_retries: self.config.n_fixed_retries,
                 };
+                ctx.emit(ProgressEvent::PhaseChanged(Phase::Downloading));
                 let downloader = Downloader::new(
                     Arc::new(instruction.clone()),
                     metadata,
                     client,
                     randomize_user_agent,
-                    Span::current(),
                     self.config.speed_limit,
                     retry_policy,
+                    ctx.clone(),
                 );
 
-                let mut mdata = downloader.run().await?;
-                mdata.finished = true;
+                // Persist per-part finished flags but DO NOT set the
+                // overall `metadata.finished = true` here: assembly is
+                // still ahead and may be interrupted. The aggregate
+                // flag is only flipped after assembly + checksum +
+                // part cleanup all succeed below — that way an
+                // interrupt mid-assembly leaves `finished = false` and
+                // the next run re-runs assembly instead of trusting a
+                // partial final file.
+                let mdata = downloader.run().await?;
                 persist_metadata(&mdata, &instruction).await?;
                 metadata = mdata;
             }
 
-            let final_path = assemble_final_file(&metadata, &instruction).await?;
+            // Defensively delete any partial final file from a prior
+            // interrupted assembly. `assemble_blocking` already opens
+            // with `truncate(true)`, but removing first guarantees the
+            // file is gone even if the open path errors out before
+            // truncation, and removes any leftover xattrs/mtime.
+            let final_path_for_cleanup = instruction.final_file_path();
+            if tokio::fs::try_exists(&final_path_for_cleanup)
+                .await
+                .unwrap_or(false)
+            {
+                let _ = tokio::fs::remove_file(&final_path_for_cleanup).await;
+            }
+
+            ctx.emit(ProgressEvent::PhaseChanged(Phase::Assembling));
+            let final_path = assemble_final_file(&metadata, &instruction, ctx).await?;
+
+            // Mark metadata fully finished BEFORE removing parts. If
+            // the process dies between these two steps, parts simply
+            // leak on disk (cleanup done lazily on the next run); the
+            // final file is already verified-correct. Doing the flag
+            // flip after `remove_all_parts` would create the opposite
+            // hazard: parts gone, flag still false, restart attempts
+            // re-assembly with no source files.
+            metadata.finished = true;
+            persist_metadata(&metadata, &instruction).await?;
+
             remove_all_parts(instruction.download_dir()).await;
+
+            ctx.emit(ProgressEvent::Completed {
+                path: final_path.clone(),
+                already_complete: false,
+            });
             Ok(final_path)
         } else {
             let final_path = instruction.final_file_path();
             if tokio::fs::try_exists(&final_path).await.unwrap_or(false) {
+                ctx.emit(ProgressEvent::Completed {
+                    path: final_path.clone(),
+                    already_complete: true,
+                });
                 Ok(final_path)
             } else {
                 Err(OdlError::StdIoError {
@@ -1091,9 +1249,9 @@ mod tests {
             metadata,
             client,
             false,
-            Span::current(),
             None,
             retry_policy,
+            DownloadContext::new(),
         );
 
         let updated_metadata = downloader.run().await?;
@@ -1561,6 +1719,383 @@ mod tests {
 
         head_mock.assert_async().await;
         get_mock.assert_async().await;
+
+        Ok(())
+    }
+
+    /// Simulates Ctrl-C interrupting `assemble_final_file` after
+    /// `set_len(final_end)` ran (so the final file exists at the
+    /// expected length, zero-padded) but before all per-part pwrites
+    /// completed. With no server-supplied checksum, the only validity
+    /// signal is the `metadata.finished` flag.
+    ///
+    /// Pre-fix behavior: `metadata.finished` was persisted as `true`
+    /// BEFORE assembly ran, so on restart the size check passed against
+    /// the zero-padded partial file and the user got a corrupt download
+    /// silently reported as complete.
+    ///
+    /// Post-fix behavior: `metadata.finished` is only persisted after
+    /// assembly + checksum + cleanup succeed. An interrupt mid-assembly
+    /// leaves `finished = false`, so the next run re-runs assembly and
+    /// produces the correct final file.
+    #[tokio::test]
+    async fn test_resumes_assembly_after_interrupt_with_no_server_checksum()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let file_content =
+            b"AssemblyResumePayload-NoChecksumScenario-0123456789abcdefghijklmnop";
+
+        let tmp_data_dir = tempfile::tempdir()?;
+        let tmp_save_dir = tempfile::tempdir()?;
+
+        // Place the per-download dir as a child of the tempdir so the
+        // lockfile / metadata / parts all live together as in real use.
+        let download_dir = tmp_data_dir.path().join("payload-bin");
+        fs::create_dir_all(&download_dir).await?;
+
+        // Two parts split at byte 20.
+        let part1_ulid = "part1ulid_resume_test";
+        let part2_ulid = "part2ulid_resume_test";
+        let split: usize = 20;
+
+        let mut parts = HashMap::new();
+        parts.insert(
+            part1_ulid.to_string(),
+            PartDetails {
+                ulid: part1_ulid.to_string(),
+                offset: 0,
+                size: split as u64,
+                finished: true,
+            },
+        );
+        parts.insert(
+            part2_ulid.to_string(),
+            PartDetails {
+                ulid: part2_ulid.to_string(),
+                offset: split as u64,
+                size: (file_content.len() - split) as u64,
+                finished: true,
+            },
+        );
+
+        let instruction = DownloadBuilder::default()
+            .download_dir(download_dir.clone())
+            .save_dir(tmp_save_dir.path().to_path_buf())
+            .filename("payload.bin".to_string())
+            .url(Url::parse("http://example.invalid/payload.bin").unwrap())
+            .size(Some(file_content.len() as u64))
+            .max_connections(1)
+            .parts(parts)
+            .is_resumable(true)
+            .build()
+            .unwrap();
+
+        // Write part files with the correct payload bytes.
+        fs::write(instruction.part_path(part1_ulid), &file_content[..split]).await?;
+        fs::write(instruction.part_path(part2_ulid), &file_content[split..]).await?;
+
+        // Persist metadata in the mid-assembly-interrupted state:
+        // every part marked finished individually, but the aggregate
+        // `finished` flag is `false`. No server checksum.
+        let metadata = instruction.as_metadata();
+        assert!(
+            !metadata.finished,
+            "precondition: metadata.finished should be false (mid-assembly state)"
+        );
+        assert!(
+            metadata.checksums.is_empty(),
+            "precondition: no server checksum (the bug condition)"
+        );
+        persist_metadata(&metadata, &instruction).await?;
+
+        // Pre-create a partial, zero-padded final file at the same size
+        // as the real payload, mirroring what `assemble_blocking` leaves
+        // behind when killed after `set_len(final_end)` but before
+        // pwrites finish. The contents do NOT match the real payload.
+        let final_path = instruction.final_file_path();
+        fs::write(&final_path, vec![0u8; file_content.len()]).await?;
+
+        let cfg = crate::config::ConfigBuilder::default()
+            .download_dir(tmp_data_dir.path().to_path_buf())
+            .max_connections(1)
+            .build()
+            .unwrap();
+        let dlm = DownloadManager::new(cfg);
+        let resolver = AlwaysAbortResolver {};
+
+        let result_path = dlm.download(instruction.clone(), &resolver).await?;
+        assert_eq!(result_path, final_path);
+
+        let on_disk = fs::read(&final_path).await?;
+        assert_eq!(
+            on_disk, file_content,
+            "final file must be re-assembled from parts, not left as the partial zero-padded carcass"
+        );
+
+        // After successful run the aggregate flag must be persisted
+        // true so the next invocation short-circuits.
+        let bytes = fs::read(instruction.metadata_path()).await?;
+        let persisted = {
+            use prost::Message;
+            crate::download_metadata::DownloadMetadata::decode_length_delimited(&*bytes)
+                .expect("decode metadata")
+        };
+        assert!(
+            persisted.finished,
+            "post-condition: metadata.finished must be true after successful assembly"
+        );
+
+        Ok(())
+    }
+
+    /// Crash-recovery fast path: prior run completed assembly (final
+    /// file written, checksum-correct on disk) but crashed BEFORE
+    /// `metadata.finished = true` was persisted. With server checksums
+    /// available, restart must trust the existing final file rather
+    /// than nuke-and-reassemble — and must not re-download / re-pwrite.
+    #[tokio::test]
+    async fn test_recovers_from_crash_between_assembly_and_finished_persist()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use base64::Engine;
+        use sha2::{Digest, Sha256};
+
+        let file_content = b"FastPathRecovery-AssemblyDone-FinishedFlagNotPersisted-XYZ";
+        let mut hasher = Sha256::new();
+        hasher.update(file_content);
+        let sha256_b64 = base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
+
+        let tmp_data_dir = tempfile::tempdir()?;
+        let tmp_save_dir = tempfile::tempdir()?;
+        let download_dir = tmp_data_dir.path().join("payload-fastpath");
+        fs::create_dir_all(&download_dir).await?;
+
+        let part_ulid = "fastpath_part";
+        let mut parts = HashMap::new();
+        parts.insert(
+            part_ulid.to_string(),
+            PartDetails {
+                ulid: part_ulid.to_string(),
+                offset: 0,
+                size: file_content.len() as u64,
+                finished: true,
+            },
+        );
+
+        // Build instruction WITH the same checksum the persisted
+        // metadata will carry, so `resolve_server_conflicts` does not
+        // see a `FileChanged` mismatch on restart.
+        let checksums = vec![crate::hash::HashDigest::SHA256(
+            sha256_b64.clone(),
+            crate::hash::HashEncoding::Base64,
+        )];
+        let instruction = DownloadBuilder::default()
+            .download_dir(download_dir.clone())
+            .save_dir(tmp_save_dir.path().to_path_buf())
+            .filename("payload-fastpath.bin".to_string())
+            .url(Url::parse("http://example.invalid/payload-fastpath.bin").unwrap())
+            .size(Some(file_content.len() as u64))
+            .max_connections(1)
+            .parts(parts)
+            .is_resumable(true)
+            .checksums(checksums)
+            .build()
+            .unwrap();
+
+        // Part file matches payload (was downloaded successfully).
+        fs::write(instruction.part_path(part_ulid), file_content).await?;
+
+        // Final file matches payload (assembly ran successfully).
+        fs::write(instruction.final_file_path(), file_content).await?;
+
+        // Persist metadata: parts.finished=true, metadata.finished=false.
+        // The checksum is already populated via `instruction.as_metadata()`.
+        let metadata = instruction.as_metadata();
+        assert!(!metadata.checksums.is_empty());
+        persist_metadata(&metadata, &instruction).await?;
+
+        // Snapshot the part file's mtime + inode equivalent (size) so we
+        // can prove the recovery path did not re-pwrite it.
+        let part_path = instruction.part_path(part_ulid);
+        let pre_meta = std::fs::metadata(&part_path)?;
+        let pre_final_meta = std::fs::metadata(instruction.final_file_path())?;
+
+        let cfg = crate::config::ConfigBuilder::default()
+            .download_dir(tmp_data_dir.path().to_path_buf())
+            .max_connections(1)
+            .build()
+            .unwrap();
+        let dlm = DownloadManager::new(cfg);
+        let resolver = AlwaysAbortResolver {};
+
+        let final_path = dlm.download(instruction.clone(), &resolver).await?;
+        let on_disk = fs::read(&final_path).await?;
+        assert_eq!(
+            on_disk, file_content,
+            "fast-path must preserve the already-correct final file"
+        );
+
+        // Final file should not have been rewritten — same mtime as
+        // before the call (recovery path must not re-run assembly).
+        let post_final_meta = std::fs::metadata(&final_path)?;
+        assert_eq!(
+            pre_final_meta.modified()?,
+            post_final_meta.modified()?,
+            "fast-path must not rewrite the final file"
+        );
+
+        // Parts must be cleaned up after fast-path success.
+        assert!(
+            !tokio::fs::try_exists(&part_path).await.unwrap_or(false),
+            "fast-path must remove parts after marking finished"
+        );
+
+        // Persisted metadata must be flipped to finished.
+        let bytes = fs::read(instruction.metadata_path()).await?;
+        let persisted = {
+            use prost::Message;
+            crate::download_metadata::DownloadMetadata::decode_length_delimited(&*bytes)
+                .expect("decode metadata")
+        };
+        assert!(persisted.finished);
+
+        let _ = pre_meta; // silence unused on platforms without mtime
+        Ok(())
+    }
+
+    /// Negative case for the recovery fast path: existing final file's
+    /// checksum does NOT match. Must NOT trust it — must re-assemble
+    /// from parts (which carry the correct payload).
+    #[tokio::test]
+    async fn test_recovery_fast_path_rejects_corrupt_existing_final()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use base64::Engine;
+        use sha2::{Digest, Sha256};
+
+        let file_content = b"RejectCorruptExistingFinal-MustReassembleFromParts";
+        let mut hasher = Sha256::new();
+        hasher.update(file_content);
+        let sha256_b64 = base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
+
+        let tmp_data_dir = tempfile::tempdir()?;
+        let tmp_save_dir = tempfile::tempdir()?;
+        let download_dir = tmp_data_dir.path().join("payload-rejectfinal");
+        fs::create_dir_all(&download_dir).await?;
+
+        let part_ulid = "rejectfinal_part";
+        let mut parts = HashMap::new();
+        parts.insert(
+            part_ulid.to_string(),
+            PartDetails {
+                ulid: part_ulid.to_string(),
+                offset: 0,
+                size: file_content.len() as u64,
+                finished: true,
+            },
+        );
+        let checksums = vec![crate::hash::HashDigest::SHA256(
+            sha256_b64,
+            crate::hash::HashEncoding::Base64,
+        )];
+        let instruction = DownloadBuilder::default()
+            .download_dir(download_dir.clone())
+            .save_dir(tmp_save_dir.path().to_path_buf())
+            .filename("payload-rejectfinal.bin".to_string())
+            .url(Url::parse("http://example.invalid/payload-rejectfinal.bin").unwrap())
+            .size(Some(file_content.len() as u64))
+            .max_connections(1)
+            .parts(parts)
+            .is_resumable(true)
+            .checksums(checksums)
+            .build()
+            .unwrap();
+
+        // Parts: correct.
+        fs::write(instruction.part_path(part_ulid), file_content).await?;
+        // Final on disk: same length as payload, but content is zeros
+        // (typical mid-assembly carcass after `set_len`).
+        fs::write(
+            instruction.final_file_path(),
+            vec![0u8; file_content.len()],
+        )
+        .await?;
+
+        let metadata = instruction.as_metadata();
+        persist_metadata(&metadata, &instruction).await?;
+
+        let cfg = crate::config::ConfigBuilder::default()
+            .download_dir(tmp_data_dir.path().to_path_buf())
+            .max_connections(1)
+            .build()
+            .unwrap();
+        let dlm = DownloadManager::new(cfg);
+        let resolver = AlwaysAbortResolver {};
+
+        let final_path = dlm.download(instruction.clone(), &resolver).await?;
+        let on_disk = fs::read(&final_path).await?;
+        assert_eq!(
+            on_disk, file_content,
+            "must re-assemble: existing final was zero-padded carcass"
+        );
+        Ok(())
+    }
+
+    /// Same scenario but the partial final file is missing entirely
+    /// (interrupted before `set_len` ran). Must still re-assemble.
+    #[tokio::test]
+    async fn test_resumes_assembly_when_final_file_absent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let file_content = b"AnotherResumePayload-FinalFileAbsent";
+
+        let tmp_data_dir = tempfile::tempdir()?;
+        let tmp_save_dir = tempfile::tempdir()?;
+        let download_dir = tmp_data_dir.path().join("payload-bin-2");
+        fs::create_dir_all(&download_dir).await?;
+
+        let only_ulid = "only_part_resume2";
+        let mut parts = HashMap::new();
+        parts.insert(
+            only_ulid.to_string(),
+            PartDetails {
+                ulid: only_ulid.to_string(),
+                offset: 0,
+                size: file_content.len() as u64,
+                finished: true,
+            },
+        );
+
+        let instruction = DownloadBuilder::default()
+            .download_dir(download_dir.clone())
+            .save_dir(tmp_save_dir.path().to_path_buf())
+            .filename("payload2.bin".to_string())
+            .url(Url::parse("http://example.invalid/payload2.bin").unwrap())
+            .size(Some(file_content.len() as u64))
+            .max_connections(1)
+            .parts(parts)
+            .is_resumable(true)
+            .build()
+            .unwrap();
+
+        fs::write(instruction.part_path(only_ulid), file_content).await?;
+        let metadata = instruction.as_metadata();
+        persist_metadata(&metadata, &instruction).await?;
+
+        // No partial final file at all.
+        assert!(
+            !tokio::fs::try_exists(instruction.final_file_path())
+                .await
+                .unwrap_or(false)
+        );
+
+        let cfg = crate::config::ConfigBuilder::default()
+            .download_dir(tmp_data_dir.path().to_path_buf())
+            .max_connections(1)
+            .build()
+            .unwrap();
+        let dlm = DownloadManager::new(cfg);
+        let resolver = AlwaysAbortResolver {};
+
+        let final_path = dlm.download(instruction.clone(), &resolver).await?;
+        let on_disk = fs::read(&final_path).await?;
+        assert_eq!(on_disk, file_content);
 
         Ok(())
     }

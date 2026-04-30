@@ -1,11 +1,12 @@
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use futures::io;
 use prost::Message;
 use reflink_copy::ReflinkBlockBuilder;
-use tracing::info_span;
-use tracing_indicatif::span_ext::IndicatifSpanExt;
 
 use crate::{
     Download,
@@ -13,9 +14,14 @@ use crate::{
     download_metadata::{DownloadMetadata, PartDetails},
     error::OdlError,
     fs_utils::{atomic_write, set_file_mtime_async},
+    progress::{DownloadContext, Phase, ProgressEvent, SAMPLE_INTERVAL},
 };
 
 const COPY_BUF_SIZE: usize = 1024 * 1024;
+
+/// Synthetic ulid used for the assembly progress bar so consumers can
+/// render it as a regular child / part bar.
+pub const ASSEMBLY_ULID: &str = "_assemble";
 
 /// removes all .part files on disk
 pub async fn remove_all_parts(download_dir: &Path) {
@@ -36,17 +42,25 @@ pub async fn remove_all_parts(download_dir: &Path) {
 pub async fn assemble_final_file(
     metadata: &DownloadMetadata,
     instruction: &Download,
+    ctx: &DownloadContext,
 ) -> Result<PathBuf, OdlError> {
     let final_path = instruction.final_file_path();
     let mut sorted_parts: Vec<&PartDetails> = metadata.parts.values().collect();
     sorted_parts.sort_by_key(|p| p.offset);
 
     let total: u64 = sorted_parts.iter().map(|p| p.size).sum();
-    let span = info_span!("assemble");
-    span.pb_set_length(total);
-    span.pb_set_position(0);
-    span.pb_set_message("Assembling");
-    span.pb_start();
+    ctx.emit(ProgressEvent::PhaseChanged(Phase::Assembling));
+    ctx.emit(ProgressEvent::Progress {
+        downloaded: 0,
+        total: Some(total),
+    });
+    // Surface assembly as a child bar so consumers can show progress +
+    // speed + ETA for it the same way they show download parts.
+    ctx.emit(ProgressEvent::PartAdded {
+        ulid: ASSEMBLY_ULID.to_string(),
+        offset: 0,
+        size: total,
+    });
 
     let parts: Vec<(PathBuf, u64, u64)> = sorted_parts
         .iter()
@@ -57,17 +71,41 @@ pub async fn assemble_final_file(
     // keeps `set_len` correct if a future split ever leaves gaps.
     let final_end: u64 = sorted_parts.last().map(|p| p.offset + p.size).unwrap_or(0);
     let final_path_for_blocking = final_path.clone();
-    let span_for_blocking = span.clone();
+    let ctx_for_blocking = ctx.clone();
 
-    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+    // Shared counter updated by the blocking assembler and read by the
+    // async sampler so we can emit raw, un-smoothed Speed/PartSpeed
+    // events at a fixed cadence — same model as the download sampler.
+    let done_counter = Arc::new(AtomicU64::new(0));
+    let done_for_blocking = Arc::clone(&done_counter);
+    let sampler_handle = spawn_assembly_sampler(ctx.clone(), Arc::clone(&done_counter), total);
+
+    let blocking_result = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
         assemble_blocking(
             &final_path_for_blocking,
             final_end,
             parts,
-            span_for_blocking,
+            done_for_blocking,
+            ctx_for_blocking,
         )
     })
-    .await??;
+    .await;
+    sampler_handle.abort();
+    // Only land the bar at 100% on success. On failure / panic the
+    // outer error path emits Failed; emitting PartFinished here would
+    // briefly show "complete" before the failure event.
+    let blocking_ok = matches!(&blocking_result, Ok(Ok(())));
+    if blocking_ok {
+        ctx.emit(ProgressEvent::PartProgress {
+            ulid: ASSEMBLY_ULID.to_string(),
+            downloaded: total,
+            total,
+        });
+        ctx.emit(ProgressEvent::PartFinished {
+            ulid: ASSEMBLY_ULID.to_string(),
+        });
+    }
+    blocking_result??;
 
     if metadata.use_server_time
         && let Some(last_modified) = metadata.last_modified
@@ -80,15 +118,59 @@ pub async fn assemble_final_file(
         );
     }
 
+    ctx.emit(ProgressEvent::PhaseChanged(Phase::Verifying));
     check_final_file_checksum(metadata, instruction, false).await?;
     Ok(final_path)
+}
+
+fn spawn_assembly_sampler(
+    ctx: DownloadContext,
+    done: Arc<AtomicU64>,
+    total: u64,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut last_at = Instant::now();
+        let mut last_bytes: u64 = 0;
+        loop {
+            tokio::select! {
+                _ = ctx.cancel.cancelled() => return,
+                _ = tokio::time::sleep(SAMPLE_INTERVAL) => {}
+            }
+            let now = Instant::now();
+            let cur = done.load(Ordering::Relaxed);
+            let dt = now.saturating_duration_since(last_at).as_secs_f64();
+            if dt > 0.0 {
+                let delta = cur.saturating_sub(last_bytes);
+                let rate = delta as f64 / dt;
+                ctx.emit(ProgressEvent::Speed {
+                    bytes_per_second: rate,
+                });
+                ctx.emit(ProgressEvent::PartSpeed {
+                    ulid: ASSEMBLY_ULID.to_string(),
+                    bytes_per_second: rate,
+                });
+            }
+            ctx.emit(ProgressEvent::Progress {
+                downloaded: cur,
+                total: Some(total),
+            });
+            ctx.emit(ProgressEvent::PartProgress {
+                ulid: ASSEMBLY_ULID.to_string(),
+                downloaded: cur,
+                total,
+            });
+            last_at = now;
+            last_bytes = cur;
+        }
+    })
 }
 
 fn assemble_blocking(
     final_path: &Path,
     final_end: u64,
     parts: Vec<(PathBuf, u64, u64)>,
-    span: tracing::Span,
+    done: Arc<AtomicU64>,
+    ctx: DownloadContext,
 ) -> std::io::Result<()> {
     use std::io::Read;
 
@@ -147,7 +229,7 @@ fn assemble_blocking(
         };
 
         if reflinked {
-            span.pb_inc(size);
+            done.fetch_add(size, Ordering::Relaxed);
             continue;
         }
 
@@ -172,14 +254,14 @@ fn assemble_blocking(
             pwrite_all(&final_file, &buf[..n], write_offset)?;
             write_offset += n as u64;
             remaining -= n as u64;
-            span.pb_inc(n as u64);
+            done.fetch_add(n as u64, Ordering::Relaxed);
         }
     }
 
     // sync_data() can stall multiple seconds on spinning disks / encrypted
-    // FS when a copy-fallback dirtied the whole file. Update the bar message
+    // FS when a copy-fallback dirtied the whole file. Emit Flushing phase
     // so the UI doesn't look frozen at 100%.
-    span.pb_set_message("Flushing data to disk");
+    ctx.emit(ProgressEvent::PhaseChanged(Phase::Flushing));
     final_file.sync_data()?;
     Ok(())
 }

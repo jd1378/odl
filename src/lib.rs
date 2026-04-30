@@ -25,6 +25,7 @@ pub mod download_manager;
 pub mod error;
 mod fs_utils;
 mod hash;
+pub mod progress;
 mod response_info;
 mod retry_policies;
 pub mod user_agents;

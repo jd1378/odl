@@ -59,6 +59,8 @@ pub enum OdlError {
     },
     #[error("CLI error: {message}")]
     CliError { message: String },
+    #[error("download cancelled")]
+    Cancelled,
     #[error(transparent)]
     ConfigBuilderError(#[from] ConfigBuilderError),
     #[error(transparent)]

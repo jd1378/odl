@@ -1,8 +1,16 @@
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use clap::{CommandFactory, Parser};
-use indicatif::{ProgressState, ProgressStyle};
+use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressState, ProgressStyle};
 use odl::{
     Download,
     config::{Config, ConfigBuilder},
@@ -13,14 +21,15 @@ use odl::{
     credentials::Credentials,
     download_manager::DownloadManager,
     error::OdlError,
+    progress::{
+        AsyncReporter, DownloadContext, Phase, ProgressEvent, ProgressReporter, SAMPLE_INTERVAL,
+    },
 };
 use reqwest::Url;
 use tokio::{self, io::AsyncBufReadExt};
 mod args;
 use args::Args;
-use tracing::{Instrument, info_span, instrument};
-use tracing_indicatif::{IndicatifLayer, TickSettings, span_ext::IndicatifSpanExt};
-use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing::instrument;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DownloadType {
@@ -73,6 +82,273 @@ impl SaveConflictResolver for CliResolver {
 }
 
 pub const PROGRESS_CHARS: &str = "█▇▆▅▄▃▂▁";
+
+/// Atomics shared between a bar and its indicatif style closures so the
+/// closures can render fast-reacting speed / ETA without locking.
+struct BarMetrics {
+    speed_bits: Arc<AtomicU64>,
+    downloaded: Arc<AtomicU64>,
+    total: Arc<AtomicU64>,
+}
+
+impl BarMetrics {
+    fn new() -> Self {
+        Self {
+            speed_bits: Arc::new(AtomicU64::new(0)),
+            downloaded: Arc::new(AtomicU64::new(0)),
+            total: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+struct PartBar {
+    bar: ProgressBar,
+    metrics: BarMetrics,
+}
+
+/// Drives a parent + per-part `indicatif` bar set from
+/// `odl::progress::ProgressEvent`s. One `CliReporter` per download.
+struct CliReporter {
+    mp: Arc<MultiProgress>,
+    parent: ProgressBar,
+    parts: Mutex<HashMap<String, PartBar>>,
+    parent_metrics: BarMetrics,
+    /// Last resolved filename. Restored as parent's bar message when
+    /// transient phases (Evaluating / ResolvingConflicts / retry
+    /// countdown) clear, so the bar lands back on the file label.
+    filename: Mutex<Option<String>>,
+}
+
+impl CliReporter {
+    fn new(mp: Arc<MultiProgress>, parent: ProgressBar, parent_metrics: BarMetrics) -> Self {
+        Self {
+            mp,
+            parent,
+            parts: Mutex::new(HashMap::new()),
+            parent_metrics,
+            filename: Mutex::new(None),
+        }
+    }
+}
+
+fn phase_label(phase: Phase) -> &'static str {
+    match phase {
+        Phase::Evaluating => "Evaluating",
+        Phase::ResolvingConflicts => "Resolving conflicts",
+        Phase::Downloading => "Downloading",
+        Phase::Assembling => "Assembling",
+        Phase::Flushing => "Flushing data to disk",
+        Phase::Verifying => "Verifying checksum",
+    }
+}
+
+impl ProgressReporter for CliReporter {
+    fn on_event(&self, event: ProgressEvent) {
+        match event {
+            ProgressEvent::FilenameResolved(name) => {
+                *self.filename.lock().unwrap() = Some(name.clone());
+                self.parent.set_message(name);
+            }
+            ProgressEvent::PhaseChanged(phase) => {
+                // Once Downloading begins (or any later phase), restore the
+                // filename as the bar message so transient phase labels
+                // ("Resolving conflicts", "Evaluating") don't stick.
+                // Assembling/Flushing/Verifying still get explicit labels
+                // because they replace the download progress.
+                match phase {
+                    Phase::Downloading => {
+                        if let Some(name) = self.filename.lock().unwrap().clone() {
+                            self.parent.set_message(name);
+                        }
+                    }
+                    _ => {
+                        self.parent.set_message(phase_label(phase));
+                    }
+                }
+            }
+            ProgressEvent::Progress { downloaded, total } => {
+                self.parent_metrics
+                    .downloaded
+                    .store(downloaded, Ordering::Relaxed);
+                if let Some(t) = total {
+                    self.parent_metrics.total.store(t, Ordering::Relaxed);
+                    self.parent.set_length(t);
+                }
+                self.parent.set_position(downloaded);
+            }
+            ProgressEvent::Speed { bytes_per_second } => {
+                self.parent_metrics
+                    .speed_bits
+                    .store(bytes_per_second.to_bits(), Ordering::Relaxed);
+            }
+            ProgressEvent::PartAdded { ulid, size, .. } => {
+                let metrics = BarMetrics::new();
+                metrics.total.store(size, Ordering::Relaxed);
+                let style = build_child_style(&metrics);
+                let bar = self.mp.add(ProgressBar::new(size).with_style(style));
+                bar.enable_steady_tick(SAMPLE_INTERVAL);
+                self.parts
+                    .lock()
+                    .unwrap()
+                    .insert(ulid, PartBar { bar, metrics });
+            }
+            ProgressEvent::PartProgress {
+                ulid,
+                downloaded,
+                total,
+            } => {
+                if let Some(p) = self.parts.lock().unwrap().get(&ulid) {
+                    p.metrics.downloaded.store(downloaded, Ordering::Relaxed);
+                    p.metrics.total.store(total, Ordering::Relaxed);
+                    p.bar.set_length(total);
+                    p.bar.set_position(downloaded);
+                }
+            }
+            ProgressEvent::PartSpeed {
+                ulid,
+                bytes_per_second,
+            } => {
+                if let Some(p) = self.parts.lock().unwrap().get(&ulid) {
+                    p.metrics
+                        .speed_bits
+                        .store(bytes_per_second.to_bits(), Ordering::Relaxed);
+                }
+            }
+            ProgressEvent::PartFinished { ulid } => {
+                if let Some(p) = self.parts.lock().unwrap().remove(&ulid) {
+                    p.bar.finish_and_clear();
+                }
+            }
+            ProgressEvent::PartRetrying { ulid, attempt } => {
+                if let Some(p) = self.parts.lock().unwrap().get(&ulid) {
+                    p.bar.set_message(format!("retry #{attempt}"));
+                }
+            }
+            ProgressEvent::Message(msg) => {
+                if !msg.is_empty() {
+                    self.parent.set_message(msg);
+                }
+            }
+            ProgressEvent::Completed {
+                path,
+                already_complete,
+            } => {
+                // Drain child bars first so the final parent line lands at
+                // the bottom of the group with no leftover assembly /
+                // part rows.
+                {
+                    let mut parts = self.parts.lock().unwrap();
+                    for (_, p) in parts.drain() {
+                        p.bar.finish_and_clear();
+                    }
+                }
+                // Replace the parent's template with a single-line "saved"
+                // style so the path is rendered as the final state of the
+                // bar itself. Using `mp.println` would queue the line
+                // above active bars where it could be overwritten on
+                // redraw; baking it into the bar's own line avoids that.
+                let suffix = if already_complete {
+                    " (already complete)"
+                } else {
+                    ""
+                };
+                let final_style = ProgressStyle::with_template("✓ Saved to {msg}")
+                    .expect("templating final progress should not fail");
+                self.parent.set_style(final_style);
+                self.parent
+                    .finish_with_message(format!("{}{}", path.display(), suffix));
+            }
+            ProgressEvent::Cancelled => {
+                {
+                    let mut parts = self.parts.lock().unwrap();
+                    for (_, p) in parts.drain() {
+                        p.bar.finish_and_clear();
+                    }
+                }
+                self.parent.abandon_with_message("Cancelled");
+            }
+            ProgressEvent::Failed { message } => {
+                {
+                    let mut parts = self.parts.lock().unwrap();
+                    for (_, p) in parts.drain() {
+                        p.bar.finish_and_clear();
+                    }
+                }
+                self.parent
+                    .abandon_with_message(format!("Failed: {message}"));
+            }
+        }
+    }
+}
+
+fn install_metric_keys(style: ProgressStyle, metrics: &BarMetrics) -> ProgressStyle {
+    let speed_for_key = Arc::clone(&metrics.speed_bits);
+    let dl_for_eta = Arc::clone(&metrics.downloaded);
+    let total_for_eta = Arc::clone(&metrics.total);
+    let speed_for_eta = Arc::clone(&metrics.speed_bits);
+    style
+        .with_key(
+            "fast_speed",
+            move |_state: &ProgressState, w: &mut dyn std::fmt::Write| {
+                let bytes = f64::from_bits(speed_for_key.load(Ordering::Relaxed));
+                let bytes = if bytes.is_finite() && bytes >= 0.0 {
+                    bytes as u64
+                } else {
+                    0
+                };
+                let _ = write!(w, "{}/s", HumanBytes(bytes));
+            },
+        )
+        .with_key(
+            "fast_eta",
+            move |_state: &ProgressState, w: &mut dyn std::fmt::Write| {
+                let total = total_for_eta.load(Ordering::Relaxed);
+                let downloaded = dl_for_eta.load(Ordering::Relaxed);
+                let speed = f64::from_bits(speed_for_eta.load(Ordering::Relaxed));
+                if total == 0 || downloaded >= total || !speed.is_finite() || speed <= 1.0 {
+                    let _ = write!(w, "--");
+                    return;
+                }
+                let remaining = (total - downloaded) as f64 / speed;
+                let secs = remaining as u64;
+                let _ = write!(
+                    w,
+                    "{:02}:{:02}:{:02}",
+                    secs / 3600,
+                    (secs / 60) % 60,
+                    secs % 60
+                );
+            },
+        )
+}
+
+fn build_parent_style(metrics: &BarMetrics) -> ProgressStyle {
+    let style = ProgressStyle::with_template(
+        "{spinner} {maybe_connect} {msg:!40}   {percent:>3}%  {decimal_bytes:<10} / {decimal_total_bytes:<10} {fast_speed:<14} eta {fast_eta:>9} elapsed {elapsed}",
+    )
+    .expect("templating progress bar should not fail")
+    .progress_chars(PROGRESS_CHARS)
+    .with_key(
+        "maybe_connect",
+        |state: &ProgressState, w: &mut dyn std::fmt::Write| {
+            if state.len().is_none() || state.len().is_some_and(|x| x == 0) {
+                let _ = write!(w, "━");
+            } else {
+                let _ = write!(w, "┌");
+            }
+        },
+    );
+    install_metric_keys(style, metrics)
+}
+
+fn build_child_style(metrics: &BarMetrics) -> ProgressStyle {
+    let style = ProgressStyle::with_template(
+        "  ↳ {spinner} {bar:30.cyan/blue} {percent:>3}%  {decimal_bytes:<10} / {decimal_total_bytes:<10} {fast_speed:<14} eta {fast_eta:>9} {msg}",
+    )
+    .expect("templating progress bar should not fail")
+    .progress_chars(PROGRESS_CHARS);
+    install_metric_keys(style, metrics)
+}
 
 #[tokio::main]
 async fn main() -> Result<(), OdlError> {
@@ -185,30 +461,7 @@ async fn main() -> Result<(), OdlError> {
             }
         }
     }
-    let child_style = ProgressStyle::with_template(
-            "{span_child_prefix}{spinner} {bar:40.cyan/blue} {percent:>3}%  {decimal_bytes:<10} / {decimal_total_bytes:<10} {decimal_bytes_per_sec:<12}{msg}"
-        )
-        .expect("templating progress bar should not fail").progress_chars(PROGRESS_CHARS);
-    let indicatif_layer = IndicatifLayer::new()
-        .with_progress_style(child_style)
-        .with_tick_settings(TickSettings {
-            term_draw_hz: 10,
-            default_tick_interval: Some(Duration::from_millis(100)),
-            footer_tick_interval: None,
-            ..Default::default()
-        })
-        .with_span_child_prefix_symbol("↳ ")
-        .with_span_child_prefix_indent("  ");
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_writer(indicatif_layer.get_stderr_writer())
-                .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
-        )
-        .with(indicatif_layer.with_filter(
-            tracing_subscriber::filter::Targets::new().with_target("odl", tracing::Level::INFO),
-        ))
-        .init();
+    let mp = Arc::new(MultiProgress::new());
 
     let dlm = build_download_manager(&args).await?;
 
@@ -268,16 +521,6 @@ async fn main() -> Result<(), OdlError> {
     // large remote lists). This keeps the number of active tasks
     // bounded by the download manager's semaphore.
     let mut handles = Vec::new();
-    let parent_style = ProgressStyle::with_template(
-        "{spinner} {maybe_connect} {msg:!40}   {percent:>3}%  {decimal_bytes:<10} / {decimal_total_bytes:<10} {decimal_bytes_per_sec:<12} eta {eta_precise} elapsed {elapsed}",
-    )
-    .expect("templating progress bar should not fail").with_key("maybe_connect", |state: &ProgressState, writer: &mut dyn std::fmt::Write| {
-            if state.len().is_none() || state.len().is_some_and(|x| x == 0) {
-                let _ = write!(writer, "━");
-            } else {
-                let _ = write!(writer, "┌");
-            }
-        });
 
     let dlm = Arc::new(dlm);
     let credentials = if let Some(user) = args.http_user.as_deref() {
@@ -322,15 +565,28 @@ async fn main() -> Result<(), OdlError> {
     };
 
     for url in urls.into_iter() {
-        let download_span = info_span!("download", url = %url);
-        download_span.pb_set_style(&parent_style);
-        download_span.pb_set_message("Warming up");
-        download_span.pb_start();
+        let parent_metrics = BarMetrics::new();
+        let parent_style = build_parent_style(&parent_metrics);
+
+        let parent = mp.add(ProgressBar::new(0).with_style(parent_style));
+        parent.set_message(format!("{url} (warming up)"));
+        parent.enable_steady_tick(SAMPLE_INTERVAL);
+
+        // Wrap the CliReporter in an async forwarder so every `emit`
+        // hands the event off to a worker task via a lock-free mpsc and
+        // returns immediately. Indicatif `set_position` / Mutex hops
+        // never run on the download tasks themselves.
+        let cli_reporter = CliReporter::new(Arc::clone(&mp), parent, parent_metrics);
+        let reporter = AsyncReporter::spawn(cli_reporter);
+        let ctx = DownloadContext::new()
+            .with_reporter(reporter as Arc<dyn ProgressReporter>)
+            .with_url(url.clone());
+
         let dlm = Arc::clone(&dlm);
         let save_dir = save_dir.clone();
         let user_provided_filename = user_provided_filename.clone();
         let credentials = credentials.clone();
-        // `resolver` is `Copy`, closures will capture by value; no extra binding needed
+        // `resolver` is `Copy`, closures will capture by value; no extra binding needed.
 
         // Wait here for a permit before spawning the task. This ensures we
         // don't construct/spawn more tasks than permits available.
@@ -342,17 +598,16 @@ async fn main() -> Result<(), OdlError> {
         // Move the permit into the spawned task so it is held for the
         // duration of the download and released automatically when the
         // task completes.
-        let handle = tokio::spawn(
-            async move {
-                let _permit = permit;
-                let mut instruction = dlm.evaluate(url, save_dir, credentials, &resolver).await?;
-                if let Some(filename) = user_provided_filename {
-                    instruction.set_filename(filename);
-                }
-                dlm.download(instruction, &resolver).await
+        let handle = tokio::spawn(async move {
+            let _permit = permit;
+            let mut instruction = dlm
+                .evaluate_with(url, save_dir, credentials, &resolver, &ctx)
+                .await?;
+            if let Some(filename) = user_provided_filename {
+                instruction.set_filename(filename);
             }
-            .instrument(download_span),
-        );
+            dlm.download_with(instruction, &resolver, &ctx).await
+        });
 
         handles.push(handle);
     }

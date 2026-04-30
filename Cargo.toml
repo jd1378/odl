@@ -1,6 +1,6 @@
 [package]
 name = "odl"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2024"
 description = "flexible download library and CLI intended to be fast, reliable, and easy to use."
 repository = "https://github.com/jd1378/odl"
@@ -14,6 +14,7 @@ keywords = ["download", "manager", "idm", "dl", "download-manager"]
 reqwest = { version = "0.12.24", default-features = false, features = ["http2", "gzip", "brotli", "native-tls", "native-tls-vendored", "native-tls-alpn", "socks", "stream"] }
 reqwest-retry = "0.7.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
+tokio-util = { version = "0.7", default-features = false }
 thiserror = "2.0.12"
 chrono = "0.4.41"
 secrecy = "0.10.3"
@@ -22,7 +23,7 @@ regex = "1"
 filetime = "0.2"
 prost = "0.14"
 prost-types = "0.14"
-clap = { version = "4.5.41", features = ["derive"] }
+clap = { version = "4.5.41", features = ["derive"], optional = true }
 dirs = "6.0.0"
 derive_builder = "0.20.2"
 keyring = { version = "3.6.2",features = ["apple-native", "linux-native", "windows-native", "vendored"]  }
@@ -40,23 +41,29 @@ rand = "0.9.1"
 tracing = "0.1.41"
 async-trait = "0.1.88"
 percent-encoding = "2.3.1"
-indicatif = "0.18.3"
-tracing-subscriber = "0.3.20"
+indicatif = { version = "0.18.3", optional = true }
+tracing-subscriber = { version = "0.3.20", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.9"
 indexmap = { version = "2", features = ["serde"] }
 humantime = "2"
-tracing-indicatif = "0.3.14"
 reflink-copy = { version = "0.1.29", features = ["tracing"] }
 
 [dev-dependencies]
 reqwest = { version = "0.12.19", default-features = false, features = ["http2", "gzip", "brotli", "native-tls", "socks", "stream", "blocking"] }
 mockito = "1.7.0"
+tracing-subscriber = "0.3.20"
 
 [build-dependencies]
 prost-build = "0.14"
 protobuf-src = { version = "2.1", optional = true }
 
 [features]
-default = []
+default = ["cli"]
+cli = ["dep:clap", "dep:indicatif", "dep:tracing-subscriber"]
 vendored-protoc = ["protobuf-src"]
+
+[[bin]]
+name = "odl"
+path = "src/main.rs"
+required-features = ["cli"]

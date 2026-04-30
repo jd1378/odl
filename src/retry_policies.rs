@@ -1,11 +1,10 @@
+use crate::progress::{DownloadContext, ProgressEvent};
 use reqwest_retry::{self, RetryDecision, RetryPolicy};
 use std::{
     cmp,
     time::{Duration, SystemTime},
 };
 use tokio::time::{self, Instant};
-use tracing::Span;
-use tracing_indicatif::span_ext::IndicatifSpanExt;
 
 /// Calculate exponential using base and number of past retries
 fn calculate_exponential(base: u32, n_past_retries: u32) -> u32 {
@@ -68,17 +67,18 @@ impl RetryPolicy for FixedThenExponentialRetry {
 }
 
 /// Consult the retry policy after a failed attempt. If retry is allowed,
-/// sleeps until the scheduled retry time while updating `span` with a
-/// human-readable countdown message. Returns `true` if caller should retry,
-/// `false` if no further retries are allowed.
+/// sleeps until the scheduled retry time while emitting countdown
+/// [`ProgressEvent::Message`] events on `ctx`. Returns `true` if caller
+/// should retry, `false` if no further retries are allowed.
 ///
 /// `attempts_so_far` is the number of attempts already made (>= 1 after a
 /// failure). The policy is queried with `attempts_so_far - 1` as
-/// `n_past_retries`.
+/// `n_past_retries`. The wait is interrupted early if `ctx` is cancelled,
+/// in which case this returns `false`.
 pub async fn wait_for_retry(
     policy: &FixedThenExponentialRetry,
     attempts_so_far: u32,
-    span: &Span,
+    ctx: &DownloadContext,
 ) -> bool {
     let n_past = attempts_so_far.saturating_sub(1);
     match policy.should_retry(SystemTime::now(), n_past) {
@@ -90,23 +90,32 @@ pub async fn wait_for_retry(
             let sleep = time::sleep(wait);
             tokio::pin!(sleep);
             let start = Instant::now();
+            let mut last_msg = String::new();
 
             loop {
                 let remaining = wait.checked_sub(start.elapsed()).unwrap_or_default();
-                span.pb_set_message(&format!(
+                let msg = format!(
                     " Retrying {}/{} in {}",
                     attempts_so_far,
                     policy.max_n_retries,
                     format_wait(remaining)
-                ));
+                );
+                // Only emit when the rendered countdown text actually
+                // changes; avoids flooding the reporter queue with
+                // identical messages when N parts are retrying together.
+                if msg != last_msg {
+                    ctx.emit(ProgressEvent::Message(msg.clone()));
+                    last_msg = msg;
+                }
 
                 tokio::select! {
                     _ = &mut sleep => break,
+                    _ = ctx.cancel.cancelled() => return false,
                     _ = time::sleep(Duration::from_millis(200)) => {},
                 }
             }
 
-            span.pb_set_message("");
+            ctx.emit(ProgressEvent::Message(String::new()));
             true
         }
         RetryDecision::DoNotRetry => false,

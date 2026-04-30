@@ -17,12 +17,12 @@ use tokio::{
     task::JoinSet,
     time::{self, Duration, Instant},
 };
-use tracing::{Instrument, Span, info_span};
-use tracing_indicatif::span_ext::IndicatifSpanExt;
+use tracing::{Instrument, info_span};
 use ulid::Ulid;
 
 use prost::Message;
 
+use crate::progress::{DownloadContext, ProgressEvent, ProgressTracker, SAMPLE_INTERVAL};
 use crate::retry_policies::{FixedThenExponentialRetry, wait_for_retry};
 use crate::{
     download::Download,
@@ -59,26 +59,44 @@ pub struct Downloader {
     client: Arc<Client>,
     randomize_user_agent: bool,
     concurrency_limit: Arc<AtomicUsize>,
-    aggregator_span: Span,
     speed_limiter: Option<Arc<BandwidthLimiter>>,
     retry_policy: FixedThenExponentialRetry,
     persist_mutex: Arc<Mutex<()>>,
+    ctx: DownloadContext,
+    tracker: Arc<ProgressTracker>,
+    /// Snapshot of currently scheduled parts, shared with the speed
+    /// sampler so it can emit per-part speed/progress on a fixed cadence
+    /// (independent of the per-chunk hot path).
+    active_parts: Arc<std::sync::Mutex<HashMap<String, Arc<PartController>>>>,
 }
 
 impl Downloader {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         instruction: Arc<Download>,
         metadata: DownloadMetadata,
         client: Client,
         randomize_user_agent: bool,
-        aggregator_span: Span,
         speed_limit: Option<u64>,
         retry_policy: FixedThenExponentialRetry,
+        ctx: DownloadContext,
     ) -> Self {
         let concurrency_limit = metadata.max_connections as usize;
         let speed_limiter = speed_limit
             .filter(|limit| *limit > 0)
             .map(|limit| Arc::new(BandwidthLimiter::new(limit)));
+        let total = metadata.size;
+        let tracker = Arc::new(ProgressTracker::new(total));
+        // seed tracker with bytes already on disk for parts marked finished
+        let already_done: u64 = metadata
+            .parts
+            .values()
+            .filter(|p| p.finished)
+            .map(|p| p.size)
+            .sum();
+        if already_done > 0 {
+            tracker.advance(already_done);
+        }
         Self {
             instruction,
             metadata: Arc::new(Mutex::new(metadata)),
@@ -89,14 +107,121 @@ impl Downloader {
             } else {
                 concurrency_limit
             })),
-            aggregator_span,
             speed_limiter,
             retry_policy,
             persist_mutex: Arc::new(Mutex::new(())),
+            ctx,
+            tracker,
+            active_parts: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
     pub async fn run(self) -> Result<DownloadMetadata, OdlError> {
+        // Pre-seed tracker with on-disk bytes for unfinished parts so the
+        // sampler's first emission already reflects resumed state and the
+        // UI never flashes backwards. `Downloader::new` only counted
+        // bytes from `finished` parts.
+        self.seed_tracker_with_unfinished_parts().await;
+        // Spawn a fast progress sampler that emits raw, un-smoothed speed
+        // and aggregate progress at SAMPLE_INTERVAL cadence (8 Hz). Decoupled
+        // from per-chunk hot path so CPU stays low even with thousands of
+        // tiny chunks per second.
+        let sampler_handle = self.spawn_speed_sampler();
+        let result = self.run_inner().await;
+        sampler_handle.abort();
+        result
+    }
+
+    async fn seed_tracker_with_unfinished_parts(&self) {
+        let parts: Vec<PartDetails> = {
+            let metadata = self.metadata.lock().await;
+            metadata
+                .parts
+                .values()
+                .filter(|p| !p.finished)
+                .cloned()
+                .collect()
+        };
+        let mut total_existing: u64 = 0;
+        for p in parts {
+            if let Ok(existing) = self.detect_existing_size(&p).await {
+                total_existing = total_existing.saturating_add(existing.min(p.size));
+            }
+        }
+        if total_existing > 0 {
+            self.tracker.advance(total_existing);
+            self.ctx.emit(ProgressEvent::Progress {
+                downloaded: self.tracker.downloaded(),
+                total: self.tracker.total(),
+            });
+        }
+    }
+
+    fn spawn_speed_sampler(&self) -> tokio::task::JoinHandle<()> {
+        let tracker = Arc::clone(&self.tracker);
+        let ctx = self.ctx.clone();
+        let active = Arc::clone(&self.active_parts);
+        tokio::spawn(async move {
+            let mut last_at = Instant::now();
+            let mut last_bytes = tracker.downloaded();
+            let mut last_part_bytes: HashMap<String, u64> = HashMap::new();
+            loop {
+                tokio::select! {
+                    _ = ctx.cancel.cancelled() => return,
+                    _ = time::sleep(SAMPLE_INTERVAL) => {}
+                }
+                let now = Instant::now();
+                let cur = tracker.downloaded();
+                let dt = now.saturating_duration_since(last_at).as_secs_f64();
+                if dt > 0.0 {
+                    // Raw window rate. No EWMA, no long-window averaging:
+                    // reacts immediately to network changes and resumes.
+                    let delta = cur.saturating_sub(last_bytes);
+                    ctx.emit(ProgressEvent::Speed {
+                        bytes_per_second: delta as f64 / dt,
+                    });
+                }
+                ctx.emit(ProgressEvent::Progress {
+                    downloaded: cur,
+                    total: tracker.total(),
+                });
+
+                // Per-part snapshot. Emit at sampler cadence so the per-chunk
+                // hot path stays cheap and the UI gets a steady update rate.
+                let snapshot: Vec<(String, Arc<PartController>)> = {
+                    let map = active.lock().unwrap();
+                    map.iter()
+                        .map(|(k, v)| (k.clone(), Arc::clone(v)))
+                        .collect()
+                };
+                let mut new_part_bytes = HashMap::with_capacity(snapshot.len());
+                for (ulid, controller) in snapshot {
+                    let part_cur = controller.downloaded();
+                    let part_lim = controller.limit();
+                    if dt > 0.0 {
+                        let prev = last_part_bytes.get(&ulid).copied().unwrap_or(part_cur);
+                        let delta = part_cur.saturating_sub(prev);
+                        ctx.emit(ProgressEvent::PartSpeed {
+                            ulid: ulid.clone(),
+                            bytes_per_second: delta as f64 / dt,
+                        });
+                    }
+                    ctx.emit(ProgressEvent::PartProgress {
+                        ulid: ulid.clone(),
+                        downloaded: part_cur,
+                        total: part_lim,
+                    });
+                    new_part_bytes.insert(ulid, part_cur);
+                }
+                last_part_bytes = new_part_bytes;
+
+                last_at = now;
+                last_bytes = cur;
+            }
+        })
+    }
+
+    async fn run_inner(self) -> Result<DownloadMetadata, OdlError> {
         let mut pending = self.pending_parts().await;
         let mut active: HashMap<String, ActiveTask> = HashMap::new();
         let mut join_set: JoinSet<Result<PartEvent, OdlError>> = JoinSet::new();
@@ -109,15 +234,18 @@ impl Downloader {
                 .await?;
 
             // Wait until either the probe signals it has started receiving data,
-            // or the task finishes (e.g., zero-length part completes immediately).
+            // or the task finishes (e.g., zero-length part completes immediately),
+            // or the caller cancels the download.
             tokio::select! {
-                _ = probe.notified() => {
-                    // probe started; continue to fill capacity below
-                }
+                _ = probe.notified() => {}
                 maybe_res = join_set.join_next() => {
                     if let Some(res) = maybe_res {
                         self.handle_join_result_item(res, &mut pending, &mut active, &mut join_set).await?;
                     }
+                }
+                _ = self.ctx.cancel.cancelled() => {
+                    join_set.shutdown().await;
+                    return Err(OdlError::Cancelled);
                 }
             }
         }
@@ -126,11 +254,20 @@ impl Downloader {
         self.fill_capacity(&mut pending, &mut active, &mut join_set)
             .await?;
 
-        while let Some(result) = join_set.join_next().await {
-            self.handle_join_result_item(result, &mut pending, &mut active, &mut join_set)
-                .await?;
-            self.fill_capacity(&mut pending, &mut active, &mut join_set)
-                .await?;
+        loop {
+            tokio::select! {
+                _ = self.ctx.cancel.cancelled() => {
+                    join_set.shutdown().await;
+                    return Err(OdlError::Cancelled);
+                }
+                next = join_set.join_next() => {
+                    let Some(result) = next else { break };
+                    self.handle_join_result_item(result, &mut pending, &mut active, &mut join_set)
+                        .await?;
+                    self.fill_capacity(&mut pending, &mut active, &mut join_set)
+                        .await?;
+                }
+            }
         }
 
         let metadata_mutex = Arc::try_unwrap(self.metadata).map_err(|_| {
@@ -186,10 +323,12 @@ impl Downloader {
             Ok(Ok(event)) => match event {
                 PartEvent::Completed(outcome) => {
                     active.remove(&outcome.ulid);
+                    self.active_parts.lock().unwrap().remove(&outcome.ulid);
                     self.mark_part_finished(&outcome).await?;
                 }
                 PartEvent::NeedsReschedule { ulid } => {
                     if let Some(task) = active.remove(&ulid) {
+                        self.active_parts.lock().unwrap().remove(&ulid);
                         pending.push_back(task.details);
                     }
                 }
@@ -197,6 +336,7 @@ impl Downloader {
                     // Remove from active and attempt to reschedule this part
                     // later if there are other unfinished parts. If this was
                     // the last unfinished part, fail the overall download.
+                    self.active_parts.lock().unwrap().remove(&ulid);
                     if let Some(task) = active.remove(&ulid) {
                         if pending.is_empty() && active.is_empty() {
                             // No other work to do — all parts have failed
@@ -282,21 +422,26 @@ impl Downloader {
         probe_notify: Option<Arc<Notify>>,
     ) -> Result<(), OdlError> {
         let initial_downloaded = self.detect_existing_size(&part).await?;
+        // NOTE: bytes already on disk are counted into the aggregate
+        // tracker by `seed_tracker_with_unfinished_parts` at run start.
+        // Per-chunk `tracker.advance` in `download_part` covers everything
+        // downloaded after that, so do not advance here on (re)schedule.
+        self.ctx.emit(ProgressEvent::PartAdded {
+            ulid: part.ulid.clone(),
+            offset: part.offset,
+            size: part.size,
+        });
         let controller = Arc::new(PartController::new(part.size, initial_downloaded));
         let task_part = part.clone();
         let controller_clone = Arc::clone(&controller);
         let client = Arc::clone(&self.client);
         let instruction = Arc::clone(&self.instruction);
-        let aggregator_span = self.aggregator_span.clone();
         let randomize_user_agent = self.randomize_user_agent;
         let speed_limiter = self.speed_limiter.clone();
         let span_ulid = task_part.ulid.clone();
         let part_span = info_span!("part", ulid = span_ulid.as_str());
-        // Initialize length/position immediately so the bar never renders as
-        // 0/0 in the gap between span creation and the spawned task's first
-        // poll (where `download_part` would otherwise set these).
-        part_span.pb_set_length(controller.limit());
-        part_span.pb_set_position(controller.downloaded());
+        let ctx = self.ctx.clone();
+        let tracker = Arc::clone(&self.tracker);
         let retry_policy = self.retry_policy;
 
         // Pass through the optional probe notifier to the download task. The notifier
@@ -310,22 +455,26 @@ impl Downloader {
                     task_part,
                     controller_clone,
                     randomize_user_agent,
-                    aggregator_span,
                     speed_limiter,
                     probe_for_task,
                     retry_policy,
+                    ctx,
+                    tracker,
                 )
                 .await
             }
-            .instrument(part_span.clone()),
+            .instrument(part_span),
         );
 
+        self.active_parts
+            .lock()
+            .unwrap()
+            .insert(part.ulid.clone(), Arc::clone(&controller));
         active.insert(
             part.ulid.clone(),
             ActiveTask {
                 details: part,
                 controller,
-                span: part_span.clone(),
             },
         );
 
@@ -374,7 +523,6 @@ impl Downloader {
         if let Some((new_part, new_limit)) = split_result {
             if let Some(task) = active.get_mut(&candidate.ulid) {
                 task.details.size = new_limit;
-                task.span.pb_set_length(new_limit);
             }
             pending.push_back(new_part);
             return Ok(true);
@@ -389,8 +537,8 @@ impl Downloader {
         // If estimated time to finish entire download is <= 60s,
         // Or if elapsed time is under 15 seconds
         // avoid splitting as it will be inefficient
-        if self.aggregator_span.pb_elapsed() <= MIN_DYNAMIC_SPLIT_ELAPSED
-            || self.aggregator_span.pb_eta() <= MIN_DYNAMIC_SPLIT_ETA
+        if self.tracker.elapsed() <= MIN_DYNAMIC_SPLIT_ELAPSED
+            || self.tracker.eta() <= MIN_DYNAMIC_SPLIT_ETA
         {
             return Ok(None);
         }
@@ -438,6 +586,12 @@ impl Downloader {
 
         self.persist_metadata_bytes(encoded_metadata).await?;
 
+        self.ctx.emit(ProgressEvent::PartAdded {
+            ulid: new_part.ulid.clone(),
+            offset: new_part.offset,
+            size: new_part.size,
+        });
+
         Ok(Some((new_part, new_limit)))
     }
 
@@ -476,7 +630,6 @@ impl Downloader {
 struct ActiveTask {
     details: PartDetails,
     controller: Arc<PartController>,
-    span: Span,
 }
 struct SplitCandidate {
     ulid: String,
@@ -625,23 +778,22 @@ async fn download_part(
     part: PartDetails,
     controller: Arc<PartController>,
     randomize_user_agent: bool,
-    aggregator_span: Span,
     speed_limiter: Option<Arc<BandwidthLimiter>>,
     probe_notify: Option<Arc<Notify>>,
     policy: FixedThenExponentialRetry,
+    ctx: DownloadContext,
+    tracker: Arc<ProgressTracker>,
 ) -> Result<PartEvent, OdlError> {
+    if ctx.is_cancelled() {
+        return Err(OdlError::Cancelled);
+    }
     let PartDetails {
         offset, size, ulid, ..
     } = part;
     let part_path = instruction.part_path(&ulid);
     let url = instruction.url().clone();
-    let mut current_size = controller.downloaded();
+    let mut current_size;
     let target_size = controller.limit();
-
-    let current_span = Span::current();
-    current_span.pb_set_length(target_size);
-    current_span.pb_set_position(current_size);
-    current_span.pb_reset_eta();
 
     let mut attempts: u32 = 0;
 
@@ -668,6 +820,7 @@ async fn download_part(
         };
 
         if current_size >= target_size {
+            ctx.emit(ProgressEvent::PartFinished { ulid: ulid.clone() });
             return Ok(PartEvent::Completed(PartOutcome {
                 ulid,
                 final_size: target_size,
@@ -700,15 +853,7 @@ async fn download_part(
             Ok(Ok(r)) => r,
             // request completed but returned an error (network error)
             Ok(Err(_e)) => {
-                match retry_sleep_or_fail_part(
-                    &policy,
-                    attempts,
-                    attempts + 1,
-                    &current_span,
-                    &ulid,
-                )
-                .await
-                {
+                match retry_sleep_or_fail_part(&policy, attempts, attempts + 1, &ctx, &ulid).await {
                     Ok(()) => {
                         attempts = attempts.saturating_add(1);
                         continue;
@@ -720,15 +865,7 @@ async fn download_part(
             Err(_) => {
                 // flush any partial progress to disk before retrying
                 file.flush().await?;
-                match retry_sleep_or_fail_part(
-                    &policy,
-                    attempts,
-                    attempts + 1,
-                    &current_span,
-                    &ulid,
-                )
-                .await
-                {
+                match retry_sleep_or_fail_part(&policy, attempts, attempts + 1, &ctx, &ulid).await {
                     Ok(()) => {
                         attempts = attempts.saturating_add(1);
                         continue;
@@ -753,14 +890,8 @@ async fn download_part(
                     Err(_e) => {
                         // network/body error -> consider retrying
                         file.flush().await?;
-                        match retry_sleep_or_fail_part(
-                            &policy,
-                            attempts,
-                            attempts + 1,
-                            &current_span,
-                            &ulid,
-                        )
-                        .await
+                        match retry_sleep_or_fail_part(&policy, attempts, attempts + 1, &ctx, &ulid)
+                            .await
                         {
                             Ok(()) => {
                                 attempts = attempts.saturating_add(1);
@@ -773,14 +904,8 @@ async fn download_part(
                 Err(_) => {
                     // timeout reading chunk -> retry according to policy
                     file.flush().await?;
-                    match retry_sleep_or_fail_part(
-                        &policy,
-                        attempts,
-                        attempts + 1,
-                        &current_span,
-                        &ulid,
-                    )
-                    .await
+                    match retry_sleep_or_fail_part(&policy, attempts, attempts + 1, &ctx, &ulid)
+                        .await
                     {
                         Ok(()) => {
                             attempts = attempts.saturating_add(1);
@@ -817,18 +942,32 @@ async fn download_part(
 
             let len = chunk.len() as u64;
             if let Some(limiter) = speed_limiter.as_ref() {
-                limiter.acquire(len).await;
+                tokio::select! {
+                    _ = limiter.acquire(len) => {}
+                    _ = ctx.cancel.cancelled() => {
+                        let _ = file.flush().await;
+                        return Err(OdlError::Cancelled);
+                    }
+                }
             }
             file.write_all(&chunk).await?;
-            aggregator_span.pb_inc(len);
-            current_span.pb_inc(len);
             controller.record_progress(len);
             current_size += len;
+            tracker.advance(len);
+            // Per-chunk progress events are intentionally NOT emitted here:
+            // the sampler emits both aggregate and per-part progress at a
+            // fixed cadence, which keeps the hot path cheap and the UI
+            // update rate predictable on fast networks.
+            if ctx.is_cancelled() {
+                let _ = file.flush().await;
+                return Err(OdlError::Cancelled);
+            }
         }
 
         file.flush().await?;
 
         if controller.downloaded() >= controller.limit() {
+            ctx.emit(ProgressEvent::PartFinished { ulid: ulid.clone() });
             return Ok(PartEvent::Completed(PartOutcome {
                 ulid,
                 final_size: controller.limit(),
@@ -846,7 +985,7 @@ async fn download_part(
         // The attempts counter may have been incremented in the branches above.
         // If no retry happened (shouldn't happen), increment to avoid infinite loop.
         attempts = attempts.saturating_add(1);
-        match retry_sleep_or_fail_part(&policy, attempts, attempts, &current_span, &ulid).await {
+        match retry_sleep_or_fail_part(&policy, attempts, attempts, &ctx, &ulid).await {
             Ok(()) => continue,
             Err(failed) => return Ok(failed),
         }
@@ -860,10 +999,14 @@ async fn retry_sleep_or_fail_part(
     policy: &FixedThenExponentialRetry,
     _attempts_for_policy: u32,
     attempts_display: u32,
-    span: &Span,
+    ctx: &DownloadContext,
     ulid: &str,
 ) -> Result<(), PartEvent> {
-    if wait_for_retry(policy, attempts_display, span).await {
+    ctx.emit(ProgressEvent::PartRetrying {
+        ulid: ulid.to_string(),
+        attempt: attempts_display,
+    });
+    if wait_for_retry(policy, attempts_display, ctx).await {
         Ok(())
     } else {
         Err(PartEvent::Failed {
@@ -882,8 +1025,6 @@ mod tests {
     use reqwest::Url;
     use tempfile::tempdir;
     use tokio::{fs, time};
-    use tracing_indicatif::IndicatifLayer;
-    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
     const TEST_FILENAME: &str = "test.bin";
 
@@ -969,9 +1110,9 @@ mod tests {
             metadata,
             reqwest::Client::builder().build()?,
             false,
-            Span::current(),
             None,
             FixedThenExponentialRetry::default(),
+            DownloadContext::new(),
         );
         let updated_metadata = downloader.run().await?;
 
@@ -997,13 +1138,6 @@ mod tests {
         fs::create_dir_all(&download_dir).await?;
         fs::create_dir_all(&save_dir).await?;
 
-        // Ensure an IndicatifLayer is registered so progress-bar methods have an effect
-        // in tests. Use `try_init()` and ignore the result so repeated test runs don't panic
-        // if a global subscriber is already set.
-        tracing_subscriber::registry()
-            .with(IndicatifLayer::new())
-            .init();
-
         let mut parts = HashMap::new();
         let original_size = MIN_DYNAMIC_SPLIT_SIZE * 4;
         parts.insert("orig".to_string(), make_part("orig", 0, original_size));
@@ -1018,25 +1152,21 @@ mod tests {
         )
         .await;
         let metadata = instruction.as_metadata();
-        let aggregator_span = info_span!("aggregator");
         let downloader = Downloader::new(
             Arc::clone(&instruction),
             metadata,
             reqwest::Client::builder().build()?,
             false,
-            aggregator_span.clone(),
             None,
             FixedThenExponentialRetry::default(),
+            DownloadContext::new(),
         );
-        // make eta larger than 1 min
-        aggregator_span.pb_start();
-        // Choose a large total length and a small progress so the computed ETA
-        // will be much larger than `MIN_DYNAMIC_SPLIT_ETA` (used by `split_task`).
-        aggregator_span.pb_set_length(120_000);
-        aggregator_span.pb_inc(1);
-        // give the progress bar a tiny moment to record elapsed time so ETA can be computed
+        // Seed tracker so it has computable ETA: pretend we made some progress.
+        downloader.tracker.set_total(Some(120_000));
+        downloader.tracker.advance(1);
+        // give tracker a tiny moment to record elapsed time so ETA can be computed
         time::sleep(Duration::from_millis(100)).await;
-        assert!(aggregator_span.pb_eta() > MIN_DYNAMIC_SPLIT_ETA);
+        assert!(downloader.tracker.eta() > MIN_DYNAMIC_SPLIT_ETA);
 
         let controller = Arc::new(PartController::new(original_size, 0));
         let candidate = SplitCandidate {
@@ -1078,9 +1208,9 @@ mod tests {
             metadata,
             reqwest::Client::builder().build()?,
             false,
-            Span::current(),
             None,
             FixedThenExponentialRetry::default(),
+            DownloadContext::new(),
         );
 
         let outcome = PartOutcome {
@@ -1136,10 +1266,11 @@ mod tests {
             part,
             controller,
             false,
-            Span::current(),
             None,
             None,
             FixedThenExponentialRetry::default(),
+            DownloadContext::new(),
+            Arc::new(ProgressTracker::new(Some(5))),
         )
         .await?;
 
