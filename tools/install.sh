@@ -6,6 +6,7 @@
 # Env:
 #   ODL_INSTALL_DIR  install directory (default: $HOME/.local/bin)
 #   ODL_VERSION      tag to install (default: latest)
+#   NO_COLOR         disable color output
 
 set -eu
 
@@ -29,19 +30,54 @@ EOF
   esac
 done
 
-err() { echo "error: $*" >&2; exit 1; }
+# UI helpers.
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  C_BOLD=$(printf '\033[1m')
+  C_DIM=$(printf '\033[2m')
+  C_CYAN=$(printf '\033[36m')
+  C_GREEN=$(printf '\033[32m')
+  C_RED=$(printf '\033[31m')
+  C_RESET=$(printf '\033[0m')
+else
+  C_BOLD= C_DIM= C_CYAN= C_GREEN= C_RED= C_RESET=
+fi
+step() { printf '%s==>%s %s%s%s\n' "$C_CYAN$C_BOLD" "$C_RESET" "$C_BOLD" "$*" "$C_RESET"; }
+info() { printf '    %s%s%s\n' "$C_DIM" "$*" "$C_RESET"; }
+ok()   { printf '%s✓%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+err()  { printf '%serror:%s %s\n' "$C_RED$C_BOLD" "$C_RESET" "$*" >&2; exit 1; }
+
 need() { command -v "$1" >/dev/null 2>&1 || err "missing required tool: $1"; }
 
-need uname
-need tar
+# Two download modes: silent fetch-to-stdout, and progress download-to-file.
 if command -v curl >/dev/null 2>&1; then
-  DL='curl -fsSL'
+  HAVE=curl
 elif command -v wget >/dev/null 2>&1; then
-  DL='wget -qO-'
+  HAVE=wget
 else
   err "need curl or wget"
 fi
 
+fetch() { # url -> stdout (silent, for small API responses)
+  case "$HAVE" in
+    curl) curl -fsSL "$1" ;;
+    wget) wget -qO- "$1" ;;
+  esac
+}
+download() { # url, out-path (with progress)
+  case "$HAVE" in
+    curl)
+      if [ -t 2 ]; then curl -fL --progress-bar -o "$2" "$1"
+      else curl -fsSL -o "$2" "$1"; fi ;;
+    wget)
+      if [ -t 2 ]; then wget --show-progress -q -O "$2" "$1"
+      else wget -q -O "$2" "$1"; fi ;;
+  esac
+}
+
+need uname
+need tar
+
+step "Detecting platform"
 OS="$(uname -s)"
 ARCH="$(uname -m)"
 
@@ -72,40 +108,49 @@ case "$OS" in
     ;;
   *) err "unsupported OS: $OS (use install.ps1 on windows)" ;;
 esac
+info "$OS / $ARCH → $TARGET"
 
+step "Resolving release"
 if [ "$VERSION" = latest ]; then
-  REL_JSON="$($DL "https://api.github.com/repos/$REPO/releases/latest")" \
+  REL_JSON="$(fetch "https://api.github.com/repos/$REPO/releases/latest")" \
     || err "failed to query latest release"
   TAG="$(printf '%s\n' "$REL_JSON" \
     | grep '"tag_name"' \
     | head -n1 \
     | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')"
   [ -n "$TAG" ] || err "could not resolve latest tag"
+  info "latest = $TAG"
 else
   TAG="$VERSION"
+  info "pinned = $TAG"
 fi
 
 ASSET="odl-${TAG}-${TARGET}.${ASSET_EXT}"
 URL="https://github.com/$REPO/releases/download/${TAG}/${ASSET}"
 
-echo "downloading $ASSET"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-$DL "$URL" > "$TMP/$ASSET" || err "download failed: $URL"
+step "Downloading $ASSET"
+info "$URL"
+download "$URL" "$TMP/$ASSET" || err "download failed: $URL"
+
+step "Extracting"
 tar -xzf "$TMP/$ASSET" -C "$TMP"
 
 BIN="$(find "$TMP" -type f -name odl -perm -u+x | head -n1)"
 [ -n "$BIN" ] || BIN="$(find "$TMP" -type f -name odl | head -n1)"
 [ -n "$BIN" ] || err "binary 'odl' not found in archive"
 
+step "Installing to $INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"
 install -m 0755 "$BIN" "$INSTALL_DIR/odl"
+ok "installed: $INSTALL_DIR/odl"
 
-echo "installed: $INSTALL_DIR/odl"
 case ":$PATH:" in
   *":$INSTALL_DIR:"*) ;;
-  *) echo "note: $INSTALL_DIR not in PATH. Add: export PATH=\"$INSTALL_DIR:\$PATH\"" ;;
+  *) info "note: $INSTALL_DIR not in PATH. Add: export PATH=\"$INSTALL_DIR:\$PATH\"" ;;
 esac
 
-"$INSTALL_DIR/odl" --version 2>/dev/null || true
+VER_OUT="$("$INSTALL_DIR/odl" --version 2>/dev/null || true)"
+[ -n "$VER_OUT" ] && info "$VER_OUT"
