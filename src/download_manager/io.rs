@@ -1,8 +1,9 @@
+use std::collections::VecDeque;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use futures::io;
 use prost::Message;
@@ -14,10 +15,18 @@ use crate::{
     download_metadata::{DownloadMetadata, PartDetails},
     error::OdlError,
     fs_utils::{atomic_write, set_file_mtime_async},
-    progress::{DownloadContext, Phase, ProgressEvent, SAMPLE_INTERVAL},
+    progress::{
+        DownloadContext, Phase, ProgressEvent, SAMPLE_INTERVAL, speed_window_rate,
+        trim_speed_window,
+    },
 };
 
 const COPY_BUF_SIZE: usize = 1024 * 1024;
+
+/// Sliding window length for the assembly speed sampler. Same rationale
+/// as `SPEED_WINDOW` in the downloader: bridges per-part `fetch_add`
+/// jitter so the rendered rate stays stable.
+const ASSEMBLY_SPEED_WINDOW: Duration = Duration::from_millis(1500);
 
 /// Synthetic ulid used for the assembly progress bar so consumers can
 /// render it as a regular child / part bar.
@@ -129,8 +138,10 @@ fn spawn_assembly_sampler(
     total: u64,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut last_at = Instant::now();
-        let mut last_bytes: u64 = 0;
+        // Sliding window keeps the displayed assembly speed stable
+        // across the bursty per-part `done.fetch_add` cadence.
+        let mut window: VecDeque<(Instant, u64)> = VecDeque::new();
+        window.push_back((Instant::now(), 0));
         loop {
             tokio::select! {
                 _ = ctx.cancel.cancelled() => return,
@@ -138,10 +149,9 @@ fn spawn_assembly_sampler(
             }
             let now = Instant::now();
             let cur = done.load(Ordering::Relaxed);
-            let dt = now.saturating_duration_since(last_at).as_secs_f64();
-            if dt > 0.0 {
-                let delta = cur.saturating_sub(last_bytes);
-                let rate = delta as f64 / dt;
+            window.push_back((now, cur));
+            trim_speed_window(&mut window, now, ASSEMBLY_SPEED_WINDOW);
+            if let Some(rate) = speed_window_rate(&window) {
                 ctx.emit(ProgressEvent::Speed {
                     bytes_per_second: rate,
                 });
@@ -159,8 +169,6 @@ fn spawn_assembly_sampler(
                 downloaded: cur,
                 total,
             });
-            last_at = now;
-            last_bytes = cur;
         }
     })
 }

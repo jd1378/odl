@@ -250,6 +250,44 @@ impl std::fmt::Debug for DownloadContext {
     }
 }
 
+/// Drop entries from the front of `window` whose timestamps are older
+/// than `SPEED_WINDOW_LEN` relative to `now`. Always retains at least
+/// the most recent entry so a rate can still be derived once a second
+/// sample arrives.
+pub(crate) fn trim_speed_window(
+    window: &mut std::collections::VecDeque<(Instant, u64)>,
+    now: Instant,
+    window_len: Duration,
+) {
+    while window.len() > 1 {
+        let Some(&(t, _)) = window.front() else {
+            break;
+        };
+        if now.saturating_duration_since(t) > window_len {
+            window.pop_front();
+        } else {
+            break;
+        }
+    }
+}
+
+/// Average rate (bytes/sec) across the samples currently in `window`.
+/// Returns `None` when there is not enough span to compute a rate.
+pub(crate) fn speed_window_rate(
+    window: &std::collections::VecDeque<(Instant, u64)>,
+) -> Option<f64> {
+    if window.len() < 2 {
+        return None;
+    }
+    let (t0, b0) = *window.front()?;
+    let (t1, b1) = *window.back()?;
+    let dt = t1.saturating_duration_since(t0).as_secs_f64();
+    if dt <= 0.0 {
+        return None;
+    }
+    Some(b1.saturating_sub(b0) as f64 / dt)
+}
+
 /// Internal aggregate progress tracker used by the downloader to drive
 /// dynamic-split decisions without depending on tracing-indicatif.
 ///

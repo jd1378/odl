@@ -22,7 +22,10 @@ use ulid::Ulid;
 
 use prost::Message;
 
-use crate::progress::{DownloadContext, ProgressEvent, ProgressTracker, SAMPLE_INTERVAL};
+use crate::progress::{
+    DownloadContext, ProgressEvent, ProgressTracker, SAMPLE_INTERVAL, speed_window_rate,
+    trim_speed_window,
+};
 use crate::retry_policies::{FixedThenExponentialRetry, wait_for_retry};
 use crate::{
     download::Download,
@@ -31,6 +34,13 @@ use crate::{
     error::{MetadataError, OdlError},
     user_agents::random_user_agent,
 };
+
+/// Sliding window length used by the speed sampler. Chosen long enough
+/// to bridge normal chunk-arrival jitter (TCP windowing, head-of-line
+/// reads on a multiplexed connection) so the rendered rate stays
+/// stable, short enough to react quickly when the network actually
+/// changes.
+const SPEED_WINDOW: Duration = Duration::from_millis(1500);
 
 /// Minimum chunk size we keep on a single task before attempting another split.
 const MIN_DYNAMIC_SPLIT_SIZE: u64 = 3 * 1024 * 1024; // 3 MB
@@ -162,23 +172,26 @@ impl Downloader {
         let ctx = self.ctx.clone();
         let active = Arc::clone(&self.active_parts);
         tokio::spawn(async move {
-            let mut last_at = Instant::now();
-            let mut last_bytes = tracker.downloaded();
-            let mut last_part_bytes: HashMap<String, u64> = HashMap::new();
+            // Sliding window of (timestamp, cumulative_bytes) snapshots.
+            // Speed is computed across the whole window so chunk-arrival
+            // jitter at the 125 ms tick boundary doesn't pulse the
+            // displayed rate down to 0 between bursts.
+            let mut agg_window: VecDeque<(std::time::Instant, u64)> = VecDeque::new();
+            let mut part_windows: HashMap<String, VecDeque<(std::time::Instant, u64)>> =
+                HashMap::new();
+            agg_window.push_back((std::time::Instant::now(), tracker.downloaded()));
             loop {
                 tokio::select! {
                     _ = ctx.cancel.cancelled() => return,
                     _ = time::sleep(SAMPLE_INTERVAL) => {}
                 }
-                let now = Instant::now();
+                let now = std::time::Instant::now();
                 let cur = tracker.downloaded();
-                let dt = now.saturating_duration_since(last_at).as_secs_f64();
-                if dt > 0.0 {
-                    // Raw window rate. No EWMA, no long-window averaging:
-                    // reacts immediately to network changes and resumes.
-                    let delta = cur.saturating_sub(last_bytes);
+                agg_window.push_back((now, cur));
+                trim_speed_window(&mut agg_window, now, SPEED_WINDOW);
+                if let Some(bps) = speed_window_rate(&agg_window) {
                     ctx.emit(ProgressEvent::Speed {
-                        bytes_per_second: delta as f64 / dt,
+                        bytes_per_second: bps,
                     });
                 }
                 ctx.emit(ProgressEvent::Progress {
@@ -194,16 +207,17 @@ impl Downloader {
                         .map(|(k, v)| (k.clone(), Arc::clone(v)))
                         .collect()
                 };
-                let mut new_part_bytes = HashMap::with_capacity(snapshot.len());
+                let mut seen_parts = std::collections::HashSet::with_capacity(snapshot.len());
                 for (ulid, controller) in snapshot {
                     let part_cur = controller.downloaded();
                     let part_lim = controller.limit();
-                    if dt > 0.0 {
-                        let prev = last_part_bytes.get(&ulid).copied().unwrap_or(part_cur);
-                        let delta = part_cur.saturating_sub(prev);
+                    let win = part_windows.entry(ulid.clone()).or_default();
+                    win.push_back((now, part_cur));
+                    trim_speed_window(win, now, SPEED_WINDOW);
+                    if let Some(bps) = speed_window_rate(win) {
                         ctx.emit(ProgressEvent::PartSpeed {
                             ulid: ulid.clone(),
-                            bytes_per_second: delta as f64 / dt,
+                            bytes_per_second: bps,
                         });
                     }
                     ctx.emit(ProgressEvent::PartProgress {
@@ -211,12 +225,12 @@ impl Downloader {
                         downloaded: part_cur,
                         total: part_lim,
                     });
-                    new_part_bytes.insert(ulid, part_cur);
+                    seen_parts.insert(ulid);
                 }
-                last_part_bytes = new_part_bytes;
-
-                last_at = now;
-                last_bytes = cur;
+                // Drop windows for parts no longer active so the map
+                // doesn't grow unbounded across long downloads with
+                // dynamic splits.
+                part_windows.retain(|k, _| seen_parts.contains(k));
             }
         })
     }
