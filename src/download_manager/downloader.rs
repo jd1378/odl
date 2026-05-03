@@ -6,14 +6,14 @@ use std::{
     },
 };
 
+use bytes::Bytes;
 use reqwest::{
     Client,
     header::{HeaderValue, RANGE, USER_AGENT},
 };
 use tokio::{
     fs,
-    io::{AsyncSeekExt, AsyncWriteExt, BufWriter},
-    sync::{Mutex, Notify},
+    sync::{Mutex, Notify, mpsc},
     task::JoinSet,
     time::{self, Duration, Instant},
 };
@@ -785,6 +785,106 @@ impl LimiterState {
     }
 }
 
+/// Buffer size for the per-part writer thread. Doubled from tokio's
+/// default `BufWriter` (8 KiB) so the underlying `WriteFile` syscall
+/// rate roughly halves without inflating crash-loss bounds.
+const PART_WRITER_BUF_SIZE: usize = 16 * 1024;
+
+/// Bound on the in-flight chunk channel between the async receive loop
+/// and the blocking writer thread. Provides backpressure: if the writer
+/// can't keep up the receiver awaits, throttling the network read.
+///
+/// Per-part memory ceiling is roughly `PART_WRITER_CHANNEL_CAP *
+/// max_chunk_size` (reqwest chunks are typically ≤ 16 KiB → ~1 MiB per
+/// part), multiplied by the number of concurrently downloading parts.
+const PART_WRITER_CHANNEL_CAP: usize = 64;
+
+/// Owns a dedicated blocking thread that drains chunks from `tx` and
+/// writes them to a `std::fs::File` via a large `BufWriter`. This keeps
+/// file IO entirely off the async runtime — no `tokio::fs` `spawn_blocking`
+/// hop per chunk — which on Windows is the dominant cost (each
+/// `tokio::fs` call is a thread bounce; with thousands of small chunks
+/// per second across multiple parts the blocking pool serializes the
+/// hot path).
+struct PartFileWriter {
+    tx: Option<mpsc::Sender<Bytes>>,
+    handle: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
+}
+
+impl PartFileWriter {
+    /// Open the part file, seek to end (resume), and start the writer thread.
+    async fn open(part_path: std::path::PathBuf) -> std::io::Result<Self> {
+        let file = tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
+            use std::io::Seek;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(&part_path)?;
+            f.seek(std::io::SeekFrom::End(0))?;
+            Ok(f)
+        })
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))??;
+
+        let (tx, mut rx) = mpsc::channel::<Bytes>(PART_WRITER_CHANNEL_CAP);
+        let handle = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            use std::io::Write;
+            let mut writer = std::io::BufWriter::with_capacity(PART_WRITER_BUF_SIZE, file);
+            while let Some(chunk) = rx.blocking_recv() {
+                writer.write_all(&chunk)?;
+            }
+            writer.flush()?;
+            Ok(())
+        });
+
+        Ok(Self {
+            tx: Some(tx),
+            handle: Some(handle),
+        })
+    }
+
+    async fn write(&mut self, chunk: Bytes) -> std::io::Result<()> {
+        let tx = self
+            .tx
+            .as_ref()
+            .expect("PartFileWriter::write after finish");
+        if tx.send(chunk).await.is_err() {
+            // Writer thread ended (likely an IO error). Surface it via finish.
+            return self.finish().await;
+        }
+        Ok(())
+    }
+
+    /// Close the channel and await the writer thread, returning any IO
+    /// error it produced. Safe to call multiple times; subsequent calls
+    /// are no-ops.
+    async fn finish(&mut self) -> std::io::Result<()> {
+        self.tx.take();
+        if let Some(h) = self.handle.take() {
+            match h.await {
+                Ok(r) => r,
+                Err(e) => Err(std::io::Error::other(e.to_string())),
+            }
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for PartFileWriter {
+    fn drop(&mut self) {
+        // All exit paths in `download_part` are expected to call `finish().await`
+        // so that any IO error from the writer thread is surfaced rather than
+        // swallowed. Dropping with `tx`/`handle` still set means a path was
+        // missed — flag in debug builds.
+        debug_assert!(
+            self.tx.is_none() && self.handle.is_none(),
+            "PartFileWriter dropped without finish(); writer thread errors will be swallowed"
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn download_part(
     client: Arc<Client>,
@@ -815,32 +915,16 @@ async fn download_part(
         // Recompute current size (in case previous attempts wrote some bytes)
         current_size = controller.downloaded();
 
-        // Open file for this attempt. Use plain write+create (no `append`) and
-        // seek to end once: only one writer per part, so we don't need
-        // O_APPEND atomicity, and on Windows `FILE_APPEND_DATA` makes the
-        // kernel re-resolve EOF on every WriteFile, throttling throughput.
-        // We open the file early (even for zero-length parts) so that an
-        // empty part file exists on disk — callers expect part files to be
-        // present when assembling.
-        let file_open = tokio::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&part_path)
-            .await;
-        let mut file = match file_open {
-            Ok(mut f) => {
-                if let Err(e) = f.seek(std::io::SeekFrom::End(0)).await {
-                    return Err(OdlError::StdIoError {
-                        e,
-                        extra_info: Some(format!(
-                            "Failed to seek to end of part file {}",
-                            part_path.display()
-                        )),
-                    });
-                }
-                BufWriter::new(f)
-            }
+        // Open file for this attempt. We delegate all IO to a dedicated
+        // blocking writer thread (`PartFileWriter`) to keep file writes
+        // entirely off the async runtime — on Windows each `tokio::fs`
+        // call is a thread bounce, and with thousands of small chunks
+        // per second the blocking pool serializes the hot path.
+        // No `append`: only one writer per part, so O_APPEND atomicity
+        // is unneeded, and Windows `FILE_APPEND_DATA` re-resolves EOF on
+        // every WriteFile. Seek-to-end once on open handles resume.
+        let mut file = match PartFileWriter::open(part_path.clone()).await {
+            Ok(w) => w,
             Err(e) => {
                 return Err(OdlError::StdIoError {
                     e,
@@ -894,7 +978,7 @@ async fn download_part(
             // send timed out
             Err(_) => {
                 // flush any partial progress to disk before retrying
-                file.flush().await?;
+                file.finish().await?;
                 match retry_sleep_or_fail_part(&policy, attempts, attempts + 1, &ctx, &ulid).await {
                     Ok(()) => {
                         attempts = attempts.saturating_add(1);
@@ -919,7 +1003,7 @@ async fn download_part(
                     Ok(opt) => opt,
                     Err(_e) => {
                         // network/body error -> consider retrying
-                        file.flush().await?;
+                        file.finish().await?;
                         match retry_sleep_or_fail_part(&policy, attempts, attempts + 1, &ctx, &ulid)
                             .await
                         {
@@ -933,7 +1017,7 @@ async fn download_part(
                 },
                 Err(_) => {
                     // timeout reading chunk -> retry according to policy
-                    file.flush().await?;
+                    file.finish().await?;
                     match retry_sleep_or_fail_part(&policy, attempts, attempts + 1, &ctx, &ulid)
                         .await
                     {
@@ -975,12 +1059,12 @@ async fn download_part(
                 tokio::select! {
                     _ = limiter.acquire(len) => {}
                     _ = ctx.cancel.cancelled() => {
-                        let _ = file.flush().await;
+                        let _ = file.finish().await;
                         return Err(OdlError::Cancelled);
                     }
                 }
             }
-            file.write_all(&chunk).await?;
+            file.write(chunk).await?;
             controller.record_progress(len);
             tracker.advance(len);
             // Per-chunk progress events are intentionally NOT emitted here:
@@ -988,12 +1072,12 @@ async fn download_part(
             // fixed cadence, which keeps the hot path cheap and the UI
             // update rate predictable on fast networks.
             if ctx.is_cancelled() {
-                let _ = file.flush().await;
+                let _ = file.finish().await;
                 return Err(OdlError::Cancelled);
             }
         }
 
-        file.flush().await?;
+        file.finish().await?;
 
         if controller.downloaded() >= controller.limit() {
             ctx.emit(ProgressEvent::PartFinished { ulid: ulid.clone() });

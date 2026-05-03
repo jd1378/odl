@@ -1371,11 +1371,12 @@ dependencies = [
 
 [[package]]
 name = "odl"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "async-trait",
  "atomicwrites",
  "base64",
+ "bytes",
  "chrono",
  "clap",
  "derive_builder",
