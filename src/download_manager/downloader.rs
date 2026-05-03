@@ -785,10 +785,21 @@ impl LimiterState {
     }
 }
 
-/// Buffer size for the per-part writer thread. Doubled from tokio's
-/// default `BufWriter` (8 KiB) so the underlying `WriteFile` syscall
-/// rate roughly halves without inflating crash-loss bounds.
-const PART_WRITER_BUF_SIZE: usize = 16 * 1024;
+/// Buffer size for the per-part writer thread.
+///
+/// On Windows we use 256 KiB: each `WriteFile` re-enters the kernel and
+/// passes through filter drivers (Defender, EDR, indexer), so a small
+/// buffer at high throughput burns measurable CPU. 256 KiB cuts syscall
+/// rate ~16× vs 16 KiB while keeping crash-loss bounded.
+///
+/// On Unix the page cache absorbs small writes cheaply (no per-write
+/// filter pipeline), so we use 32 KiB (4× tokio's `BufWriter` default
+/// of 8 KiB) — enough to coalesce most chunks while keeping crash-loss
+/// tighter than the Windows value.
+#[cfg(windows)]
+const PART_WRITER_BUF_SIZE: usize = 256 * 1024;
+#[cfg(not(windows))]
+const PART_WRITER_BUF_SIZE: usize = 32 * 1024;
 
 /// Bound on the in-flight chunk channel between the async receive loop
 /// and the blocking writer thread. Provides backpressure: if the writer
