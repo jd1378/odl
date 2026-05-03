@@ -12,7 +12,7 @@ use reqwest::{
 };
 use tokio::{
     fs,
-    io::{AsyncWriteExt, BufWriter},
+    io::{AsyncSeekExt, AsyncWriteExt, BufWriter},
     sync::{Mutex, Notify},
     task::JoinSet,
     time::{self, Duration, Instant},
@@ -815,16 +815,32 @@ async fn download_part(
         // Recompute current size (in case previous attempts wrote some bytes)
         current_size = controller.downloaded();
 
-        // Open file for this attempt (append so we resume). We open the file
-        // early (even for zero-length parts) so that an empty part file exists
-        // on disk — callers expect part files to be present when assembling.
+        // Open file for this attempt. Use plain write+create (no `append`) and
+        // seek to end once: only one writer per part, so we don't need
+        // O_APPEND atomicity, and on Windows `FILE_APPEND_DATA` makes the
+        // kernel re-resolve EOF on every WriteFile, throttling throughput.
+        // We open the file early (even for zero-length parts) so that an
+        // empty part file exists on disk — callers expect part files to be
+        // present when assembling.
         let file_open = tokio::fs::OpenOptions::new()
             .create(true)
-            .append(true)
+            .write(true)
+            .truncate(false)
             .open(&part_path)
             .await;
         let mut file = match file_open {
-            Ok(f) => BufWriter::new(f),
+            Ok(mut f) => {
+                if let Err(e) = f.seek(std::io::SeekFrom::End(0)).await {
+                    return Err(OdlError::StdIoError {
+                        e,
+                        extra_info: Some(format!(
+                            "Failed to seek to end of part file {}",
+                            part_path.display()
+                        )),
+                    });
+                }
+                BufWriter::new(f)
+            }
             Err(e) => {
                 return Err(OdlError::StdIoError {
                     e,
