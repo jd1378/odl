@@ -1520,14 +1520,13 @@ mod tests {
         use base64::Engine;
         use sha2::{Digest, Sha256};
 
-        use rand::{RngCore, SeedableRng, rngs::StdRng};
+        use rand::{RngExt, SeedableRng, rngs::StdRng};
 
         // 900 KiB → with MIN_PART_SIZE = 300 KiB and max_connections = 3
         // determine_parts produces exactly 3 contiguous parts of 300 KiB each.
         let size: usize = 900 * 1024;
         let mut rng = StdRng::seed_from_u64(0x00C0_FFEE_F00D);
-        let mut file_content = vec![0u8; size];
-        rng.fill_bytes(&mut file_content);
+        let file_content: Vec<u8> = (0..size).map(|_| rng.random()).collect();
 
         let mut hasher = Sha256::new();
         hasher.update(&file_content);

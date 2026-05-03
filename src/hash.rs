@@ -3,9 +3,18 @@ use digest::Digest;
 use md5::Md5;
 use sha1::Sha1;
 use sha2::{Sha256, Sha384, Sha512};
+use std::fmt::Write as _;
 use tokio::io::{self as async_io, AsyncRead, AsyncReadExt};
 
 use crate::download_metadata::{ChecksumAlgorithm, ChecksumEncoding, FileChecksum};
+
+fn to_hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{:02x}", b);
+    }
+    s
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HashDigest {
@@ -44,7 +53,7 @@ impl HashDigest {
                 let hasher = Self::hash_reader::<Md5>(reader).await?;
                 let bytes = hasher.finalize();
                 let s = match encoding {
-                    HashEncoding::Hex => format!("{:x}", bytes),
+                    HashEncoding::Hex => to_hex(&bytes),
                     HashEncoding::Base64 => general_purpose::STANDARD.encode(bytes),
                 };
                 Ok(HashDigest::MD5(s, encoding))
@@ -53,7 +62,7 @@ impl HashDigest {
                 let hasher = Self::hash_reader::<Sha1>(reader).await?;
                 let bytes = hasher.finalize();
                 let s = match encoding {
-                    HashEncoding::Hex => format!("{:x}", bytes),
+                    HashEncoding::Hex => to_hex(&bytes),
                     HashEncoding::Base64 => general_purpose::STANDARD.encode(bytes),
                 };
                 Ok(HashDigest::SHA1(s, encoding))
@@ -62,7 +71,7 @@ impl HashDigest {
                 let hasher = Self::hash_reader::<Sha256>(reader).await?;
                 let bytes = hasher.finalize();
                 let s = match encoding {
-                    HashEncoding::Hex => format!("{:x}", bytes),
+                    HashEncoding::Hex => to_hex(&bytes),
                     HashEncoding::Base64 => general_purpose::STANDARD.encode(bytes),
                 };
                 Ok(HashDigest::SHA256(s, encoding))
@@ -71,7 +80,7 @@ impl HashDigest {
                 let hasher = Self::hash_reader::<Sha384>(reader).await?;
                 let bytes = hasher.finalize();
                 let s = match encoding {
-                    HashEncoding::Hex => format!("{:x}", bytes),
+                    HashEncoding::Hex => to_hex(&bytes),
                     HashEncoding::Base64 => general_purpose::STANDARD.encode(bytes),
                 };
                 Ok(HashDigest::SHA384(s, encoding))
@@ -80,7 +89,7 @@ impl HashDigest {
                 let hasher = Self::hash_reader::<Sha512>(reader).await?;
                 let bytes = hasher.finalize();
                 let s = match encoding {
-                    HashEncoding::Hex => format!("{:x}", bytes),
+                    HashEncoding::Hex => to_hex(&bytes),
                     HashEncoding::Base64 => general_purpose::STANDARD.encode(bytes),
                 };
                 Ok(HashDigest::SHA512(s, encoding))
