@@ -701,7 +701,7 @@ enum PartEvent {
 
 struct BandwidthLimiter {
     rate: f64,
-    state: Mutex<LimiterState>,
+    state: std::sync::Mutex<LimiterState>,
     seq: AtomicU64,
 }
 
@@ -711,12 +711,33 @@ struct LimiterState {
     queue: VecDeque<u64>,
 }
 
+/// Removes our sequence number from the FIFO queue if the acquire future
+/// is dropped before consuming tokens (e.g. cancelled by `tokio::select!`).
+/// Without this guard a cancelled acquire leaves a zombie seq at the head
+/// of the queue, blocking every subsequent acquirer forever and stalling
+/// throughput to zero.
+struct QueueGuard<'a> {
+    limiter: &'a BandwidthLimiter,
+    seq: u64,
+    consumed: bool,
+}
+
+impl Drop for QueueGuard<'_> {
+    fn drop(&mut self) {
+        if !self.consumed
+            && let Ok(mut state) = self.limiter.state.lock()
+        {
+            state.queue.retain(|&s| s != self.seq);
+        }
+    }
+}
+
 impl BandwidthLimiter {
     fn new(bytes_per_second: u64) -> Self {
         let rate = bytes_per_second.max(1) as f64;
         Self {
             rate,
-            state: Mutex::new(LimiterState {
+            state: std::sync::Mutex::new(LimiterState {
                 available: rate,
                 last_refill: Instant::now(),
                 queue: VecDeque::new(),
@@ -725,46 +746,62 @@ impl BandwidthLimiter {
         }
     }
 
+    /// Acquire `amount` tokens, blocking via async sleeps until granted.
+    /// Requests larger than the bucket capacity are split into rate-sized
+    /// sub-acquires so an oversized chunk never deadlocks against the
+    /// `available <= rate` cap.
     async fn acquire(&self, amount: u64) {
-        let amount = amount as f64;
+        let chunk_cap = self.rate as u64;
+        let mut remaining = amount;
+        while remaining > 0 {
+            let take = remaining.min(chunk_cap);
+            self.acquire_one(take).await;
+            remaining -= take;
+        }
+    }
 
-        // Get a sequence number and enqueue ourselves to ensure FIFO fairness.
+    async fn acquire_one(&self, amount: u64) {
+        let amount_f = amount as f64;
+
         let my_seq = self.seq.fetch_add(1, Ordering::SeqCst);
         {
-            let mut state = self.state.lock().await;
+            let mut state = self.state.lock().expect("limiter mutex poisoned");
             state.queue.push_back(my_seq);
         }
 
+        let mut guard = QueueGuard {
+            limiter: self,
+            seq: my_seq,
+            consumed: false,
+        };
+
         loop {
-            let mut state = self.state.lock().await;
-            state.refill(self.rate);
+            let sleep_duration = {
+                let mut state = self.state.lock().expect("limiter mutex poisoned");
+                state.refill(self.rate);
 
-            // If we're at the front of the queue and enough tokens are available, consume and go.
-            if let Some(&front) = state.queue.front()
-                && front == my_seq
-                && state.available >= amount
-            {
-                state.available -= amount;
-                state.queue.pop_front();
-                return;
-            }
+                if let Some(&front) = state.queue.front()
+                    && front == my_seq
+                    && state.available >= amount_f
+                {
+                    state.available -= amount_f;
+                    state.queue.pop_front();
+                    guard.consumed = true;
+                    return;
+                }
 
-            // Compute a sensible sleep time. If there's a deficit for our request, wait
-            // the time required to refill that deficit. Otherwise yield to the scheduler
-            // to let the front of the queue make progress without waiting real time.
-            let sleep_duration = if state.available < amount {
-                let deficit = amount - state.available;
-                let wait_secs = deficit / self.rate;
-                let dur = match Duration::try_from_secs_f64(wait_secs) {
-                    Ok(d) => d.max(Duration::from_millis(1)),
-                    Err(_) => Duration::from_millis(1),
-                };
-                Some(dur)
-            } else {
-                None
+                if state.available < amount_f {
+                    let deficit = amount_f - state.available;
+                    let wait_secs = deficit / self.rate;
+                    match Duration::try_from_secs_f64(wait_secs) {
+                        Ok(d) => Some(d.max(Duration::from_millis(1))),
+                        Err(_) => Some(Duration::from_millis(1)),
+                    }
+                } else {
+                    None
+                }
             };
 
-            drop(state);
             if let Some(dur) = sleep_duration {
                 time::sleep(dur).await;
             } else {
@@ -1427,5 +1464,40 @@ mod tests {
 
         time::advance(Duration::from_millis(200)).await;
         assert!(second.as_mut().now_or_never().is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_bandwidth_limiter_dropped_acquire_does_not_block_queue() {
+        // Drain the initial bucket so the next acquire must wait.
+        let limiter = BandwidthLimiter::new(1024);
+        limiter.acquire(1024).await;
+
+        // Start an acquire, poll once to enqueue the seq, then drop it
+        // (simulating tokio::select! cancellation). Without the QueueGuard
+        // this leaves a zombie at the head of the queue.
+        {
+            let pending = limiter.acquire(1024);
+            tokio::pin!(pending);
+            assert!(pending.as_mut().now_or_never().is_none());
+        }
+
+        // After enough refill, a fresh acquire must complete; if the
+        // dropped seq were still in the queue, this would hang.
+        time::advance(Duration::from_millis(1100)).await;
+        let third = limiter.acquire(1024);
+        tokio::pin!(third);
+        assert!(third.as_mut().now_or_never().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_bandwidth_limiter_handles_amount_larger_than_rate() {
+        // Chunk larger than the per-second rate must not deadlock against
+        // the bucket capacity cap; acquire splits it into sub-acquires.
+        let limiter = Arc::new(BandwidthLimiter::new(8192));
+        // 32 KiB at 8 KiB/s → ~3s. Bound test under a generous timeout to
+        // catch deadlocks without flaking on slow CI.
+        tokio::time::timeout(Duration::from_secs(10), limiter.acquire(32 * 1024))
+            .await
+            .expect("acquire must not deadlock for amount > rate");
     }
 }
