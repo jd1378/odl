@@ -934,6 +934,7 @@ async fn download_part(
         };
 
         if current_size >= target_size {
+            file.finish().await?;
             ctx.emit(ProgressEvent::PartFinished { ulid: ulid.clone() });
             return Ok(PartEvent::Completed(PartOutcome {
                 ulid,
@@ -947,6 +948,7 @@ async fn download_part(
         let range_value = match HeaderValue::from_str(&range_header) {
             Ok(v) => v,
             Err(e) => {
+                let _ = file.finish().await;
                 return Err(OdlError::Other {
                     message: "Internal Error: Invalid range header".to_string(),
                     origin: Box::new(e),
@@ -967,6 +969,7 @@ async fn download_part(
             Ok(Ok(r)) => r,
             // request completed but returned an error (network error)
             Ok(Err(_e)) => {
+                file.finish().await?;
                 match retry_sleep_or_fail_part(&policy, attempts, attempts + 1, &ctx, &ulid).await {
                     Ok(()) => {
                         attempts = attempts.saturating_add(1);
