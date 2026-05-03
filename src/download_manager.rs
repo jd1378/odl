@@ -319,6 +319,22 @@ impl DownloadManager {
         if let Some(timeout) = &self.config.connect_timeout {
             client = client.connect_timeout(*timeout);
         }
+        if !self.config.http2 {
+            // Force HTTP/1.1: each part opens its own TCP connection, getting
+            // an independent receive window. h2 multiplexes all parts on a
+            // single TCP, whose per-stream/connection flow-control windows
+            // can throttle high-bandwidth downloads (notably on Windows).
+            client = client.http1_only();
+        } else {
+            // Bump h2 flow-control windows above the 64 KiB default so a
+            // single TCP can fill the bandwidth-delay product on
+            // high-latency / high-bandwidth links, and let the adaptive
+            // window grow further as needed.
+            client = client
+                .http2_initial_stream_window_size(8 * 1024 * 1024)
+                .http2_initial_connection_window_size(16 * 1024 * 1024)
+                .http2_adaptive_window(true);
+        }
         Ok(client.build()?)
     }
 

@@ -35,6 +35,7 @@ mod defaults {
     pub fn default_speed_limit() -> Option<u64> { None }
     pub fn default_connect_timeout() -> Option<Duration> { Some(Duration::from_secs(5)) }
     pub fn default_headers() -> Option<indexmap::IndexMap<String, String>> { None }
+    pub fn default_http2() -> bool { false }
 }
 
 use defaults::*;
@@ -129,6 +130,14 @@ pub struct Config {
     /// Accept = "application/json"
     #[serde(default = "default_headers")]
     pub headers: Option<indexmap::IndexMap<String, String>>,
+
+    /// Enable HTTP/2 over ALPN. Default `false` (HTTP/1.1 only).
+    /// HTTP/1.1 opens a separate TCP connection per part, giving each
+    /// part an independent receive window — important on Windows where
+    /// h2's per-stream/connection flow-control windows on a single TCP
+    /// can throttle high-bandwidth downloads.
+    #[serde(default = "default_http2")]
+    pub http2: bool,
 }
 
 impl Default for Config {
@@ -149,6 +158,7 @@ impl Default for Config {
             speed_limit: default_speed_limit(),
             connect_timeout: default_connect_timeout(),
             headers: default_headers(),
+            http2: default_http2(),
         }
     }
 }

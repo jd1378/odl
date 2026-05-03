@@ -383,6 +383,7 @@ async fn main() -> Result<(), OdlError> {
                 timeout,
                 use_server_time,
                 accept_invalid_certs,
+                http2,
             } => {
                 // determine directory where config is stored
                 let config_path = if let Some(c) = config_file {
@@ -451,6 +452,9 @@ async fn main() -> Result<(), OdlError> {
                 }
                 if let Some(v) = accept_invalid_certs {
                     cfg.accept_invalid_certs = *v;
+                }
+                if let Some(v) = http2 {
+                    cfg.http2 = *v;
                 }
 
                 match cfg.save_to_file(&config_path).await {
@@ -676,6 +680,7 @@ async fn build_download_manager(args: &Args) -> Result<DownloadManager, OdlError
     let accept_invalid_certs = args
         .accept_invalid_certs
         .unwrap_or(cfg.accept_invalid_certs);
+    let http2 = args.http2.unwrap_or(cfg.http2);
     let speed_limit = args.speed_limit.or(cfg.speed_limit);
     let connect_timeout = args.timeout.or(cfg.connect_timeout).and_then(|d| {
         let secs = d.as_secs_f64();
@@ -700,6 +705,7 @@ async fn build_download_manager(args: &Args) -> Result<DownloadManager, OdlError
         .proxy(proxy_str)
         .use_server_time(use_server_time)
         .accept_invalid_certs(accept_invalid_certs)
+        .http2(http2)
         .speed_limit(speed_limit);
 
     // always set download_dir from args or fallback to config

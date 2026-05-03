@@ -195,6 +195,13 @@ pub struct Args {
     #[arg(long)]
     pub accept_invalid_certs: Option<bool>,
 
+    /// Enable HTTP/2 (default: HTTP/1.1 only). HTTP/1.1 opens a separate
+    /// TCP connection per part, which usually yields higher throughput
+    /// on high-bandwidth links — especially on Windows where h2's
+    /// flow-control windows on a single TCP can throttle downloads.
+    #[arg(long)]
+    pub http2: Option<bool>,
+
     /// Custom HTTP headers to include in each request. Specify as `KEY:VALUE`.
     #[arg(long = "header", value_name = "KEY:VALUE", num_args = 0.., action = clap::ArgAction::Append)]
     pub headers: Vec<String>,
@@ -290,6 +297,10 @@ pub enum Commands {
         /// Accept invalid certs
         #[arg(long)]
         accept_invalid_certs: Option<bool>,
+
+        /// Enable HTTP/2 (default: HTTP/1.1 only).
+        #[arg(long)]
+        http2: Option<bool>,
     },
 }
 
