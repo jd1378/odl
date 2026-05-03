@@ -330,10 +330,7 @@ impl DownloadManager {
             // single TCP can fill the bandwidth-delay product on
             // high-latency / high-bandwidth links, and let the adaptive
             // window grow further as needed.
-            client = client
-                .http2_initial_stream_window_size(8 * 1024 * 1024)
-                .http2_initial_connection_window_size(16 * 1024 * 1024)
-                .http2_adaptive_window(true);
+            client = client.http2_adaptive_window(true);
         }
         Ok(client.build()?)
     }
