@@ -922,14 +922,14 @@ impl PartFileWriter {
 
 impl Drop for PartFileWriter {
     fn drop(&mut self) {
-        // All exit paths in `download_part` are expected to call `finish().await`
-        // so that any IO error from the writer thread is surfaced rather than
-        // swallowed. Dropping with `tx`/`handle` still set means a path was
-        // missed — flag in debug builds.
-        debug_assert!(
-            self.tx.is_none() && self.handle.is_none(),
-            "PartFileWriter dropped without finish(); writer thread errors will be swallowed"
-        );
+        // Best-effort cleanup when the future is dropped without an explicit
+        // `finish().await` (e.g. task cancelled mid-await on pause / cancel /
+        // shutdown). Dropping `tx` closes the channel so the writer thread
+        // drains pending chunks, flushes, and exits. The join handle is left
+        // to complete in the background; any IO error it produces is
+        // unobservable here, which is acceptable on the cancellation path.
+        self.tx.take();
+        self.handle.take();
     }
 }
 
