@@ -63,6 +63,44 @@ const STALE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(test)]
 const STALE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Controls staggered opening of new connections. Some servers cap
+/// sudden bursts of simultaneous connections per IP, dropping or
+/// resetting the excess. When `enabled`, the downloader opens at most
+/// `batch_size` new connections per round and waits a random delay in
+/// `[delay_min, delay_max]` before opening the next round.
+#[derive(Debug, Clone, Copy)]
+pub struct RampupConfig {
+    pub enabled: bool,
+    pub batch_size: u64,
+    pub delay_min: Duration,
+    pub delay_max: Duration,
+}
+
+fn sample_rampup_delay(min: Duration, max: Duration) -> Duration {
+    use rand::RngExt;
+    if max <= min {
+        return min;
+    }
+    let lo = min.as_nanos().min(u64::MAX as u128) as u64;
+    let hi = max.as_nanos().min(u64::MAX as u128) as u64;
+    let n = rand::rng().random_range(lo..=hi);
+    Duration::from_nanos(n)
+}
+
+impl RampupConfig {
+    /// Helper for tests / callers that want the legacy behavior of
+    /// opening all available capacity at once.
+    #[cfg(test)]
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            batch_size: 1,
+            delay_min: Duration::ZERO,
+            delay_max: Duration::ZERO,
+        }
+    }
+}
+
 /// Coordinates how parts are downloaded, including dynamic splitting to keep
 /// all available connections busy.
 pub struct Downloader {
@@ -72,6 +110,7 @@ pub struct Downloader {
     randomize_user_agent: bool,
     /// Whether to attempt mid-flight subdivision of long-running parts.
     dynamic_split: bool,
+    rampup: RampupConfig,
     speed_limiter: Option<Arc<BandwidthLimiter>>,
     retry_policy: FixedThenExponentialRetry,
     persist_mutex: Arc<Mutex<()>>,
@@ -81,6 +120,14 @@ pub struct Downloader {
     /// sampler so it can emit per-part speed/progress on a fixed cadence
     /// (independent of the per-chunk hot path).
     active_parts: Arc<std::sync::Mutex<HashMap<String, Arc<PartController>>>>,
+    /// Gates whether `fill_capacity` is allowed to open more than one
+    /// connection per batch. The probe (1 connection, scheduled in
+    /// `run_inner` before any ramping) must successfully begin
+    /// receiving data before we trust the server with parallel opens.
+    /// If the probe fails — or any subsequent batch part fails before
+    /// notifying — this flips false and the ramp falls back to a
+    /// strict one-at-a-time, probe-gated cadence.
+    ramp_armed: std::sync::atomic::AtomicBool,
 }
 
 impl Downloader {
@@ -92,6 +139,7 @@ impl Downloader {
         randomize_user_agent: bool,
         speed_limit: Option<u64>,
         dynamic_split: bool,
+        rampup: RampupConfig,
         retry_policy: FixedThenExponentialRetry,
         ctx: DownloadContext,
     ) -> Self {
@@ -121,12 +169,14 @@ impl Downloader {
             client: Arc::new(client),
             randomize_user_agent,
             dynamic_split,
+            rampup,
             speed_limiter,
             retry_policy,
             persist_mutex: Arc::new(Mutex::new(())),
             ctx,
             tracker,
             active_parts: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            ramp_armed: std::sync::atomic::AtomicBool::new(true),
         }
     }
 
@@ -255,8 +305,18 @@ impl Downloader {
             // or the task finishes (e.g., zero-length part completes immediately),
             // or the caller cancels the download.
             tokio::select! {
-                _ = probe.notified() => {}
+                _ = probe.notified() => {
+                    // Probe is producing data — server is willing to
+                    // serve us, so subsequent fill_capacity calls can
+                    // ramp at the configured batch size.
+                    self.ramp_armed.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
                 maybe_res = join_set.join_next() => {
+                    // Probe ended before notifying — treat the server
+                    // as unhappy and force fill_capacity into strict
+                    // one-at-a-time mode so we don't compound a bad
+                    // situation with parallel opens.
+                    self.ramp_armed.store(false, std::sync::atomic::Ordering::Relaxed);
                     if let Some(res) = maybe_res {
                         self.handle_join_result_item(res, &mut pending, &mut active, &mut join_set).await?;
                     }
@@ -318,22 +378,122 @@ impl Downloader {
         active: &mut HashMap<String, ActiveTask>,
         join_set: &mut JoinSet<Result<PartEvent, OdlError>>,
     ) -> Result<(), OdlError> {
-        let cap = self.ctx.live.max_connections();
-        if cap == 0 {
+        if self.ctx.live.max_connections() == 0 {
             return Ok(());
         }
 
         self.ensure_pending_pool(pending, active).await?;
 
-        while active.len() < cap {
-            if let Some(part) = pending.pop_front() {
+        if !self.rampup.enabled {
+            // Legacy single-shot fill: open everything at once.
+            while active.len() < self.ctx.live.max_connections() {
+                let Some(part) = pending.pop_front() else {
+                    return Ok(());
+                };
                 self.schedule_part(part, active, join_set, None).await?;
-            } else {
-                break;
             }
+            return Ok(());
         }
 
-        Ok(())
+        // Ramped fill: open at most `batch_size` connections, wait for
+        // every one of them to either signal "first chunk received" or
+        // fail terminally, then sleep a random delay before opening
+        // the next batch. Some servers throttle per-IP connection rate;
+        // pacing + confirming each batch landed before the next gives
+        // them a chance to settle. If any part fails before notifying,
+        // we stop ramping for this round (the failed part is requeued
+        // by `handle_join_result_item` and the main loop will retry).
+        // Strict mode (after a failed probe / failed batch part) caps
+        // every batch to a single connection so the next opens behave
+        // like additional probes until something successfully starts.
+        let batch_size = if self.ramp_armed.load(std::sync::atomic::Ordering::Relaxed) {
+            self.rampup.batch_size.max(1)
+        } else {
+            1
+        };
+        loop {
+            let cap = self.ctx.live.max_connections();
+            if cap == 0 || active.len() >= cap {
+                return Ok(());
+            }
+
+            let mut probes: Vec<Arc<Notify>> = Vec::new();
+            let mut opened_in_batch: u64 = 0;
+            while opened_in_batch < batch_size && active.len() < cap {
+                let Some(part) = pending.pop_front() else {
+                    break;
+                };
+                let probe = Arc::new(Notify::new());
+                self.schedule_part(part, active, join_set, Some(probe.clone()))
+                    .await?;
+                probes.push(probe);
+                opened_in_batch += 1;
+            }
+            if probes.is_empty() {
+                return Ok(());
+            }
+
+            // Wait until every probe in this batch fires (or a part
+            // fails / cancel arrives). Run the wait through a side
+            // task + oneshot so the main `select!` can race it against
+            // the shared `join_set`.
+            let probes_for_task = probes.clone();
+            let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+            tokio::spawn(async move {
+                for p in probes_for_task.iter() {
+                    p.notified().await;
+                }
+                let _ = tx.send(());
+            });
+
+            let mut batch_ok = false;
+            loop {
+                tokio::select! {
+                    _ = &mut rx => {
+                        batch_ok = true;
+                        break;
+                    }
+                    res = join_set.join_next() => {
+                        let Some(result) = res else {
+                            return Ok(());
+                        };
+                        let is_failure = matches!(&result, Ok(Ok(PartEvent::Failed { .. })));
+                        self.handle_join_result_item(result, pending, active, join_set).await?;
+                        if is_failure {
+                            break;
+                        }
+                        // Completed / NeedsReschedule — keep waiting on
+                        // the in-flight batch probes.
+                    }
+                    _ = self.ctx.cancel.cancelled() => {
+                        return Ok(());
+                    }
+                }
+            }
+            if !batch_ok {
+                // Disarm parallel ramping until something else confirms
+                // the server is healthy again — the failed part is
+                // already requeued by `handle_join_result_item` and the
+                // main loop will retry, but the next attempt should
+                // open only one connection at a time.
+                self.ramp_armed
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                return Ok(());
+            }
+
+            if pending.is_empty() || active.len() >= self.ctx.live.max_connections() {
+                return Ok(());
+            }
+
+            let delay = sample_rampup_delay(self.rampup.delay_min, self.rampup.delay_max);
+            if delay.is_zero() {
+                continue;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                _ = self.ctx.cancel.cancelled() => return Ok(()),
+            }
+        }
     }
 
     /// React to a runtime change in `ctx.live.max_connections()`. When the
@@ -1321,6 +1481,7 @@ mod tests {
             false,
             None,
             true,
+            RampupConfig::disabled(),
             FixedThenExponentialRetry::default(),
             DownloadContext::new(),
         );
@@ -1367,6 +1528,7 @@ mod tests {
             false,
             None,
             true,
+            RampupConfig::disabled(),
             FixedThenExponentialRetry::default(),
             DownloadContext::new(),
         );
@@ -1444,6 +1606,7 @@ mod tests {
             false,
             None,
             true,
+            RampupConfig::disabled(),
             FixedThenExponentialRetry::default(),
             DownloadContext::new(),
         );
@@ -1496,6 +1659,7 @@ mod tests {
             false,
             None,
             true,
+            RampupConfig::disabled(),
             FixedThenExponentialRetry::default(),
             DownloadContext::new(),
         );
@@ -1623,5 +1787,367 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(10), limiter.acquire(32 * 1024))
             .await
             .expect("acquire must not deadlock for amount > rate");
+    }
+
+    #[test]
+    fn sample_rampup_delay_clamps_when_max_le_min() {
+        let min = Duration::from_millis(500);
+        let max = Duration::from_millis(200);
+        assert_eq!(sample_rampup_delay(min, max), min);
+        // Equal bounds: deterministic.
+        assert_eq!(sample_rampup_delay(min, min), min);
+    }
+
+    #[test]
+    fn sample_rampup_delay_stays_within_bounds() {
+        let min = Duration::from_millis(500);
+        let max = Duration::from_millis(1000);
+        for _ in 0..2000 {
+            let d = sample_rampup_delay(min, max);
+            assert!(d >= min && d <= max, "delay {:?} out of bounds", d);
+        }
+    }
+
+    /// Hand-rolled HTTP server that responds to one range GET with
+    /// headers + a single body byte, then holds the connection open
+    /// forever. Lets fill_capacity see an "active" download without the
+    /// task ever completing, so we can count how many connections were
+    /// opened over time. Returns (address, counter, listener-task
+    /// abort-handle).
+    async fn spawn_hanging_http_server() -> (
+        std::net::SocketAddr,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_clone = Arc::clone(&counter);
+
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                counter_clone.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    // Read the request headers (until \r\n\r\n).
+                    let mut buf = [0u8; 4096];
+                    let mut acc = Vec::new();
+                    loop {
+                        let n = match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        acc.extend_from_slice(&buf[..n]);
+                        if acc.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    // Parse Range to know the part length so we can
+                    // advertise a matching Content-Length / Content-Range.
+                    let req = String::from_utf8_lossy(&acc);
+                    let (start, end) = req
+                        .lines()
+                        .find_map(|l| {
+                            let l = l.trim();
+                            let rest = l.strip_prefix("Range:")?.trim();
+                            let rest = rest.strip_prefix("bytes=")?;
+                            let mut it = rest.split('-');
+                            let s: u64 = it.next()?.trim().parse().ok()?;
+                            let e: u64 = it.next()?.trim().parse().ok()?;
+                            Some((s, e))
+                        })
+                        .unwrap_or((0, 0));
+                    let _ = (start, end);
+                    // Use Transfer-Encoding: chunked. Send a single
+                    // 1-byte chunk then hold the connection open
+                    // without writing the terminating zero-chunk —
+                    // hyper will treat the body as "more bytes coming"
+                    // so it blocks on the next `chunk()` instead of
+                    // returning EOF, while still surfacing the first
+                    // byte to the probe.
+                    let header = "HTTP/1.1 206 Partial Content\r\nTransfer-Encoding: chunked\r\nAccept-Ranges: bytes\r\nConnection: keep-alive\r\n\r\n";
+                    let mut out = header.as_bytes().to_vec();
+                    out.extend_from_slice(b"1\r\n\x00\r\n");
+                    if sock.write_all(&out).await.is_err() {
+                        return;
+                    }
+                    let _ = sock.flush().await;
+                    // Hold the connection open until the test tears
+                    // down — reqwest shuts its write half after sending
+                    // the GET, so reading would observe EOF immediately.
+                    std::future::pending::<()>().await;
+                    drop(sock);
+                });
+            }
+        });
+
+        (addr, counter, handle)
+    }
+
+    /// Poll the counter (real time) up to `timeout` until `pred()` holds.
+    async fn wait_for<F>(label: &str, timeout: Duration, mut pred: F)
+    where
+        F: FnMut() -> bool,
+    {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if pred() {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("timed out after {:?}: {}", timeout, label);
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    async fn build_rampup_test_downloader(
+        addr: std::net::SocketAddr,
+        n_parts: u64,
+        rampup: RampupConfig,
+    ) -> (Arc<Download>, Downloader, tempfile::TempDir) {
+        let tmp = tempdir().expect("tmp");
+        let download_dir = tmp.path().join("download");
+        let save_dir = tmp.path().join("save");
+        fs::create_dir_all(&download_dir).await.expect("mkdir dl");
+        fs::create_dir_all(&save_dir).await.expect("mkdir save");
+
+        // Each part advertises 1 MiB so they stay nominally "in flight"
+        // after the server's single body byte; sizes are arbitrary, the
+        // test cares about open-count, not bytes transferred.
+        let part_size: u64 = 1024 * 1024;
+        let total = part_size * n_parts;
+        let mut parts = HashMap::new();
+        for i in 0..n_parts {
+            let ulid = format!("p{i}");
+            parts.insert(ulid.clone(), make_part(&ulid, i * part_size, part_size));
+        }
+
+        let url = format!("http://{}/file", addr);
+        let instruction =
+            create_instruction(&download_dir, &save_dir, &url, total, parts, n_parts).await;
+        let metadata = instruction.as_metadata();
+
+        let downloader = Downloader::new(
+            Arc::clone(&instruction),
+            metadata,
+            reqwest::Client::builder().build().expect("client"),
+            false,
+            None,
+            false, // dynamic_split off — keep part count stable for counting
+            rampup,
+            FixedThenExponentialRetry::default(),
+            DownloadContext::new(),
+        );
+        (instruction, downloader, tmp)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fill_capacity_ramps_connections_in_batches() {
+        use std::sync::atomic::Ordering;
+
+        const DELAY: Duration = Duration::from_millis(300);
+
+        let (addr, counter, server_task) = spawn_hanging_http_server().await;
+        let (_instruction, downloader, _tmp) = build_rampup_test_downloader(
+            addr,
+            7,
+            RampupConfig {
+                enabled: true,
+                batch_size: 2,
+                delay_min: DELAY,
+                delay_max: DELAY,
+            },
+        )
+        .await;
+
+        let cancel = downloader.ctx.cancel.clone();
+        let dl_task = tokio::spawn(async move {
+            let _ = downloader.run().await;
+        });
+
+        // Probe + first batch (2) land back-to-back, well within one
+        // delay window.
+        wait_for(
+            "counter >= 3 (probe + first batch)",
+            Duration::from_secs(5),
+            || counter.load(Ordering::SeqCst) >= 3,
+        )
+        .await;
+        // Before the inter-batch delay elapses, no more connections
+        // should be opened.
+        tokio::time::sleep(DELAY / 3).await;
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            3,
+            "rampup must wait for inter-batch delay before opening more"
+        );
+
+        // Second batch fires after the first delay.
+        wait_for("counter >= 5 (second batch)", DELAY * 3, || {
+            counter.load(Ordering::SeqCst) >= 5
+        })
+        .await;
+        tokio::time::sleep(DELAY / 3).await;
+        assert_eq!(counter.load(Ordering::SeqCst), 5);
+
+        // Third batch fires after the second delay; cap (7) reached.
+        wait_for("counter == 7 (cap reached)", DELAY * 3, || {
+            counter.load(Ordering::SeqCst) >= 7
+        })
+        .await;
+        assert_eq!(counter.load(Ordering::SeqCst), 7);
+
+        // No further connections should be opened once cap is reached.
+        tokio::time::sleep(DELAY * 2).await;
+        assert_eq!(counter.load(Ordering::SeqCst), 7);
+
+        cancel.cancel();
+        let _ = dl_task.await;
+        server_task.abort();
+    }
+
+    /// TCP listener that accepts connections, increments a counter,
+    /// then immediately drops the socket (server-side RST/FIN). Used
+    /// to simulate a server that drops every batch connection so we
+    /// can assert rampup stops opening more after a failure.
+    async fn spawn_drop_server() -> (
+        std::net::SocketAddr,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_clone = Arc::clone(&counter);
+
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((sock, _)) = listener.accept().await else {
+                    return;
+                };
+                counter_clone.fetch_add(1, Ordering::SeqCst);
+                drop(sock);
+            }
+        });
+        (addr, counter, handle)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fill_capacity_aborts_ramp_when_batch_part_fails() {
+        // With a drop-every-connection server, the probe + the first
+        // rampup batch will all fail. After retries are exhausted the
+        // failed parts surface a `PartEvent::Failed` from the join
+        // set — at which point fill_capacity must stop ramping for
+        // this round, leaving any remaining pending parts unscheduled.
+        // We assert that not all 10 parts get opened in a single tight
+        // burst: the failure-abort path keeps the connection count
+        // bounded by the first batch (plus the probe).
+        use std::sync::atomic::Ordering;
+
+        let (addr, counter, server_task) = spawn_drop_server().await;
+
+        // Short retry policy so failures surface fast.
+        let tmp = tempdir().expect("tmp");
+        let download_dir = tmp.path().join("download");
+        let save_dir = tmp.path().join("save");
+        fs::create_dir_all(&download_dir).await.expect("mkdir dl");
+        fs::create_dir_all(&save_dir).await.expect("mkdir save");
+        let n_parts: u64 = 10;
+        let part_size: u64 = 1024 * 1024;
+        let total = part_size * n_parts;
+        let mut parts = HashMap::new();
+        for i in 0..n_parts {
+            let ulid = format!("p{i}");
+            parts.insert(ulid.clone(), make_part(&ulid, i * part_size, part_size));
+        }
+        let url = format!("http://{}/file", addr);
+        let instruction =
+            create_instruction(&download_dir, &save_dir, &url, total, parts, n_parts).await;
+        let metadata = instruction.as_metadata();
+        let downloader = Downloader::new(
+            Arc::clone(&instruction),
+            metadata,
+            reqwest::Client::builder().build().expect("client"),
+            false,
+            None,
+            false,
+            RampupConfig {
+                enabled: true,
+                batch_size: 2,
+                delay_min: Duration::from_millis(50),
+                delay_max: Duration::from_millis(50),
+            },
+            FixedThenExponentialRetry {
+                max_n_retries: 1,
+                wait_time: Duration::from_millis(20),
+                n_fixed_retries: 1,
+            },
+            DownloadContext::new(),
+        );
+
+        let cancel = downloader.ctx.cancel.clone();
+        let dl_task = tokio::spawn(async move {
+            let _ = downloader.run().await;
+        });
+
+        // Let things run long enough that, without the failure-abort,
+        // every one of the 10 parts would have been opened multiple
+        // times (retries + further batches). Each retry opens a fresh
+        // TCP connection, so the counter is monotonic but the test
+        // tolerates retries within a bounded window.
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        cancel.cancel();
+        let _ = dl_task.await;
+
+        let opened = counter.load(Ordering::SeqCst);
+        // With batch_size=2, immediate failures, and ramp abort on
+        // failure: the run should not have managed to open all 10
+        // parts in this window. Even allowing retries on the probe
+        // and one batch, we expect comfortably fewer than 10 unique
+        // parts' worth (ignoring retries). Bound generously to keep
+        // the test stable on slow CI while still catching the bug
+        // where ramp keeps marching past failures.
+        assert!(
+            opened < 30,
+            "rampup did not throttle on failures: {} connections opened",
+            opened
+        );
+        server_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fill_capacity_no_rampup_opens_all_at_once() {
+        use std::sync::atomic::Ordering;
+
+        let (addr, counter, server_task) = spawn_hanging_http_server().await;
+        let (_instruction, downloader, _tmp) =
+            build_rampup_test_downloader(addr, 6, RampupConfig::disabled()).await;
+
+        let cancel = downloader.ctx.cancel.clone();
+        let dl_task = tokio::spawn(async move {
+            let _ = downloader.run().await;
+        });
+
+        wait_for(
+            "counter == 6 (all open at once)",
+            Duration::from_secs(5),
+            || counter.load(Ordering::SeqCst) >= 6,
+        )
+        .await;
+        assert_eq!(counter.load(Ordering::SeqCst), 6);
+
+        cancel.cancel();
+        let _ = dl_task.await;
+        server_task.abort();
     }
 }

@@ -37,6 +37,10 @@ mod defaults {
     pub fn default_headers() -> Option<indexmap::IndexMap<String, String>> { None }
     pub fn default_http2() -> bool { false }
     pub fn default_dynamic_split() -> bool { true }
+    pub fn default_rampup() -> bool { true }
+    pub fn default_rampup_batch_size() -> u64 { 2 }
+    pub fn default_rampup_delay_min() -> Duration { Duration::from_millis(300) }
+    pub fn default_rampup_delay_max() -> Duration { Duration::from_millis(1000) }
 }
 
 use defaults::*;
@@ -123,6 +127,29 @@ pub struct DownloadOptions {
     /// `max_connections` on resume).
     #[serde(default = "default_dynamic_split")]
     dynamic_split: bool,
+
+    /// Stagger the opening of new connections to avoid tripping
+    /// per-IP connection-rate limits that some servers enforce. When
+    /// enabled, the downloader opens at most `rampup_batch_size`
+    /// connections at a time, waits a random delay in
+    /// `[rampup_delay_min, rampup_delay_max]`, then opens the next
+    /// batch — repeating until `max_connections` is reached. Applies
+    /// to both the initial fill and any later cap increase.
+    #[serde(default = "default_rampup")]
+    rampup: bool,
+
+    /// Number of connections opened per rampup batch. Must be >= 1.
+    #[serde(default = "default_rampup_batch_size")]
+    rampup_batch_size: u64,
+
+    /// Lower bound for the random delay between rampup batches.
+    #[serde(default = "default_rampup_delay_min")]
+    rampup_delay_min: Duration,
+
+    /// Upper bound for the random delay between rampup batches. Must
+    /// be >= `rampup_delay_min`.
+    #[serde(default = "default_rampup_delay_max")]
+    rampup_delay_max: Duration,
 }
 
 impl From<DownloadOptions> for DownloadOptionsBuilder {
@@ -141,7 +168,11 @@ impl From<DownloadOptions> for DownloadOptionsBuilder {
             .connect_timeout(o.connect_timeout)
             .headers(o.headers)
             .http2(o.http2)
-            .dynamic_split(o.dynamic_split);
+            .dynamic_split(o.dynamic_split)
+            .rampup(o.rampup)
+            .rampup_batch_size(o.rampup_batch_size)
+            .rampup_delay_min(o.rampup_delay_min)
+            .rampup_delay_max(o.rampup_delay_max);
         b
     }
 }
@@ -163,6 +194,10 @@ impl Default for DownloadOptions {
             headers: default_headers(),
             http2: default_http2(),
             dynamic_split: default_dynamic_split(),
+            rampup: default_rampup(),
+            rampup_batch_size: default_rampup_batch_size(),
+            rampup_delay_min: default_rampup_delay_min(),
+            rampup_delay_max: default_rampup_delay_max(),
         }
     }
 }
@@ -215,6 +250,18 @@ impl DownloadOptions {
     pub fn dynamic_split(&self) -> bool {
         self.dynamic_split
     }
+    pub fn rampup(&self) -> bool {
+        self.rampup
+    }
+    pub fn rampup_batch_size(&self) -> u64 {
+        self.rampup_batch_size
+    }
+    pub fn rampup_delay_min(&self) -> Duration {
+        self.rampup_delay_min
+    }
+    pub fn rampup_delay_max(&self) -> Duration {
+        self.rampup_delay_max
+    }
 
     /// Convert into a [`DownloadOptionsBuilder`] pre-populated with this
     /// instance's values. Use to apply partial overrides on top of an
@@ -234,6 +281,13 @@ impl DownloadOptions {
                 default_max_connections()
             );
             self.max_connections = default_max_connections();
+        }
+        if self.rampup_batch_size == 0 {
+            tracing::warn!(
+                "rampup_batch_size must be at least 1; got 0, clamping to {}",
+                default_rampup_batch_size()
+            );
+            self.rampup_batch_size = default_rampup_batch_size();
         }
         if let Some(headers) = self.headers.as_mut() {
             headers.retain(|k, v| {
@@ -278,6 +332,12 @@ impl DownloadOptions {
             return Err(DownloadOptionsBuilderError::ValidationError(
                 "connect_timeout must be greater than 0".to_owned(),
             ));
+        }
+        if self.rampup && self.rampup_delay_max < self.rampup_delay_min {
+            return Err(DownloadOptionsBuilderError::ValidationError(format!(
+                "rampup_delay_max ({:?}) must be >= rampup_delay_min ({:?})",
+                self.rampup_delay_max, self.rampup_delay_min
+            )));
         }
         if let Some(p) = self.proxy.as_deref()
             && Proxy::all(p).is_err()

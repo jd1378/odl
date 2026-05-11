@@ -23,7 +23,10 @@ pub struct DownloadPermit(#[allow(dead_code)] OwnedSemaphorePermit);
 use crate::config::{Config, DownloadOptions};
 use crate::download_manager::checksum::check_final_file_checksum;
 use crate::download_manager::recover_metadata::recover_metadata;
-use crate::download_manager::{downloader::Downloader, io::persist_metadata};
+use crate::download_manager::{
+    downloader::{Downloader, RampupConfig},
+    io::persist_metadata,
+};
 use crate::download_manager::{io::assemble_final_file, server_conflict::resolve_server_conflicts};
 use crate::download_manager::{io::remove_all_parts, save_conflict::resolve_save_conflicts};
 use crate::error::MetadataError;
@@ -503,6 +506,12 @@ impl DownloadManager {
                     randomize_user_agent,
                     opts.speed_limit(),
                     opts.dynamic_split(),
+                    RampupConfig {
+                        enabled: opts.rampup(),
+                        batch_size: opts.rampup_batch_size(),
+                        delay_min: opts.rampup_delay_min(),
+                        delay_max: opts.rampup_delay_max(),
+                    },
                     retry_policy,
                     ctx.clone(),
                 );
@@ -670,6 +679,7 @@ mod tests {
     use mockito::Server;
     use std::collections::HashMap;
     use std::path::Path;
+    use std::time::Duration;
     use tempfile::tempdir;
     use tokio::fs;
     use tokio::io::AsyncWriteExt;
@@ -816,6 +826,52 @@ mod tests {
             .build()
             .unwrap();
         assert!(!opts.dynamic_split());
+    }
+
+    #[test]
+    fn rampup_defaults() {
+        let opts = DownloadOptionsBuilder::default().build().unwrap();
+        assert!(opts.rampup());
+        assert_eq!(opts.rampup_batch_size(), 2);
+        assert_eq!(opts.rampup_delay_min(), Duration::from_millis(300));
+        assert_eq!(opts.rampup_delay_max(), Duration::from_millis(1000));
+    }
+
+    #[test]
+    fn rampup_builder_clamps_zero_batch_size() {
+        let opts = DownloadOptionsBuilder::default()
+            .rampup_batch_size(0)
+            .build()
+            .unwrap();
+        assert!(opts.rampup_batch_size() >= 1);
+    }
+
+    #[test]
+    fn rampup_builder_rejects_inverted_delays() {
+        use crate::config::DownloadOptionsBuilderError;
+        let err = DownloadOptionsBuilder::default()
+            .rampup(true)
+            .rampup_delay_min(Duration::from_millis(1000))
+            .rampup_delay_max(Duration::from_millis(500))
+            .build()
+            .expect_err("expected error");
+        assert!(matches!(
+            err,
+            DownloadOptionsBuilderError::ValidationError(_)
+        ));
+    }
+
+    #[test]
+    fn rampup_inverted_delays_ignored_when_disabled() {
+        // When rampup is off, the delay fields aren't consulted, so a
+        // nonsensical pair shouldn't block construction.
+        let opts = DownloadOptionsBuilder::default()
+            .rampup(false)
+            .rampup_delay_min(Duration::from_millis(1000))
+            .rampup_delay_max(Duration::from_millis(500))
+            .build()
+            .unwrap();
+        assert!(!opts.rampup());
     }
 
     #[tokio::test]
@@ -1596,6 +1652,7 @@ mod tests {
             false,
             None,
             true,
+            RampupConfig::disabled(),
             retry_policy,
             DownloadContext::new(),
         );
