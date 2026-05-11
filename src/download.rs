@@ -106,13 +106,23 @@ pub struct Download {
     finished: bool,
 }
 
+/// Result of [`Download::compute_split`]: how to resize an existing
+/// part (`new_left_size`) and where the new right-hand part begins
+/// (`new_right_offset` / `new_right_size`).
+#[derive(Debug, Clone, Copy)]
+pub struct PartSplit {
+    pub new_left_size: u64,
+    pub new_right_offset: u64,
+    pub new_right_size: u64,
+}
+
 impl Download {
     // Getters for Download fields
     const METADATA_FILENAME: &'static str = "metadata.pb";
     const METADATA_TEMP_FILENAME: &'static str = "metadata.pb.temp";
     const LOCK_FILENAME: &'static str = "odl.lock";
     pub const PART_EXTENSION: &'static str = "part";
-    const MIN_PART_SIZE: u64 = 300 * 1024; // 300 KB
+    pub const MIN_PART_SIZE: u64 = 300 * 1024; // 300 KB
     /// Assumed filesystem cluster size used to keep part boundaries aligned
     /// so the assembler can reflink parts into the final file.
     ///
@@ -127,11 +137,9 @@ impl Download {
     ///   * `download_manager::io::assemble_blocking` — reflink alignment check
     pub const ASSEMBLY_CLUSTER_SIZE: u64 = 4096;
 
-    // Bit-mask trick (`x & !(N-1)`) used to align values requires a
-    // power-of-two cluster size. The split logic also assumes the minimum
-    // part size is at least one cluster, otherwise `base_size` could round
-    // down to zero and produce empty leading parts.
-    const _ASSERT_CLUSTER_POW2: () = assert!(Self::ASSEMBLY_CLUSTER_SIZE.is_power_of_two());
+    // Split logic assumes the minimum part size is at least one cluster,
+    // otherwise the base-size round-down could produce zero and emit
+    // empty leading parts.
     const _ASSERT_MIN_PART_GE_CLUSTER: () =
         assert!(Self::MIN_PART_SIZE >= Self::ASSEMBLY_CLUSTER_SIZE);
 
@@ -361,6 +369,77 @@ impl Download {
         }
     }
 
+    /// Compute a cluster-aligned split point for a part with `offset`,
+    /// `size`, and `already_consumed` bytes already written/scheduled.
+    /// The split favours the right half (new part) absorbing roughly the
+    /// remaining bytes / 2; the left half (current part) keeps every
+    /// byte up to `already_consumed`, so no progress is invalidated.
+    ///
+    /// Returns `None` when the resulting halves wouldn't both clear
+    /// `min_part_size`, the new boundary wouldn't move past
+    /// `already_consumed`, or the input `offset` is not on a cluster
+    /// boundary (which would break reflink-based assembly).
+    ///
+    /// Reflink invariant kept:
+    /// - `new_left_size` is rounded down to a multiple of
+    ///   `ASSEMBLY_CLUSTER_SIZE` so the left half ends on a cluster
+    ///   boundary → its reflink range stays aligned.
+    /// - `new_right_offset = offset + new_left_size` stays cluster-
+    ///   aligned because `offset` is required to be aligned on entry
+    ///   and `new_left_size` is a cluster multiple.
+    /// - `new_right_size = size - new_left_size` inherits any tail
+    ///   unalignment from `size`. The original tail-unaligned part is
+    ///   always the LAST in absolute-offset order, so its split right
+    ///   child remains last too — Linux's `ficlonerange` allows an
+    ///   unaligned tail on the final reflink range (Windows falls back
+    ///   to a byte copy, same as before).
+    ///
+    /// Both callers — mid-flight dynamic splits in
+    /// `Downloader::split_task` and the static resume-time grow in
+    /// `download_manager::grow_parts` — share this geometry; only the
+    /// minimum-size threshold differs.
+    pub fn compute_split(
+        offset: u64,
+        size: u64,
+        already_consumed: u64,
+        min_part_size: u64,
+    ) -> Option<PartSplit> {
+        if !offset.is_multiple_of(Self::ASSEMBLY_CLUSTER_SIZE) {
+            // Caller bug: a part whose absolute offset isn't cluster-
+            // aligned can't be assembled via reflink, so refuse to split
+            // it (preserving the current bad state is strictly better
+            // than producing two bad parts).
+            debug_assert!(
+                false,
+                "compute_split: offset {offset:#x} not cluster-aligned",
+            );
+            return None;
+        }
+        if already_consumed >= size {
+            return None;
+        }
+        let remaining = size - already_consumed;
+        if remaining < min_part_size * 2 {
+            return None;
+        }
+        let candidate = already_consumed + remaining / 2;
+        // Round down to a multiple of ASSEMBLY_CLUSTER_SIZE so the new
+        // boundary lands on a cluster edge (reflink requirement).
+        let new_left_size = candidate - candidate % Self::ASSEMBLY_CLUSTER_SIZE;
+        if new_left_size <= already_consumed {
+            return None;
+        }
+        let new_right_size = size - new_left_size;
+        if new_right_size < min_part_size || new_left_size - already_consumed < min_part_size {
+            return None;
+        }
+        Some(PartSplit {
+            new_left_size,
+            new_right_offset: offset + new_left_size,
+            new_right_size,
+        })
+    }
+
     pub fn determine_parts(
         size: Option<u64>,
         max_connections: u64,
@@ -398,8 +477,10 @@ impl Download {
             actual_connections = min_connections;
         }
 
-        let mask = Self::ASSEMBLY_CLUSTER_SIZE - 1;
-        let base_size = (size / actual_connections) & !mask;
+        // Round each middle part's size down to a cluster multiple so
+        // the assembler can reflink it at its absolute offset.
+        let raw_base = size / actual_connections;
+        let base_size = raw_base - raw_base % Self::ASSEMBLY_CLUSTER_SIZE;
         let mut offset = 0;
 
         // Cluster-aligned base size lets the assembler reflink each part at its
@@ -618,5 +699,107 @@ mod tests {
         assert_eq!(part_vec[0].offset % Download::ASSEMBLY_CLUSTER_SIZE, 0);
         assert_eq!(part_vec[1].offset % Download::ASSEMBLY_CLUSTER_SIZE, 0);
         assert_eq!(part_vec[2].offset % Download::ASSEMBLY_CLUSTER_SIZE, 0);
+    }
+
+    #[test]
+    fn compute_split_returns_none_when_remaining_below_double_min() {
+        // remaining = size - already = MIN_PART_SIZE * 2 - 1
+        let size = Download::MIN_PART_SIZE * 2 - 1;
+        assert!(Download::compute_split(0, size, 0, Download::MIN_PART_SIZE).is_none());
+    }
+
+    #[test]
+    fn compute_split_aligns_boundary_and_preserves_total() {
+        let size = Download::MIN_PART_SIZE * 8;
+        let split = Download::compute_split(1024 * 1024, size, 0, Download::MIN_PART_SIZE)
+            .expect("split expected");
+        // Left half aligned to cluster boundary
+        assert_eq!(split.new_left_size % Download::ASSEMBLY_CLUSTER_SIZE, 0);
+        // Total bytes preserved
+        assert_eq!(split.new_left_size + split.new_right_size, size);
+        // New offset = base offset + left size
+        assert_eq!(split.new_right_offset, 1024 * 1024 + split.new_left_size);
+        // Both halves above min
+        assert!(split.new_left_size >= Download::MIN_PART_SIZE);
+        assert!(split.new_right_size >= Download::MIN_PART_SIZE);
+    }
+
+    #[test]
+    fn compute_split_keeps_offsets_cluster_aligned_for_reflink() {
+        // Start from a determine_parts result (which guarantees all
+        // middle offsets are cluster-aligned) and recursively split the
+        // largest unfinished candidate. Every produced offset must stay
+        // cluster-aligned so the assembler can reflink.
+        let size = 50 * 1024 * 1024 + 1234; // 50 MiB + unaligned tail
+        let mut parts = Download::determine_parts(Some(size), 4);
+
+        for _ in 0..8 {
+            let candidate = parts
+                .values()
+                .filter_map(|p| {
+                    Download::compute_split(p.offset, p.size, 0, Download::MIN_PART_SIZE)
+                        .map(|s| (p.ulid.clone(), p.offset, p.size, s))
+                })
+                .max_by_key(|(_, _, _, s)| s.new_right_size);
+            let Some((ulid, _, _, split)) = candidate else {
+                break;
+            };
+            // Update left
+            if let Some(p) = parts.get_mut(&ulid) {
+                p.size = split.new_left_size;
+            }
+            // Insert right
+            let new_ulid = ulid::Ulid::new().to_string();
+            parts.insert(
+                new_ulid.clone(),
+                crate::download_metadata::PartDetails {
+                    offset: split.new_right_offset,
+                    size: split.new_right_size,
+                    ulid: new_ulid,
+                    finished: false,
+                },
+            );
+        }
+
+        // All offsets must be cluster-aligned for reflink.
+        for p in parts.values() {
+            assert_eq!(
+                p.offset % Download::ASSEMBLY_CLUSTER_SIZE,
+                0,
+                "offset {} broke cluster alignment after split",
+                p.offset
+            );
+        }
+        // Coverage preserved.
+        let total: u64 = parts.values().map(|p| p.size).sum();
+        assert_eq!(total, size);
+
+        // Among the parts, the last-by-offset is the only one allowed
+        // to have unaligned size. Every other must be cluster-aligned
+        // size to keep its reflink range fully aligned.
+        let mut sorted: Vec<_> = parts.values().collect();
+        sorted.sort_by_key(|p| p.offset);
+        for p in &sorted[..sorted.len() - 1] {
+            assert_eq!(
+                p.size % Download::ASSEMBLY_CLUSTER_SIZE,
+                0,
+                "non-last part size {} broke cluster alignment",
+                p.size
+            );
+        }
+    }
+
+    #[test]
+    fn compute_split_respects_already_consumed_floor() {
+        // Already consumed half; remainder must still be splittable.
+        let size = Download::MIN_PART_SIZE * 8;
+        let consumed = Download::MIN_PART_SIZE * 4;
+        let split = Download::compute_split(0, size, consumed, Download::MIN_PART_SIZE)
+            .expect("split expected");
+        assert!(
+            split.new_left_size > consumed,
+            "boundary must move past already-consumed prefix"
+        );
+        assert_eq!(split.new_left_size + split.new_right_size, size);
     }
 }

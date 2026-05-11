@@ -36,6 +36,7 @@ mod defaults {
     pub fn default_connect_timeout() -> Option<Duration> { Some(Duration::from_secs(5)) }
     pub fn default_headers() -> Option<indexmap::IndexMap<String, String>> { None }
     pub fn default_http2() -> bool { false }
+    pub fn default_dynamic_split() -> bool { true }
 }
 
 use defaults::*;
@@ -115,6 +116,13 @@ pub struct DownloadOptions {
     /// can throttle high-bandwidth downloads.
     #[serde(default = "default_http2")]
     http2: bool,
+
+    /// Allow the downloader to dynamically subdivide a long-running part
+    /// mid-flight when spare connections are idle. Disabling locks the
+    /// part layout chosen at evaluate time (or set explicitly via
+    /// `max_connections` on resume).
+    #[serde(default = "default_dynamic_split")]
+    dynamic_split: bool,
 }
 
 impl From<DownloadOptions> for DownloadOptionsBuilder {
@@ -132,7 +140,8 @@ impl From<DownloadOptions> for DownloadOptionsBuilder {
             .speed_limit(o.speed_limit)
             .connect_timeout(o.connect_timeout)
             .headers(o.headers)
-            .http2(o.http2);
+            .http2(o.http2)
+            .dynamic_split(o.dynamic_split);
         b
     }
 }
@@ -153,6 +162,7 @@ impl Default for DownloadOptions {
             connect_timeout: default_connect_timeout(),
             headers: default_headers(),
             http2: default_http2(),
+            dynamic_split: default_dynamic_split(),
         }
     }
 }
@@ -201,6 +211,9 @@ impl DownloadOptions {
     }
     pub fn http2(&self) -> bool {
         self.http2
+    }
+    pub fn dynamic_split(&self) -> bool {
+        self.dynamic_split
     }
 
     /// Convert into a [`DownloadOptionsBuilder`] pre-populated with this

@@ -202,6 +202,12 @@ pub struct Args {
     #[arg(long)]
     pub http2: Option<bool>,
 
+    /// Allow mid-flight subdivision of long-running parts to keep idle
+    /// connections busy. Default: enabled. Pass `--dynamic-split false`
+    /// to lock the part layout chosen at evaluate / resume time.
+    #[arg(long)]
+    pub dynamic_split: Option<bool>,
+
     /// Custom HTTP headers to include in each request. Specify as `KEY:VALUE`.
     #[arg(long = "header", value_name = "KEY:VALUE", num_args = 0.., action = clap::ArgAction::Append)]
     pub headers: Vec<String>,
@@ -301,6 +307,10 @@ pub enum Commands {
         /// Enable HTTP/2 (default: HTTP/1.1 only).
         #[arg(long)]
         http2: Option<bool>,
+
+        /// Allow mid-flight subdivision of long-running parts.
+        #[arg(long)]
+        dynamic_split: Option<bool>,
     },
 }
 

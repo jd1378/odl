@@ -383,6 +383,7 @@ async fn main() -> Result<(), OdlError> {
                 use_server_time,
                 accept_invalid_certs,
                 http2,
+                dynamic_split,
             } => {
                 // determine directory where config is stored
                 let config_path = if let Some(c) = config_file {
@@ -449,6 +450,9 @@ async fn main() -> Result<(), OdlError> {
                 }
                 if let Some(v) = http2 {
                     dl_b.http2(*v);
+                }
+                if let Some(v) = dynamic_split {
+                    dl_b.dynamic_split(*v);
                 }
                 let new_download = dl_b.build()?;
 
@@ -743,6 +747,9 @@ async fn build_download_manager(args: &Args) -> Result<DownloadManager, OdlError
     }
     if let Some(v) = args.http2 {
         dl_b.http2(v);
+    }
+    if let Some(v) = args.dynamic_split {
+        dl_b.dynamic_split(v);
     }
     let download = dl_b.build()?;
 

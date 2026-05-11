@@ -465,6 +465,17 @@ impl DownloadManager {
                 return Ok(final_path_recovery);
             }
 
+            // If the caller asked for more connections than the metadata
+            // was sealed with, statically subdivide unfinished parts so
+            // the downloader actually has more work to schedule in
+            // parallel. Decreases are intentionally ignored — shrinking
+            // would require merging parts (and their part files), which
+            // is more invasive than it's worth.
+            if opts.max_connections() > metadata.max_connections {
+                grow_parts(&instruction, &mut metadata, opts.max_connections()).await?;
+                persist_metadata(&metadata, &instruction).await?;
+            }
+
             let to_download = metadata
                 .parts
                 .values()
@@ -491,6 +502,7 @@ impl DownloadManager {
                     client,
                     randomize_user_agent,
                     opts.speed_limit(),
+                    opts.dynamic_split(),
                     retry_policy,
                     ctx.clone(),
                 );
@@ -562,6 +574,87 @@ impl DownloadManager {
     }
 }
 
+/// Grow the unfinished-part set by subdividing the largest unfinished
+/// part whose remaining bytes can be split into two halves both at least
+/// `MIN_PART_SIZE` and cluster-aligned. Stops when `target` is reached or
+/// no candidate qualifies. Updates `metadata.max_connections` to the new
+/// part count when growth happened. Decreases are not handled here.
+async fn grow_parts(
+    instruction: &Download,
+    metadata: &mut crate::download_metadata::DownloadMetadata,
+    target: u64,
+) -> Result<(), OdlError> {
+    let target_n = target as usize;
+
+    // Snapshot on-disk bytes per part once; we only subdivide each part
+    // beyond what's already been written so progress isn't lost.
+    let mut on_disk: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::with_capacity(metadata.parts.len());
+    for (ulid, _) in metadata.parts.iter() {
+        let path = instruction.part_path(ulid);
+        let size = match tokio::fs::metadata(&path).await {
+            Ok(m) => m.len(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(e) => {
+                return Err(OdlError::StdIoError {
+                    e,
+                    extra_info: Some(format!(
+                        "grow_parts: failed to stat part at {}",
+                        path.display(),
+                    )),
+                });
+            }
+        };
+        on_disk.insert(ulid.clone(), size);
+    }
+
+    loop {
+        let unfinished_count = metadata.parts.values().filter(|p| !p.finished).count();
+        if unfinished_count >= target_n {
+            break;
+        }
+
+        // Pick the unfinished part with the largest remaining range —
+        // shared split geometry is computed via `Download::compute_split`
+        // (same helper the runtime dynamic-split path uses). At rest, the
+        // tighter `MIN_PART_SIZE` threshold is acceptable: the user
+        // explicitly asked for more parallelism and there's no in-flight
+        // setup cost to amortize.
+        let candidate = metadata
+            .parts
+            .values()
+            .filter(|p| !p.finished)
+            .filter_map(|p| {
+                let written = *on_disk.get(&p.ulid).unwrap_or(&0);
+                Download::compute_split(p.offset, p.size, written, Download::MIN_PART_SIZE)
+                    .map(|split| (p.ulid.clone(), split))
+            })
+            .max_by_key(|(_, s)| s.new_right_size);
+
+        let Some((ulid, split)) = candidate else {
+            break;
+        };
+
+        if let Some(p) = metadata.parts.get_mut(&ulid) {
+            p.size = split.new_left_size;
+        }
+        let new_ulid = ulid::Ulid::new().to_string();
+        metadata.parts.insert(
+            new_ulid.clone(),
+            crate::download_metadata::PartDetails {
+                offset: split.new_right_offset,
+                size: split.new_right_size,
+                ulid: new_ulid.clone(),
+                finished: false,
+            },
+        );
+        on_disk.insert(new_ulid, 0);
+    }
+
+    metadata.max_connections = metadata.parts.len() as u64;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,6 +685,193 @@ mod tests {
             )
             .build()
             .unwrap()
+    }
+
+    fn build_dummy_instruction(download_dir: &Path) -> Download {
+        let mut parts = HashMap::new();
+        parts.insert(
+            "p0".to_string(),
+            PartDetails {
+                ulid: "p0".to_string(),
+                offset: 0,
+                size: 0,
+                finished: false,
+            },
+        );
+        DownloadBuilder::default()
+            .download_dir(download_dir.to_path_buf())
+            .save_dir(download_dir.to_path_buf())
+            .filename("dummy".to_string())
+            .url(Url::parse("http://example.invalid/x").unwrap())
+            .size(Some(0))
+            .max_connections(1)
+            .parts(parts)
+            .is_resumable(true)
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn grow_parts_increases_unfinished_count() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempdir()?;
+        let instruction = build_dummy_instruction(tmp.path());
+
+        let large_size = Download::MIN_PART_SIZE * 16;
+        let mut parts = HashMap::new();
+        parts.insert(
+            "big".to_string(),
+            PartDetails {
+                ulid: "big".to_string(),
+                offset: 0,
+                size: large_size,
+                finished: false,
+            },
+        );
+        let mut metadata = crate::download_metadata::DownloadMetadata {
+            url: "http://example.invalid/x".to_string(),
+            filename: "dummy".to_string(),
+            save_dir: tmp.path().to_string_lossy().into_owned(),
+            is_resumable: true,
+            use_server_time: false,
+            last_modified: None,
+            last_etag: None,
+            size: Some(large_size),
+            checksums: vec![],
+            requires_auth: false,
+            requires_basic_auth: false,
+            headers: HashMap::new(),
+            max_connections: 1,
+            parts,
+            finished: false,
+        };
+
+        grow_parts(&instruction, &mut metadata, 4).await?;
+        let unfinished = metadata.parts.values().filter(|p| !p.finished).count();
+        assert_eq!(unfinished, 4, "should grow to 4 unfinished parts");
+        assert_eq!(metadata.max_connections, 4);
+        let total: u64 = metadata.parts.values().map(|p| p.size).sum();
+        assert_eq!(total, large_size, "total coverage must not change");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn grow_parts_is_noop_when_target_le_current() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempdir()?;
+        let instruction = build_dummy_instruction(tmp.path());
+
+        let large_size = Download::MIN_PART_SIZE * 16;
+        let mut parts = HashMap::new();
+        parts.insert(
+            "a".to_string(),
+            PartDetails {
+                ulid: "a".to_string(),
+                offset: 0,
+                size: large_size / 2,
+                finished: false,
+            },
+        );
+        parts.insert(
+            "b".to_string(),
+            PartDetails {
+                ulid: "b".to_string(),
+                offset: large_size / 2,
+                size: large_size / 2,
+                finished: false,
+            },
+        );
+        let mut metadata = crate::download_metadata::DownloadMetadata {
+            url: "http://example.invalid/x".to_string(),
+            filename: "dummy".to_string(),
+            save_dir: tmp.path().to_string_lossy().into_owned(),
+            is_resumable: true,
+            use_server_time: false,
+            last_modified: None,
+            last_etag: None,
+            size: Some(large_size),
+            checksums: vec![],
+            requires_auth: false,
+            requires_basic_auth: false,
+            headers: HashMap::new(),
+            max_connections: 2,
+            parts,
+            finished: false,
+        };
+
+        // Target == current → nothing changes.
+        grow_parts(&instruction, &mut metadata, 2).await?;
+        assert_eq!(metadata.parts.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn dynamic_split_default_is_true() {
+        let opts = DownloadOptionsBuilder::default().build().unwrap();
+        assert!(opts.dynamic_split());
+    }
+
+    #[test]
+    fn dynamic_split_can_be_disabled_via_builder() {
+        let opts = DownloadOptionsBuilder::default()
+            .dynamic_split(false)
+            .build()
+            .unwrap();
+        assert!(!opts.dynamic_split());
+    }
+
+    #[tokio::test]
+    async fn grow_parts_preserves_partial_progress() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempdir()?;
+        let instruction = build_dummy_instruction(tmp.path());
+        let total_size = Download::MIN_PART_SIZE * 16;
+        let already_written = Download::MIN_PART_SIZE * 3;
+
+        let part_path = instruction.part_path("big");
+        tokio::fs::write(&part_path, vec![0u8; already_written as usize]).await?;
+
+        let mut parts = HashMap::new();
+        parts.insert(
+            "big".to_string(),
+            PartDetails {
+                ulid: "big".to_string(),
+                offset: 0,
+                size: total_size,
+                finished: false,
+            },
+        );
+        let mut metadata = crate::download_metadata::DownloadMetadata {
+            url: "http://example.invalid/x".to_string(),
+            filename: "dummy".to_string(),
+            save_dir: tmp.path().to_string_lossy().into_owned(),
+            is_resumable: true,
+            use_server_time: false,
+            last_modified: None,
+            last_etag: None,
+            size: Some(total_size),
+            checksums: vec![],
+            requires_auth: false,
+            requires_basic_auth: false,
+            headers: HashMap::new(),
+            max_connections: 1,
+            parts,
+            finished: false,
+        };
+
+        grow_parts(&instruction, &mut metadata, 2).await?;
+
+        // Existing part should still cover the already-written prefix —
+        // its new size must be >= already_written so on-disk bytes
+        // remain valid.
+        let original = metadata.parts.get("big").expect("original part survives");
+        assert_eq!(original.offset, 0);
+        assert!(
+            original.size >= already_written,
+            "split point must not invalidate already-downloaded bytes (size={}, written={})",
+            original.size,
+            already_written,
+        );
+        let total: u64 = metadata.parts.values().map(|p| p.size).sum();
+        assert_eq!(total, total_size);
+        Ok(())
     }
 
     struct AlwaysAbortResolver;
@@ -1315,6 +1595,7 @@ mod tests {
             client,
             false,
             None,
+            true,
             retry_policy,
             DownloadContext::new(),
         );

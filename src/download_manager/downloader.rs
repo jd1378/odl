@@ -69,6 +69,8 @@ pub struct Downloader {
     client: Arc<Client>,
     randomize_user_agent: bool,
     concurrency_limit: Arc<AtomicUsize>,
+    /// Whether to attempt mid-flight subdivision of long-running parts.
+    dynamic_split: bool,
     speed_limiter: Option<Arc<BandwidthLimiter>>,
     retry_policy: FixedThenExponentialRetry,
     persist_mutex: Arc<Mutex<()>>,
@@ -88,6 +90,7 @@ impl Downloader {
         client: Client,
         randomize_user_agent: bool,
         speed_limit: Option<u64>,
+        dynamic_split: bool,
         retry_policy: FixedThenExponentialRetry,
         ctx: DownloadContext,
     ) -> Self {
@@ -117,6 +120,7 @@ impl Downloader {
             } else {
                 concurrency_limit
             })),
+            dynamic_split,
             speed_limiter,
             retry_policy,
             persist_mutex: Arc::new(Mutex::new(())),
@@ -420,6 +424,9 @@ impl Downloader {
             .concurrency_limit
             .load(Ordering::SeqCst)
             .saturating_sub(active.len());
+        if !self.dynamic_split {
+            return Ok(());
+        }
         while pending.len() < spare_capacity {
             if !self.try_split_active(active, pending).await? {
                 break;
@@ -559,23 +566,16 @@ impl Downloader {
 
         let downloaded = candidate.controller.downloaded();
         let current_limit = candidate.controller.limit();
-        if current_limit <= downloaded + MIN_DYNAMIC_SPLIT_SIZE * 2 {
-            return Ok(None);
-        }
-
-        let remaining = current_limit - downloaded;
-        // Round new_limit down to a cluster boundary so the new part's absolute
-        // offset stays aligned for reflink-based assembly.
-        let mask = Download::ASSEMBLY_CLUSTER_SIZE - 1;
-        let new_limit = (downloaded + remaining / 2) & !mask;
-        if new_limit <= downloaded {
-            return Ok(None);
-        }
-        let split_size = current_limit - new_limit;
-        if split_size < MIN_DYNAMIC_SPLIT_SIZE || new_limit - downloaded < MIN_DYNAMIC_SPLIT_SIZE {
-            return Ok(None);
-        }
-        candidate.controller.set_limit(new_limit);
+        // Shared split geometry: cluster-aligned boundary at roughly the
+        // midpoint of the remaining bytes. The bigger dynamic-split
+        // threshold (3 MB) avoids splitting off a tail that wouldn't
+        // outpace per-connection setup cost.
+        let split =
+            match Download::compute_split(0, current_limit, downloaded, MIN_DYNAMIC_SPLIT_SIZE) {
+                Some(s) => s,
+                None => return Ok(None),
+            };
+        candidate.controller.set_limit(split.new_left_size);
 
         let (new_part, encoded_metadata) = {
             let mut metadata = self.metadata.lock().await;
@@ -584,12 +584,12 @@ impl Downloader {
                     message: format!("Part with ulid {} not found", candidate.ulid),
                 })
             })?;
-            part_entry.size = new_limit;
-            let new_part_offset = part_entry.offset + new_limit;
+            let new_part_offset = part_entry.offset + split.new_left_size;
+            part_entry.size = split.new_left_size;
             let new_ulid = Ulid::new().to_string();
             let new_part = PartDetails {
                 offset: new_part_offset,
-                size: split_size,
+                size: split.new_right_size,
                 ulid: new_ulid.clone(),
                 finished: false,
             };
@@ -606,7 +606,7 @@ impl Downloader {
             size: new_part.size,
         });
 
-        Ok(Some((new_part, new_limit)))
+        Ok(Some((new_part, split.new_left_size)))
     }
 
     async fn mark_part_finished(&self, outcome: &PartOutcome) -> Result<(), OdlError> {
@@ -1275,6 +1275,7 @@ mod tests {
             reqwest::Client::builder().build()?,
             false,
             None,
+            true,
             FixedThenExponentialRetry::default(),
             DownloadContext::new(),
         );
@@ -1322,6 +1323,7 @@ mod tests {
             reqwest::Client::builder().build()?,
             false,
             None,
+            true,
             FixedThenExponentialRetry::default(),
             DownloadContext::new(),
         );
@@ -1373,6 +1375,7 @@ mod tests {
             reqwest::Client::builder().build()?,
             false,
             None,
+            true,
             FixedThenExponentialRetry::default(),
             DownloadContext::new(),
         );
