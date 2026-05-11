@@ -2,9 +2,11 @@ use std::{
     collections::{HashMap, VecDeque},
     sync::{
         Arc,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
 };
+
+use tokio_util::sync::CancellationToken;
 
 use bytes::Bytes;
 use reqwest::{
@@ -68,7 +70,6 @@ pub struct Downloader {
     metadata: Arc<Mutex<DownloadMetadata>>,
     client: Arc<Client>,
     randomize_user_agent: bool,
-    concurrency_limit: Arc<AtomicUsize>,
     /// Whether to attempt mid-flight subdivision of long-running parts.
     dynamic_split: bool,
     speed_limiter: Option<Arc<BandwidthLimiter>>,
@@ -95,6 +96,10 @@ impl Downloader {
         ctx: DownloadContext,
     ) -> Self {
         let concurrency_limit = metadata.max_connections as usize;
+        // Seed the live cap from metadata when the caller hasn't set
+        // anything yet. A caller that pre-set `ctx.live.set_max_connections`
+        // before download wins (seed_if_unset is a no-op when non-zero).
+        ctx.live.seed_if_unset(concurrency_limit.max(1));
         let speed_limiter = speed_limit
             .filter(|limit| *limit > 0)
             .map(|limit| Arc::new(BandwidthLimiter::new(limit)));
@@ -115,11 +120,6 @@ impl Downloader {
             metadata: Arc::new(Mutex::new(metadata)),
             client: Arc::new(client),
             randomize_user_agent,
-            concurrency_limit: Arc::new(AtomicUsize::new(if concurrency_limit == 0 {
-                1
-            } else {
-                concurrency_limit
-            })),
             dynamic_split,
             speed_limiter,
             retry_policy,
@@ -273,10 +273,16 @@ impl Downloader {
             .await?;
 
         loop {
+            let live_changed = self.ctx.live.notified();
+            tokio::pin!(live_changed);
             tokio::select! {
                 _ = self.ctx.cancel.cancelled() => {
                     join_set.shutdown().await;
                     return Err(OdlError::Cancelled);
+                }
+                _ = &mut live_changed => {
+                    self.apply_live_cap(&mut active);
+                    self.fill_capacity(&mut pending, &mut active, &mut join_set).await?;
                 }
                 next = join_set.join_next() => {
                     let Some(result) = next else { break };
@@ -312,7 +318,7 @@ impl Downloader {
         active: &mut HashMap<String, ActiveTask>,
         join_set: &mut JoinSet<Result<PartEvent, OdlError>>,
     ) -> Result<(), OdlError> {
-        let cap = self.concurrency_limit.load(Ordering::SeqCst);
+        let cap = self.ctx.live.max_connections();
         if cap == 0 {
             return Ok(());
         }
@@ -328,6 +334,27 @@ impl Downloader {
         }
 
         Ok(())
+    }
+
+    /// React to a runtime change in `ctx.live.max_connections()`. When the
+    /// new cap is below the current `active.len()`, cancel the surplus
+    /// in-flight tasks (chosen arbitrarily). Each cancelled task returns
+    /// `PartEvent::NeedsReschedule`, which the existing handler requeues
+    /// onto `pending`; they will resume later once capacity frees up. No
+    /// progress is lost — partial bytes stay on disk and the controller is
+    /// rebuilt from disk size on reschedule.
+    fn apply_live_cap(&self, active: &mut HashMap<String, ActiveTask>) {
+        let cap = self.ctx.live.max_connections();
+        if cap == 0 || active.len() <= cap {
+            return;
+        }
+        let surplus = active.len() - cap;
+        let victims: Vec<String> = active.keys().take(surplus).cloned().collect();
+        for ulid in victims {
+            if let Some(task) = active.get(&ulid) {
+                task.cancel.cancel();
+            }
+        }
     }
 
     async fn handle_join_result_item(
@@ -374,13 +401,7 @@ impl Downloader {
                             // Reduce concurrency to avoid scheduling too many
                             // simultaneous connections if the server only
                             // allows a small number. Ensure minimum of 1.
-                            let _ = self.concurrency_limit.fetch_update(
-                                Ordering::SeqCst,
-                                Ordering::SeqCst,
-                                |cur| {
-                                    if cur > 1 { Some(cur - 1) } else { Some(1) }
-                                },
-                            );
+                            self.ctx.live.shrink_by_one();
                         }
                     } else {
                         // If the task wasn't in `active`, still check whether
@@ -419,11 +440,8 @@ impl Downloader {
         active: &mut HashMap<String, ActiveTask>,
     ) -> Result<(), OdlError> {
         // Only attempt to create enough pending parts to fill the spare capacity
-        // (i.e. `concurrency_limit - active.len()`)
-        let spare_capacity = self
-            .concurrency_limit
-            .load(Ordering::SeqCst)
-            .saturating_sub(active.len());
+        // (i.e. `live.max_connections() - active.len()`)
+        let spare_capacity = self.ctx.live.max_connections().saturating_sub(active.len());
         if !self.dynamic_split {
             return Ok(());
         }
@@ -468,6 +486,8 @@ impl Downloader {
         // Pass through the optional probe notifier to the download task. The notifier
         // will be signalled when the task starts receiving data (first chunk).
         let probe_for_task = probe_notify.clone();
+        let task_cancel = CancellationToken::new();
+        let task_cancel_for_task = task_cancel.clone();
         join_set.spawn(
             async move {
                 download_part(
@@ -481,6 +501,7 @@ impl Downloader {
                     retry_policy,
                     ctx,
                     tracker,
+                    task_cancel_for_task,
                 )
                 .await
             }
@@ -496,6 +517,7 @@ impl Downloader {
             ActiveTask {
                 details: part,
                 controller,
+                cancel: task_cancel,
             },
         );
 
@@ -644,6 +666,10 @@ impl Downloader {
 struct ActiveTask {
     details: PartDetails,
     controller: Arc<PartController>,
+    /// Per-task cancel; tripped when the live-cap is reduced and this
+    /// task is selected as surplus. The task returns `NeedsReschedule`
+    /// so the part's remaining bytes go back to `pending`.
+    cancel: CancellationToken,
 }
 struct SplitCandidate {
     ulid: String,
@@ -945,9 +971,13 @@ async fn download_part(
     policy: FixedThenExponentialRetry,
     ctx: DownloadContext,
     tracker: Arc<ProgressTracker>,
+    task_cancel: CancellationToken,
 ) -> Result<PartEvent, OdlError> {
     if ctx.is_cancelled() {
         return Err(OdlError::Cancelled);
+    }
+    if task_cancel.is_cancelled() {
+        return Ok(PartEvent::NeedsReschedule { ulid: part.ulid });
     }
     let PartDetails {
         offset, size, ulid, ..
@@ -1048,7 +1078,18 @@ async fn download_part(
                 break;
             }
 
-            let chunk_result = time::timeout(STALE_CONNECTION_TIMEOUT, resp.chunk()).await;
+            let chunk_result = tokio::select! {
+                biased;
+                _ = ctx.cancel.cancelled() => {
+                    let _ = file.finish().await;
+                    return Err(OdlError::Cancelled);
+                }
+                _ = task_cancel.cancelled() => {
+                    let _ = file.finish().await;
+                    return Ok(PartEvent::NeedsReschedule { ulid });
+                }
+                r = time::timeout(STALE_CONNECTION_TIMEOUT, resp.chunk()) => r,
+            };
             let maybe_chunk = match chunk_result {
                 Ok(chunk_res) => match chunk_res.map_err(OdlError::from) {
                     Ok(opt) => opt,
@@ -1112,6 +1153,10 @@ async fn download_part(
                     _ = ctx.cancel.cancelled() => {
                         let _ = file.finish().await;
                         return Err(OdlError::Cancelled);
+                    }
+                    _ = task_cancel.cancelled() => {
+                        let _ = file.finish().await;
+                        return Ok(PartEvent::NeedsReschedule { ulid });
                     }
                 }
             }
@@ -1296,6 +1341,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_apply_live_cap_cancels_surplus() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempdir()?;
+        let download_dir = tmp.path().join("download");
+        let save_dir = tmp.path().join("save");
+        fs::create_dir_all(&download_dir).await?;
+        fs::create_dir_all(&save_dir).await?;
+
+        let mut parts = HashMap::new();
+        parts.insert("p1".to_string(), make_part("p1", 0, 1024));
+        let instruction = create_instruction(
+            &download_dir,
+            &save_dir,
+            "http://example.com/file",
+            1024,
+            parts,
+            3,
+        )
+        .await;
+        let metadata = instruction.as_metadata();
+        let downloader = Downloader::new(
+            Arc::clone(&instruction),
+            metadata,
+            reqwest::Client::builder().build()?,
+            false,
+            None,
+            true,
+            FixedThenExponentialRetry::default(),
+            DownloadContext::new(),
+        );
+
+        let make_task = |size: u64| ActiveTask {
+            details: make_part("x", 0, size),
+            controller: Arc::new(PartController::new(size, 0)),
+            cancel: CancellationToken::new(),
+        };
+        let mut active: HashMap<String, ActiveTask> = HashMap::new();
+        active.insert("a".to_string(), make_task(1024));
+        active.insert("b".to_string(), make_task(1024));
+        active.insert("c".to_string(), make_task(1024));
+
+        // No-op when cap >= active.
+        downloader.ctx.live.set_max_connections(3);
+        downloader.apply_live_cap(&mut active);
+        assert_eq!(
+            active.values().filter(|t| t.cancel.is_cancelled()).count(),
+            0
+        );
+
+        // Shrink to 1 — two should be cancelled.
+        downloader.ctx.live.set_max_connections(1);
+        downloader.apply_live_cap(&mut active);
+        assert_eq!(
+            active.values().filter(|t| t.cancel.is_cancelled()).count(),
+            2
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_live_controls_seed_and_set() {
+        let ctx = DownloadContext::new();
+        assert_eq!(ctx.live.max_connections(), 0);
+        ctx.live.seed_if_unset(4);
+        assert_eq!(ctx.live.max_connections(), 4);
+        // seed is a no-op when already set
+        ctx.live.seed_if_unset(8);
+        assert_eq!(ctx.live.max_connections(), 4);
+        // explicit set wins, clamped to >=1
+        ctx.live.set_max_connections(0);
+        assert_eq!(ctx.live.max_connections(), 1);
+        ctx.live.set_max_connections(6);
+        assert_eq!(ctx.live.max_connections(), 6);
+    }
+
+    #[tokio::test]
     async fn test_downloader_split_persists_metadata() -> Result<(), Box<dyn std::error::Error>> {
         let tmp = tempdir()?;
         let download_dir = tmp.path().join("download");
@@ -1438,6 +1558,7 @@ mod tests {
             FixedThenExponentialRetry::default(),
             DownloadContext::new(),
             Arc::new(ProgressTracker::new(Some(5))),
+            CancellationToken::new(),
         )
         .await?;
 

@@ -17,7 +17,10 @@
 //! from the receiver in a long-running task.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+
+use tokio::sync::Notify;
 
 /// Sampling cadence for speed / progress events emitted by the lib.
 ///
@@ -189,7 +192,83 @@ impl ProgressReporter for AsyncReporter {
     }
 }
 
-/// Per-download context: reporter + cancellation token.
+/// Runtime knob to change the number of live connections of a running
+/// download. Cheap to clone (single `Arc` inside). Increases let the
+/// downloader split unfinished parts to fill the new capacity (subject to
+/// `dynamic_split`). Decreases cancel surplus in-flight parts; their
+/// remaining bytes go back to the pending queue and resume later as
+/// capacity frees up.
+///
+/// A fresh instance reports `max_connections() == 0` (unset); the
+/// downloader seeds it from `metadata.max_connections` on first run.
+#[derive(Clone, Default)]
+pub struct LiveControls {
+    inner: Arc<LiveControlsInner>,
+}
+
+#[derive(Default)]
+struct LiveControlsInner {
+    max_connections: AtomicUsize,
+    notify: Notify,
+}
+
+impl LiveControls {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the desired number of live connections. `0` is clamped to `1`.
+    /// Effective on a running download as soon as the run loop observes
+    /// the notification (next iteration).
+    pub fn set_max_connections(&self, n: usize) {
+        self.inner
+            .max_connections
+            .store(n.max(1), Ordering::SeqCst);
+        self.inner.notify.notify_waiters();
+    }
+
+    /// Current live-connection target. `0` means unset (downloader will
+    /// seed from `metadata.max_connections` on first run).
+    pub fn max_connections(&self) -> usize {
+        self.inner.max_connections.load(Ordering::SeqCst)
+    }
+
+    /// Atomically initialize the cap if still unset; returns the post-call
+    /// value. Used by the downloader on startup.
+    pub(crate) fn seed_if_unset(&self, n: usize) -> usize {
+        let _ = self.inner.max_connections.compare_exchange(
+            0,
+            n.max(1),
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+        self.inner.max_connections.load(Ordering::SeqCst)
+    }
+
+    /// Bound the current cap to at most `n` (used by the downloader's
+    /// failure-driven shrink). Never raises.
+    pub(crate) fn shrink_by_one(&self) {
+        let _ = self.inner.max_connections.fetch_update(
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+            |cur| if cur > 1 { Some(cur - 1) } else { Some(1) },
+        );
+    }
+
+    pub(crate) fn notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.inner.notify.notified()
+    }
+}
+
+impl std::fmt::Debug for LiveControls {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveControls")
+            .field("max_connections", &self.max_connections())
+            .finish()
+    }
+}
+
+/// Per-download context: reporter + cancellation token + live controls.
 ///
 /// Cheap to clone (`Arc` and a `CancellationToken` clone). One context per
 /// `DownloadManager::download` call (attach via `DownloadRequest::ctx`).
@@ -200,6 +279,9 @@ pub struct DownloadContext {
     /// Optional URL the GUI knows this context by. Reporters that
     /// multiplex many downloads onto one channel use this to disambiguate.
     pub url: Option<Url>,
+    /// Live knobs (currently: connection count). Clone and call
+    /// `set_max_connections` on it mid-download to grow or shrink.
+    pub live: LiveControls,
 }
 
 impl DownloadContext {
@@ -208,7 +290,13 @@ impl DownloadContext {
             reporter: Arc::new(NoopReporter),
             cancel: CancellationToken::new(),
             url: None,
+            live: LiveControls::new(),
         }
+    }
+
+    pub fn with_live(mut self, live: LiveControls) -> Self {
+        self.live = live;
+        self
     }
 
     pub fn with_reporter(mut self, reporter: Arc<dyn ProgressReporter>) -> Self {
@@ -246,6 +334,7 @@ impl std::fmt::Debug for DownloadContext {
         f.debug_struct("DownloadContext")
             .field("cancel", &self.cancel)
             .field("url", &self.url)
+            .field("live", &self.live)
             .finish_non_exhaustive()
     }
 }
