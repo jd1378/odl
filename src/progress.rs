@@ -221,9 +221,7 @@ impl LiveControls {
     /// Effective on a running download as soon as the run loop observes
     /// the notification (next iteration).
     pub fn set_max_connections(&self, n: usize) {
-        self.inner
-            .max_connections
-            .store(n.max(1), Ordering::SeqCst);
+        self.inner.max_connections.store(n.max(1), Ordering::SeqCst);
         self.inner.notify.notify_waiters();
     }
 
@@ -248,11 +246,12 @@ impl LiveControls {
     /// Bound the current cap to at most `n` (used by the downloader's
     /// failure-driven shrink). Never raises.
     pub(crate) fn shrink_by_one(&self) {
-        let _ = self.inner.max_connections.fetch_update(
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-            |cur| if cur > 1 { Some(cur - 1) } else { Some(1) },
-        );
+        let _ =
+            self.inner
+                .max_connections
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
+                    if cur > 1 { Some(cur - 1) } else { Some(1) }
+                });
     }
 
     pub(crate) fn notified(&self) -> tokio::sync::futures::Notified<'_> {
