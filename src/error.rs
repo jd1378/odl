@@ -4,7 +4,7 @@ use thiserror::Error;
 use tokio::{sync::AcquireError, task::JoinError};
 
 use crate::{
-    config::ConfigBuilderError,
+    config::{ConfigBuilderError, DownloadOptionsBuilderError},
     conflict::{SaveConflict, ServerConflict},
 };
 
@@ -63,6 +63,8 @@ pub enum OdlError {
     Cancelled,
     #[error(transparent)]
     ConfigBuilderError(#[from] ConfigBuilderError),
+    #[error(transparent)]
+    DownloadOptionsBuilderError(#[from] DownloadOptionsBuilderError),
     #[error(transparent)]
     MetadataError(#[from] MetadataError),
     #[error("{message}")]

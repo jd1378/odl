@@ -15,7 +15,12 @@ use reqwest::{
 
 use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore};
 
-use crate::config::Config;
+/// Opaque permit held while one download counts against the manager's
+/// `max_concurrent_downloads` cap. Drop to release.
+#[derive(Debug)]
+pub struct DownloadPermit(#[allow(dead_code)] OwnedSemaphorePermit);
+
+use crate::config::{Config, DownloadOptions};
 use crate::download_manager::checksum::check_final_file_checksum;
 use crate::download_manager::recover_metadata::recover_metadata;
 use crate::download_manager::{downloader::Downloader, io::persist_metadata};
@@ -47,8 +52,12 @@ use crate::{download::Download, download_metadata::PartDetails, error::OdlError}
 /// //
 /// // let cfg = Config::default();
 /// // let manager = DownloadManager::new(cfg);
-/// // let instruction = manager.evaluate(url, save_dir, None, &save_resolver).await?;
-/// // let path = manager.download(instruction, &server_resolver).await?;
+/// // let instruction = manager
+/// //     .evaluate(EvaluateRequest::new(url, save_dir, &save_resolver))
+/// //     .await?;
+/// // let path = manager
+/// //     .download(DownloadRequest::new(instruction, &server_resolver))
+/// //     .await?;
 /// ```
 #[derive(Debug)]
 pub struct DownloadManager {
@@ -59,9 +68,75 @@ pub struct DownloadManager {
     semaphore: Arc<Semaphore>,
 }
 
+/// Inputs to [`DownloadManager::evaluate`]. Required fields are positional
+/// in [`Self::new`]; optional fields are set via chainable builders.
+#[derive(Debug)]
+pub struct EvaluateRequest<'a, CR: SaveConflictResolver> {
+    pub url: Url,
+    pub save_dir: PathBuf,
+    pub conflict_resolver: &'a CR,
+    pub credentials: Option<Credentials>,
+    pub ctx: Option<&'a DownloadContext>,
+    pub options: Option<&'a DownloadOptions>,
+}
+
+impl<'a, CR: SaveConflictResolver> EvaluateRequest<'a, CR> {
+    pub fn new<P: Into<PathBuf>>(url: Url, save_dir: P, conflict_resolver: &'a CR) -> Self {
+        Self {
+            url,
+            save_dir: save_dir.into(),
+            conflict_resolver,
+            credentials: None,
+            ctx: None,
+            options: None,
+        }
+    }
+    pub fn credentials(mut self, c: Credentials) -> Self {
+        self.credentials = Some(c);
+        self
+    }
+    pub fn ctx(mut self, c: &'a DownloadContext) -> Self {
+        self.ctx = Some(c);
+        self
+    }
+    pub fn options(mut self, o: &'a DownloadOptions) -> Self {
+        self.options = Some(o);
+        self
+    }
+}
+
+/// Inputs to [`DownloadManager::download`]. Required fields are positional
+/// in [`Self::new`]; optional fields are set via chainable builders.
+#[derive(Debug)]
+pub struct DownloadRequest<'a, CR: ServerConflictResolver> {
+    pub instruction: Download,
+    pub conflict_resolver: &'a CR,
+    pub ctx: Option<&'a DownloadContext>,
+    pub options: Option<&'a DownloadOptions>,
+}
+
+impl<'a, CR: ServerConflictResolver> DownloadRequest<'a, CR> {
+    pub fn new(instruction: Download, conflict_resolver: &'a CR) -> Self {
+        Self {
+            instruction,
+            conflict_resolver,
+            ctx: None,
+            options: None,
+        }
+    }
+    pub fn ctx(mut self, c: &'a DownloadContext) -> Self {
+        self.ctx = Some(c);
+        self
+    }
+    pub fn options(mut self, o: &'a DownloadOptions) -> Self {
+        self.options = Some(o);
+        self
+    }
+}
+
 impl DownloadManager {
     pub fn new(config: Config) -> DownloadManager {
-        let max_concurrent_downloads = config.max_concurrent_downloads;
+        let max_concurrent_downloads = config.max_concurrent_downloads();
         DownloadManager {
             config,
             semaphore: Arc::new(Semaphore::new(max_concurrent_downloads)),
@@ -73,9 +148,9 @@ impl DownloadManager {
     }
 
     pub async fn set_config(&mut self, value: Config) -> Result<(), AcquireError> {
-        let old_max = self.config.max_concurrent_downloads;
+        let old_max = self.config.max_concurrent_downloads();
         self.config = value;
-        let new_max = self.config.max_concurrent_downloads;
+        let new_max = self.config.max_concurrent_downloads();
         if new_max > old_max {
             let add_count = new_max.saturating_sub(old_max);
             self.semaphore.add_permits(add_count);
@@ -94,51 +169,40 @@ impl DownloadManager {
     /// Probe the remote URL and resolve save conflicts, returning a
     /// [`Download`] ready for [`Self::download`].
     ///
-    /// Use [`Self::evaluate_with`] to attach a progress reporter or
-    /// cancellation token.
-    pub async fn evaluate<CR>(
-        &self,
-        url: Url,
-        save_dir: PathBuf,
-        credentials: Option<Credentials>,
-        conflict_resolver: &CR,
-    ) -> Result<Download, OdlError>
+    /// All inputs are bundled in [`EvaluateRequest`]. Optional fields
+    /// (`credentials`, `ctx`, `options`) default to `None`; when `options`
+    /// is `None` the manager's own `config.download` is used.
+    pub async fn evaluate<CR>(&self, req: EvaluateRequest<'_, CR>) -> Result<Download, OdlError>
     where
         CR: SaveConflictResolver,
     {
-        self.evaluate_with(
+        let EvaluateRequest {
             url,
             save_dir,
-            credentials,
             conflict_resolver,
-            &DownloadContext::new(),
-        )
-        .await
-    }
-
-    /// Same as [`Self::evaluate`] with an explicit [`DownloadContext`] for
-    /// progress reporting and cancellation.
-    pub async fn evaluate_with<CR>(
-        &self,
-        url: Url,
-        save_dir: PathBuf,
-        credentials: Option<Credentials>,
-        conflict_resolver: &CR,
-        ctx: &DownloadContext,
-    ) -> Result<Download, OdlError>
-    where
-        CR: SaveConflictResolver,
-    {
+            credentials,
+            ctx,
+            options,
+        } = req;
+        let default_ctx;
+        let ctx = match ctx {
+            Some(c) => c,
+            None => {
+                default_ctx = DownloadContext::new();
+                &default_ctx
+            }
+        };
+        let opts = options.unwrap_or(self.config.download());
         ctx.emit(ProgressEvent::PhaseChanged(Phase::Evaluating));
         if ctx.is_cancelled() {
             return Err(OdlError::Cancelled);
         }
-        let client = self.get_client(None)?;
+        let client = self.get_client(opts)?;
 
         let retry_policy = FixedThenExponentialRetry {
-            max_n_retries: self.config.max_retries,
-            wait_time: self.config.wait_between_retries,
-            n_fixed_retries: self.config.n_fixed_retries,
+            max_n_retries: opts.max_retries(),
+            wait_time: opts.wait_between_retries(),
+            n_fixed_retries: opts.n_fixed_retries(),
         };
 
         let mut attempts: u32 = 0;
@@ -158,7 +222,7 @@ impl DownloadManager {
             if let Some(creds) = &credentials {
                 req = req.basic_auth(creds.username(), creds.password());
             }
-            if self.config.user_agent.is_none() && self.config.randomize_user_agent {
+            if opts.user_agent().is_none() && opts.randomize_user_agent() {
                 req = req.header(USER_AGENT, random_user_agent());
             }
 
@@ -177,14 +241,14 @@ impl DownloadManager {
         };
         let info = ResponseInfo::from(resp);
         let instruction = Download::from_response_info(
-            &self.config.download_dir,
+            self.config.download_dir(),
             save_dir,
             info,
-            self.config.max_connections,
-            self.config.use_server_time,
+            opts.max_connections(),
+            opts.use_server_time(),
             credentials,
-            Option::<Proxy>::from(&self.config),
-            Some(HeaderMap::from(&self.config)),
+            Option::<Proxy>::from(opts),
+            Some(HeaderMap::from(opts)),
         );
 
         ctx.emit(ProgressEvent::PhaseChanged(Phase::ResolvingConflicts));
@@ -201,35 +265,36 @@ impl DownloadManager {
         Ok(instruction)
     }
 
-    /// Immediately starts a download using the given instruction and conflict_resolver.
+    /// Run a download for an evaluated [`Download`] instruction.
     ///
-    /// Use [`Self::download_with`] to attach a progress reporter or
-    /// cancellation token.
-    pub async fn download<CR>(
-        &self,
-        instruction: Download,
-        conflict_resolver: &CR,
-    ) -> Result<PathBuf, OdlError>
+    /// All inputs are bundled in [`DownloadRequest`]. Optional fields
+    /// (`ctx`, `options`) default to `None`; when `options` is `None` the
+    /// manager's own `config.download` is used.
+    ///
+    /// Note: `max_concurrent_downloads` is a manager-only setting and is
+    /// not part of [`DownloadOptions`] — the semaphore that enforces it
+    /// is shared across all jobs.
+    pub async fn download<CR>(&self, req: DownloadRequest<'_, CR>) -> Result<PathBuf, OdlError>
     where
         CR: ServerConflictResolver,
     {
-        self.download_with(instruction, conflict_resolver, &DownloadContext::new())
-            .await
-    }
-
-    /// Same as [`Self::download`] with an explicit [`DownloadContext`] for
-    /// live progress and cancellation.
-    pub async fn download_with<CR>(
-        &self,
-        instruction: Download,
-        conflict_resolver: &CR,
-        ctx: &DownloadContext,
-    ) -> Result<PathBuf, OdlError>
-    where
-        CR: ServerConflictResolver,
-    {
+        let DownloadRequest {
+            instruction,
+            conflict_resolver,
+            ctx,
+            options,
+        } = req;
+        let default_ctx;
+        let ctx = match ctx {
+            Some(c) => c,
+            None => {
+                default_ctx = DownloadContext::new();
+                &default_ctx
+            }
+        };
+        let opts = options.unwrap_or(self.config.download());
         let result = self
-            .download_with_inner(instruction, conflict_resolver, ctx)
+            .download_inner(instruction, conflict_resolver, ctx, opts)
             .await;
         // Success emission lives in `process_download` so the
         // already-on-disk branch can be flagged distinctly. Failure /
@@ -245,11 +310,12 @@ impl DownloadManager {
         result
     }
 
-    async fn download_with_inner<CR>(
+    async fn download_inner<CR>(
         &self,
         instruction: Download,
         conflict_resolver: &CR,
         ctx: &DownloadContext,
+        opts: &DownloadOptions,
     ) -> Result<PathBuf, OdlError>
     where
         CR: ServerConflictResolver,
@@ -277,49 +343,44 @@ impl DownloadManager {
         }
 
         let result = self
-            .process_download(instruction, conflict_resolver, ctx)
+            .process_download(instruction, conflict_resolver, ctx, opts)
             .await;
         let _ = FileExt::unlock(&f);
         result
     }
 
     /// acquire a permit from this download manager's semaphore. Only up to `max_concurrent_downloads` are permitted at the same time.
-    pub async fn acquire_download_permit(&self) -> Result<OwnedSemaphorePermit, AcquireError> {
-        Arc::clone(&self.semaphore).acquire_owned().await
+    pub async fn acquire_download_permit(&self) -> Result<DownloadPermit, AcquireError> {
+        Arc::clone(&self.semaphore)
+            .acquire_owned()
+            .await
+            .map(DownloadPermit)
     }
 
-    fn get_client(&self, instructions: Option<&Download>) -> Result<Client, OdlError> {
+    fn get_client(&self, opts: &DownloadOptions) -> Result<Client, OdlError> {
         let mut client = reqwest::Client::builder();
 
-        if let Some(download) = instructions {
-            // we already have passed our config's headers and proxy to Download at evaluation, no need to check config here
-            if let Some(proxy) = download.proxy() {
-                client = client.proxy(proxy.clone());
-            }
-
-            if let Some(headers) = download.headers() {
-                client = client.default_headers(headers.clone());
-            }
-        } else {
-            // we want to evaluate the download, so we use config here
-            if self.config.headers.as_ref().is_some_and(|x| !x.is_empty()) {
-                client = client.default_headers(HeaderMap::from(&self.config));
-            }
-            if let Some(proxy) = Option::<Proxy>::from(&self.config) {
-                client = client.proxy(proxy);
-            }
+        // Always source per-job knobs from `opts` so per-job overrides are
+        // applied uniformly at every phase (evaluate AND download). The
+        // proxy/headers captured into `Download` at evaluate time are kept
+        // for metadata/round-trip but aren't read here.
+        if opts.headers().is_some_and(|x| !x.is_empty()) {
+            client = client.default_headers(HeaderMap::from(opts));
+        }
+        if let Some(proxy) = Option::<Proxy>::from(opts) {
+            client = client.proxy(proxy);
         }
 
-        if self.config.accept_invalid_certs {
-            client = client.danger_accept_invalid_certs(self.config.accept_invalid_certs)
+        if opts.accept_invalid_certs() {
+            client = client.danger_accept_invalid_certs(opts.accept_invalid_certs())
         }
-        if let Some(user_agent) = &self.config.user_agent {
-            client = client.user_agent(user_agent.clone());
+        if let Some(user_agent) = opts.user_agent() {
+            client = client.user_agent(user_agent.to_owned());
         }
-        if let Some(timeout) = &self.config.connect_timeout {
-            client = client.connect_timeout(*timeout);
+        if let Some(timeout) = opts.connect_timeout() {
+            client = client.connect_timeout(timeout);
         }
-        if !self.config.http2 {
+        if !opts.http2() {
             // Force HTTP/1.1: each part opens its own TCP connection, getting
             // an independent receive window. h2 multiplexes all parts on a
             // single TCP, whose per-stream/connection flow-control windows
@@ -340,6 +401,7 @@ impl DownloadManager {
         instruction: Download,
         conflict_resolver: &CR,
         ctx: &DownloadContext,
+        opts: &DownloadOptions,
     ) -> Result<PathBuf, OdlError>
     where
         CR: ServerConflictResolver,
@@ -410,17 +472,17 @@ impl DownloadManager {
                 .collect::<Vec<PartDetails>>();
 
             if !to_download.is_empty() {
-                let randomize_user_agent = if self.config.user_agent.is_some() {
+                let randomize_user_agent = if opts.user_agent().is_some() {
                     false
                 } else {
-                    self.config.randomize_user_agent
+                    opts.randomize_user_agent()
                 };
 
-                let client = self.get_client(Some(&instruction))?;
+                let client = self.get_client(opts)?;
                 let retry_policy = crate::retry_policies::FixedThenExponentialRetry {
-                    max_n_retries: self.config.max_retries,
-                    wait_time: self.config.wait_between_retries,
-                    n_fixed_retries: self.config.n_fixed_retries,
+                    max_n_retries: opts.max_retries(),
+                    wait_time: opts.wait_between_retries(),
+                    n_fixed_retries: opts.n_fixed_retries(),
                 };
                 ctx.emit(ProgressEvent::PhaseChanged(Phase::Downloading));
                 let downloader = Downloader::new(
@@ -428,7 +490,7 @@ impl DownloadManager {
                     metadata,
                     client,
                     randomize_user_agent,
-                    self.config.speed_limit,
+                    opts.speed_limit(),
                     retry_policy,
                     ctx.clone(),
                 );
@@ -503,6 +565,7 @@ impl DownloadManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::DownloadOptionsBuilder;
     use crate::conflict::FileChangedResolution;
     use crate::conflict::NotResumableResolution;
     use crate::conflict::ServerConflict;
@@ -513,9 +576,23 @@ mod tests {
     use mockito::Matcher;
     use mockito::Server;
     use std::collections::HashMap;
+    use std::path::Path;
     use tempfile::tempdir;
     use tokio::fs;
     use tokio::io::AsyncWriteExt;
+
+    fn test_cfg(download_dir: &Path, max_connections: u64) -> Config {
+        crate::config::ConfigBuilder::default()
+            .download_dir(download_dir.to_path_buf())
+            .download(
+                DownloadOptionsBuilder::default()
+                    .max_connections(max_connections)
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap()
+    }
 
     struct AlwaysAbortResolver;
 
@@ -591,22 +668,17 @@ mod tests {
         // Build DownloadManager with 2 connections and separate download/save dirs
         let tmp_data_dir = tempfile::tempdir()?;
         let tmp_save_dir = tempfile::tempdir()?;
-        let cfg = crate::config::ConfigBuilder::default()
-            .download_dir(tmp_data_dir.path().to_path_buf())
-            .max_connections(2)
-            .build()
-            .unwrap();
+        let cfg = test_cfg(tmp_data_dir.path(), 2);
         let dlm = DownloadManager::new(cfg);
 
         // Evaluate to get Download instruction
         let save_resolver = AlwaysReplaceResolver {};
         let instruction = dlm
-            .evaluate(
+            .evaluate(EvaluateRequest::new(
                 Url::parse(&format!("{}/testfile", url)).unwrap(),
                 tmp_save_dir.path().to_path_buf(),
-                None,
                 &save_resolver,
-            )
+            ))
             .await?;
 
         // Patch the instruction to simulate 2 parts
@@ -645,7 +717,9 @@ mod tests {
 
         let resolver = AlwaysAbortResolver {};
         // Download and concatenate
-        let final_path = dlm.download(instruction, &resolver).await?;
+        let final_path = dlm
+            .download(DownloadRequest::new(instruction, &resolver))
+            .await?;
 
         // Check file content
         let result = fs::read(&final_path).await?;
@@ -682,11 +756,7 @@ mod tests {
         let final_path = tmp_save_dir.path().join(filename);
         tokio::fs::write(&final_path, b"x").await?;
 
-        let cfg = crate::config::ConfigBuilder::default()
-            .download_dir(tmp_data_dir.path().to_path_buf())
-            .max_connections(1)
-            .build()
-            .unwrap();
+        let cfg = test_cfg(tmp_data_dir.path(), 1);
         let dlm = DownloadManager::new(cfg);
 
         struct AbortFinalResolver;
@@ -709,12 +779,11 @@ mod tests {
         let resolver = AbortFinalResolver {};
 
         let result = dlm
-            .evaluate(
+            .evaluate(EvaluateRequest::new(
                 Url::parse(&format!("{}/file_abort", base)).unwrap(),
                 tmp_save_dir.path().to_path_buf(),
-                None,
                 &resolver,
-            )
+            ))
             .await;
 
         assert!(matches!(
@@ -752,11 +821,7 @@ mod tests {
         let final_path = tmp_save_dir.path().join(filename);
         tokio::fs::write(&final_path, b"x").await?;
 
-        let cfg = crate::config::ConfigBuilder::default()
-            .download_dir(tmp_data_dir.path().to_path_buf())
-            .max_connections(1)
-            .build()
-            .unwrap();
+        let cfg = test_cfg(tmp_data_dir.path(), 1);
         let dlm = DownloadManager::new(cfg);
 
         struct AddNumberResolver;
@@ -779,12 +844,11 @@ mod tests {
         let resolver = AddNumberResolver {};
 
         let instruction = dlm
-            .evaluate(
+            .evaluate(EvaluateRequest::new(
                 Url::parse(&format!("{}/file_add", base)).unwrap(),
                 tmp_save_dir.path().to_path_buf(),
-                None,
                 &resolver,
-            )
+            ))
             .await?;
 
         // Expect suggested alternative filename (file_add_2)
@@ -832,22 +896,17 @@ mod tests {
         // Build DownloadManager with 1 connection and separate download/save dirs
         let tmp_data_dir = tempfile::tempdir()?;
         let tmp_save_dir = tempfile::tempdir()?;
-        let cfg = crate::config::ConfigBuilder::default()
-            .download_dir(tmp_data_dir.path().to_path_buf())
-            .max_connections(1)
-            .build()
-            .unwrap();
+        let cfg = test_cfg(tmp_data_dir.path(), 1);
         let dlm = DownloadManager::new(cfg);
 
         // Evaluate to get Download instruction
         let save_resolver = AlwaysReplaceResolver {};
         let instruction = dlm
-            .evaluate(
+            .evaluate(EvaluateRequest::new(
                 Url::parse(&format!("{}/singlefile", url)).unwrap(),
                 tmp_save_dir.path().to_path_buf(),
-                None,
                 &save_resolver,
-            )
+            ))
             .await?;
         // Patch the instruction to simulate 1 part
         let instruction = DownloadBuilder::default()
@@ -876,7 +935,9 @@ mod tests {
 
         let resolver = AlwaysAbortResolver {};
         // Download and concatenate
-        let final_path = dlm.download(instruction, &resolver).await?;
+        let final_path = dlm
+            .download(DownloadRequest::new(instruction, &resolver))
+            .await?;
 
         // Check file content
         let result = fs::read(&final_path).await?;
@@ -912,22 +973,17 @@ mod tests {
         // Build DownloadManager with 2 connections and separate download/save dirs
         let tmp_data_dir = tempfile::tempdir()?;
         let tmp_save_dir = tempfile::tempdir()?;
-        let cfg = crate::config::ConfigBuilder::default()
-            .download_dir(tmp_data_dir.path().to_path_buf())
-            .max_connections(2)
-            .build()
-            .unwrap();
+        let cfg = test_cfg(tmp_data_dir.path(), 2);
         let dlm = DownloadManager::new(cfg);
 
         // Evaluate to get Download instruction
         let save_resolver = AlwaysReplaceResolver {};
         let instruction = dlm
-            .evaluate(
+            .evaluate(EvaluateRequest::new(
                 Url::parse(&format!("{}/nonresumablefile", url)).unwrap(),
                 tmp_save_dir.path().to_path_buf(),
-                None,
                 &save_resolver,
-            )
+            ))
             .await?;
 
         // Patch the instruction to simulate 2 parts, but not resumable
@@ -977,7 +1033,9 @@ mod tests {
 
         let resolver = AssertTestResolver {};
         // Download should abort due to not resumable conflict
-        let result = dlm.download(instruction, &resolver).await;
+        let result = dlm
+            .download(DownloadRequest::new(instruction, &resolver))
+            .await;
 
         assert!(matches!(
             result,
@@ -1028,22 +1086,17 @@ mod tests {
         // Build DownloadManager with 2 connections (will be forced to 1) and separate download/save dirs
         let tmp_data_dir = tempfile::tempdir()?;
         let tmp_save_dir = tempfile::tempdir()?;
-        let cfg = crate::config::ConfigBuilder::default()
-            .download_dir(tmp_data_dir.path().to_path_buf())
-            .max_connections(2)
-            .build()
-            .unwrap();
+        let cfg = test_cfg(tmp_data_dir.path(), 2);
         let dlm = DownloadManager::new(cfg);
 
         // Evaluate to get Download instruction
         let save_resolver = AlwaysReplaceResolver {};
         let instruction = dlm
-            .evaluate(
+            .evaluate(EvaluateRequest::new(
                 Url::parse(&format!("{}/nonresumablefile_restart", url)).unwrap(),
                 tmp_save_dir.path().to_path_buf(),
-                None,
                 &save_resolver,
-            )
+            ))
             .await?;
 
         // Patch the instruction to simulate 2 parts, but not resumable
@@ -1094,7 +1147,9 @@ mod tests {
         let resolver = AssertTestResolver {};
 
         // Download should restart and succeed with a single connection
-        let final_path = dlm.download(instruction, &resolver).await?;
+        let final_path = dlm
+            .download(DownloadRequest::new(instruction, &resolver))
+            .await?;
 
         // Check file content
         let result = fs::read(&final_path).await?;
@@ -1131,22 +1186,17 @@ mod tests {
         // Build DownloadManager with 1 connection and separate download/save dirs
         let tmp_data_dir = tempfile::tempdir()?;
         let tmp_save_dir = tempfile::tempdir()?;
-        let cfg = crate::config::ConfigBuilder::default()
-            .download_dir(tmp_data_dir.path().to_path_buf())
-            .max_connections(1)
-            .build()
-            .unwrap();
+        let cfg = test_cfg(tmp_data_dir.path(), 1);
         let dlm = DownloadManager::new(cfg);
 
         // Evaluate to get Download instruction
         let save_resolver = AlwaysReplaceResolver {};
         let instruction = dlm
-            .evaluate(
+            .evaluate(EvaluateRequest::new(
                 Url::parse(&format!("{}/zerofile", url)).unwrap(),
                 tmp_save_dir.path().to_path_buf(),
-                None,
                 &save_resolver,
-            )
+            ))
             .await?;
 
         // Patch the instruction to simulate 1 part of 0 bytes
@@ -1176,7 +1226,9 @@ mod tests {
 
         let resolver = AlwaysAbortResolver {};
         // Download and concatenate
-        let final_path = dlm.download(instruction, &resolver).await?;
+        let final_path = dlm
+            .download(DownloadRequest::new(instruction, &resolver))
+            .await?;
 
         // Check file content
         let result = fs::read(&final_path).await?;
@@ -1326,9 +1378,14 @@ mod tests {
         let tmp_save_dir = tempfile::tempdir()?;
         let cfg = crate::config::ConfigBuilder::default()
             .download_dir(tmp_data_dir.path().to_path_buf())
-            .max_connections(1)
-            .user_agent(Some(custom_ua.to_string()))
-            .randomize_user_agent(false)
+            .download(
+                DownloadOptionsBuilder::default()
+                    .max_connections(1)
+                    .user_agent(Some(custom_ua.to_string()))
+                    .randomize_user_agent(false)
+                    .build()
+                    .unwrap(),
+            )
             .build()
             .unwrap();
         let dlm = DownloadManager::new(cfg);
@@ -1336,12 +1393,11 @@ mod tests {
         // Evaluate to get Download instruction
         let save_resolver = AlwaysReplaceResolver {};
         let instruction = dlm
-            .evaluate(
+            .evaluate(EvaluateRequest::new(
                 Url::parse(&format!("{}/useragentfile", url)).unwrap(),
                 tmp_save_dir.path().to_path_buf(),
-                None,
                 &save_resolver,
-            )
+            ))
             .await?;
 
         // Patch the instruction to simulate 1 part
@@ -1370,9 +1426,120 @@ mod tests {
             .unwrap();
 
         let resolver = AlwaysAbortResolver {};
-        let final_path = dlm.download(instruction, &resolver).await?;
+        let final_path = dlm
+            .download(DownloadRequest::new(instruction, &resolver))
+            .await?;
 
         let result = tokio::fs::read(&final_path).await?;
+        assert_eq!(result, file_content);
+
+        head_mock.assert_async().await;
+        get_mock.assert_async().await;
+
+        Ok(())
+    }
+
+    /// Per-job `DownloadOptions` override must replace the manager's
+    /// own UA (and propagate to both evaluate's HEAD and download's GET).
+    /// Regression guard for the get_client unification.
+    #[tokio::test]
+    async fn test_per_job_options_override_user_agent_end_to_end()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let file_content = b"per-job override payload";
+
+        let mut server = Server::new_async().await;
+        let url = server.url();
+
+        let manager_ua = "ManagerUA/1.0";
+        let job_ua = "PerJobUA/2.0";
+
+        // Both HEAD and GET must see the per-job UA, not the manager UA.
+        let head_mock = server
+            .mock("HEAD", "/perjob")
+            .match_header("user-agent", Matcher::Exact(job_ua.into()))
+            .with_status(200)
+            .with_header("content-length", &file_content.len().to_string())
+            .with_header("accept-ranges", "bytes")
+            .with_header("etag", "pjetag")
+            .create_async()
+            .await;
+
+        let get_mock = server
+            .mock("GET", "/perjob")
+            .match_header("user-agent", Matcher::Exact(job_ua.into()))
+            .match_header(
+                "range",
+                Matcher::Exact(format!("bytes=0-{}", file_content.len() - 1)),
+            )
+            .with_status(206)
+            .with_body(file_content)
+            .create_async()
+            .await;
+
+        let tmp_data_dir = tempfile::tempdir()?;
+        let tmp_save_dir = tempfile::tempdir()?;
+        let cfg = crate::config::ConfigBuilder::default()
+            .download_dir(tmp_data_dir.path().to_path_buf())
+            .download(
+                DownloadOptionsBuilder::default()
+                    .max_connections(1)
+                    .user_agent(Some(manager_ua.to_string()))
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap();
+        let dlm = DownloadManager::new(cfg);
+
+        // Per-job options overriding manager defaults.
+        let job_opts = DownloadOptionsBuilder::default()
+            .max_connections(1)
+            .user_agent(Some(job_ua.to_string()))
+            .build()
+            .unwrap();
+
+        let save_resolver = AlwaysReplaceResolver {};
+        let instruction = dlm
+            .evaluate(
+                EvaluateRequest::new(
+                    Url::parse(&format!("{}/perjob", url)).unwrap(),
+                    tmp_save_dir.path().to_path_buf(),
+                    &save_resolver,
+                )
+                .options(&job_opts),
+            )
+            .await?;
+
+        let instruction = DownloadBuilder::default()
+            .download_dir(instruction.download_dir().clone())
+            .save_dir(instruction.save_dir().clone())
+            .filename(instruction.filename().to_string())
+            .url(instruction.url().clone())
+            .size(Some(file_content.len() as u64))
+            .max_connections(1)
+            .parts({
+                let mut parts = std::collections::HashMap::new();
+                parts.insert(
+                    "part1".to_string(),
+                    PartDetails {
+                        ulid: "part1".to_string(),
+                        offset: 0,
+                        size: file_content.len() as u64,
+                        finished: false,
+                    },
+                );
+                parts
+            })
+            .is_resumable(true)
+            .build()
+            .unwrap();
+
+        let resolver = AlwaysAbortResolver {};
+        let final_path = dlm
+            .download(DownloadRequest::new(instruction, &resolver).options(&job_opts))
+            .await?;
+
+        let result = fs::read(&final_path).await?;
         assert_eq!(result, file_content);
 
         head_mock.assert_async().await;
@@ -1421,21 +1588,16 @@ mod tests {
 
         let tmp_data_dir = tempfile::tempdir()?;
         let tmp_save_dir = tempfile::tempdir()?;
-        let cfg = crate::config::ConfigBuilder::default()
-            .download_dir(tmp_data_dir.path().to_path_buf())
-            .max_connections(1)
-            .build()
-            .unwrap();
+        let cfg = test_cfg(tmp_data_dir.path(), 1);
         let dlm = DownloadManager::new(cfg);
 
         let save_resolver = AlwaysReplaceResolver {};
         let instruction = dlm
-            .evaluate(
+            .evaluate(EvaluateRequest::new(
                 Url::parse(&format!("{}/payload.bin", url)).unwrap(),
                 tmp_save_dir.path().to_path_buf(),
-                None,
                 &save_resolver,
-            )
+            ))
             .await?;
 
         // checksum must have been picked up from Repr-Digest during evaluate
@@ -1446,7 +1608,9 @@ mod tests {
         assert_eq!(instruction.size(), Some(file_content.len() as u64));
 
         let resolver = AlwaysAbortResolver {};
-        let final_path = dlm.download(instruction, &resolver).await?;
+        let final_path = dlm
+            .download(DownloadRequest::new(instruction, &resolver))
+            .await?;
 
         let on_disk = fs::read(&final_path).await?;
         assert_eq!(on_disk, file_content, "final file content mismatch");
@@ -1494,25 +1658,22 @@ mod tests {
 
         let tmp_data_dir = tempfile::tempdir()?;
         let tmp_save_dir = tempfile::tempdir()?;
-        let cfg = crate::config::ConfigBuilder::default()
-            .download_dir(tmp_data_dir.path().to_path_buf())
-            .max_connections(1)
-            .build()
-            .unwrap();
+        let cfg = test_cfg(tmp_data_dir.path(), 1);
         let dlm = DownloadManager::new(cfg);
 
         let save_resolver = AlwaysReplaceResolver {};
         let instruction = dlm
-            .evaluate(
+            .evaluate(EvaluateRequest::new(
                 Url::parse(&format!("{}/bad.bin", url)).unwrap(),
                 tmp_save_dir.path().to_path_buf(),
-                None,
                 &save_resolver,
-            )
+            ))
             .await?;
 
         let resolver = AlwaysAbortResolver {};
-        let result = dlm.download(instruction, &resolver).await;
+        let result = dlm
+            .download(DownloadRequest::new(instruction, &resolver))
+            .await;
         assert!(
             matches!(
                 result,
@@ -1584,21 +1745,16 @@ mod tests {
 
         let tmp_data_dir = tempfile::tempdir()?;
         let tmp_save_dir = tempfile::tempdir()?;
-        let cfg = crate::config::ConfigBuilder::default()
-            .download_dir(tmp_data_dir.path().to_path_buf())
-            .max_connections(3)
-            .build()
-            .unwrap();
+        let cfg = test_cfg(tmp_data_dir.path(), 3);
         let dlm = DownloadManager::new(cfg);
 
         let save_resolver = AlwaysReplaceResolver {};
         let instruction = dlm
-            .evaluate(
+            .evaluate(EvaluateRequest::new(
                 Url::parse(&format!("{}/big.bin", url)).unwrap(),
                 tmp_save_dir.path().to_path_buf(),
-                None,
                 &save_resolver,
-            )
+            ))
             .await?;
 
         // Verify evaluate produced exactly 3 parts before any download work.
@@ -1625,7 +1781,9 @@ mod tests {
         assert!(!metadata.checksums.is_empty());
 
         let resolver = AlwaysAbortResolver {};
-        let final_path = dlm.download(instruction, &resolver).await?;
+        let final_path = dlm
+            .download(DownloadRequest::new(instruction, &resolver))
+            .await?;
 
         let on_disk = fs::read(&final_path).await?;
         assert_eq!(on_disk.len(), file_content.len());
@@ -1681,8 +1839,13 @@ mod tests {
         let tmp_save_dir = tempfile::tempdir()?;
         let cfg = crate::config::ConfigBuilder::default()
             .download_dir(tmp_data_dir.path().to_path_buf())
-            .max_connections(1)
-            .randomize_user_agent(true)
+            .download(
+                DownloadOptionsBuilder::default()
+                    .max_connections(1)
+                    .randomize_user_agent(true)
+                    .build()
+                    .unwrap(),
+            )
             .build()
             .unwrap();
         let dlm = DownloadManager::new(cfg);
@@ -1690,12 +1853,11 @@ mod tests {
         // Evaluate to get Download instruction
         let save_resolver = AlwaysReplaceResolver {};
         let instruction = dlm
-            .evaluate(
+            .evaluate(EvaluateRequest::new(
                 Url::parse(&format!("{}/randomua", url)).unwrap(),
                 tmp_save_dir.path().to_path_buf(),
-                None,
                 &save_resolver,
-            )
+            ))
             .await?;
 
         // Patch the instruction to simulate 1 part
@@ -1724,7 +1886,9 @@ mod tests {
             .unwrap();
 
         let resolver = AlwaysAbortResolver {};
-        let final_path = dlm.download(instruction, &resolver).await?;
+        let final_path = dlm
+            .download(DownloadRequest::new(instruction, &resolver))
+            .await?;
 
         let result = tokio::fs::read(&final_path).await?;
         assert_eq!(result, file_content);
@@ -1825,15 +1989,13 @@ mod tests {
         let final_path = instruction.final_file_path();
         fs::write(&final_path, vec![0u8; file_content.len()]).await?;
 
-        let cfg = crate::config::ConfigBuilder::default()
-            .download_dir(tmp_data_dir.path().to_path_buf())
-            .max_connections(1)
-            .build()
-            .unwrap();
+        let cfg = test_cfg(tmp_data_dir.path(), 1);
         let dlm = DownloadManager::new(cfg);
         let resolver = AlwaysAbortResolver {};
 
-        let result_path = dlm.download(instruction.clone(), &resolver).await?;
+        let result_path = dlm
+            .download(DownloadRequest::new(instruction.clone(), &resolver))
+            .await?;
         assert_eq!(result_path, final_path);
 
         let on_disk = fs::read(&final_path).await?;
@@ -1929,15 +2091,13 @@ mod tests {
         let pre_meta = std::fs::metadata(&part_path)?;
         let pre_final_meta = std::fs::metadata(instruction.final_file_path())?;
 
-        let cfg = crate::config::ConfigBuilder::default()
-            .download_dir(tmp_data_dir.path().to_path_buf())
-            .max_connections(1)
-            .build()
-            .unwrap();
+        let cfg = test_cfg(tmp_data_dir.path(), 1);
         let dlm = DownloadManager::new(cfg);
         let resolver = AlwaysAbortResolver {};
 
-        let final_path = dlm.download(instruction.clone(), &resolver).await?;
+        let final_path = dlm
+            .download(DownloadRequest::new(instruction.clone(), &resolver))
+            .await?;
         let on_disk = fs::read(&final_path).await?;
         assert_eq!(
             on_disk, file_content,
@@ -2028,15 +2188,13 @@ mod tests {
         let metadata = instruction.as_metadata();
         persist_metadata(&metadata, &instruction).await?;
 
-        let cfg = crate::config::ConfigBuilder::default()
-            .download_dir(tmp_data_dir.path().to_path_buf())
-            .max_connections(1)
-            .build()
-            .unwrap();
+        let cfg = test_cfg(tmp_data_dir.path(), 1);
         let dlm = DownloadManager::new(cfg);
         let resolver = AlwaysAbortResolver {};
 
-        let final_path = dlm.download(instruction.clone(), &resolver).await?;
+        let final_path = dlm
+            .download(DownloadRequest::new(instruction.clone(), &resolver))
+            .await?;
         let on_disk = fs::read(&final_path).await?;
         assert_eq!(
             on_disk, file_content,
@@ -2092,15 +2250,13 @@ mod tests {
                 .unwrap_or(false)
         );
 
-        let cfg = crate::config::ConfigBuilder::default()
-            .download_dir(tmp_data_dir.path().to_path_buf())
-            .max_connections(1)
-            .build()
-            .unwrap();
+        let cfg = test_cfg(tmp_data_dir.path(), 1);
         let dlm = DownloadManager::new(cfg);
         let resolver = AlwaysAbortResolver {};
 
-        let final_path = dlm.download(instruction.clone(), &resolver).await?;
+        let final_path = dlm
+            .download(DownloadRequest::new(instruction.clone(), &resolver))
+            .await?;
         let on_disk = fs::read(&final_path).await?;
         assert_eq!(on_disk, file_content);
 

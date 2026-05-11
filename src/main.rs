@@ -5,7 +5,6 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -13,13 +12,13 @@ use clap::{CommandFactory, Parser};
 use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressState, ProgressStyle};
 use odl::{
     Download,
-    config::{Config, ConfigBuilder},
+    config::Config,
     conflict::{
         FileChangedResolution, FinalFileExistsResolution, NotResumableResolution,
         SameDownloadExistsResolution, SaveConflictResolver, ServerConflictResolver,
     },
     credentials::Credentials,
-    download_manager::DownloadManager,
+    download_manager::{DownloadManager, DownloadRequest, EvaluateRequest},
     error::OdlError,
     progress::{
         AsyncReporter, DownloadContext, Phase, ProgressEvent, ProgressReporter, SAMPLE_INTERVAL,
@@ -414,48 +413,54 @@ async fn main() -> Result<(), OdlError> {
                 }
 
                 // apply command-specified settings into config
-                if let Some(v) = download_dir {
-                    cfg.download_dir = v.clone();
-                }
+                let mut dl_b = cfg.download().clone().into_builder();
                 if let Some(v) = max_connections {
-                    cfg.max_connections = *v;
-                }
-                if let Some(v) = max_concurrent_downloads {
-                    cfg.max_concurrent_downloads = *v;
+                    dl_b.max_connections(*v);
                 }
                 if let Some(v) = max_retries {
-                    cfg.max_retries = *v;
-                }
-                if let Some(v) = n_fixed_retries {
-                    cfg.n_fixed_retries = *v;
+                    dl_b.max_retries(*v);
                 }
                 if let Some(v) = wait_between_retries {
-                    cfg.wait_between_retries = *v;
+                    dl_b.wait_between_retries(*v);
                 }
-                if let Some(v) = speed_limit {
-                    cfg.speed_limit = Some(*v);
+                if let Some(v) = n_fixed_retries {
+                    dl_b.n_fixed_retries(*v);
                 }
                 if let Some(v) = user_agent {
-                    cfg.user_agent = Some(v.clone());
+                    dl_b.user_agent(Some(v.clone()));
                 }
                 if let Some(v) = randomize_user_agent {
-                    cfg.randomize_user_agent = *v;
+                    dl_b.randomize_user_agent(*v);
                 }
                 if let Some(v) = proxy {
-                    cfg.proxy = Some(v.clone());
-                }
-                if let Some(v) = *timeout {
-                    cfg.connect_timeout = Some(v);
+                    dl_b.proxy(Some(v.clone()));
                 }
                 if let Some(v) = use_server_time {
-                    cfg.use_server_time = *v;
+                    dl_b.use_server_time(*v);
                 }
                 if let Some(v) = accept_invalid_certs {
-                    cfg.accept_invalid_certs = *v;
+                    dl_b.accept_invalid_certs(*v);
+                }
+                if let Some(v) = speed_limit {
+                    dl_b.speed_limit(Some(*v));
+                }
+                if let Some(v) = *timeout {
+                    dl_b.connect_timeout(Some(v));
                 }
                 if let Some(v) = http2 {
-                    cfg.http2 = *v;
+                    dl_b.http2(*v);
                 }
+                let new_download = dl_b.build()?;
+
+                let mut cfg_b = cfg.into_builder();
+                cfg_b.download(new_download);
+                if let Some(v) = download_dir {
+                    cfg_b.download_dir(v.clone());
+                }
+                if let Some(v) = max_concurrent_downloads {
+                    cfg_b.max_concurrent_downloads(*v);
+                }
+                cfg = cfg_b.build()?;
 
                 match cfg.save_to_file(&config_path).await {
                     Ok(()) => println!("Saved configuration to {}", config_path.display()),
@@ -605,12 +610,25 @@ async fn main() -> Result<(), OdlError> {
         let handle = tokio::spawn(async move {
             let _permit = permit;
             let mut instruction = dlm
-                .evaluate_with(url, save_dir, credentials, &resolver, &ctx)
+                .evaluate(EvaluateRequest {
+                    url,
+                    save_dir,
+                    conflict_resolver: &resolver,
+                    credentials,
+                    ctx: Some(&ctx),
+                    options: None,
+                })
                 .await?;
             if let Some(filename) = user_provided_filename {
                 instruction.set_filename(filename);
             }
-            dlm.download_with(instruction, &resolver, &ctx).await
+            dlm.download(DownloadRequest {
+                instruction,
+                conflict_resolver: &resolver,
+                ctx: Some(&ctx),
+                options: None,
+            })
+            .await
         });
 
         handles.push(handle);
@@ -651,38 +669,15 @@ async fn build_download_manager(args: &Args) -> Result<DownloadManager, OdlError
         .await
         .unwrap_or_default();
 
-    let max_connections: u64 = args.max_connections.unwrap_or(cfg.max_connections);
-    let max_concurrent_downloads: usize = args
-        .max_concurrent_downloads
-        .unwrap_or(cfg.max_concurrent_downloads);
-    let max_retries: u32 = args.max_retries.unwrap_or(cfg.max_retries);
-    let wait_between_retries: Duration = args
-        .wait_between_retries
-        .or(Some(cfg.wait_between_retries))
-        .and_then(|d| {
-            let secs = d.as_secs_f64();
-            if secs.is_finite() && secs >= 0.0 {
-                Some(d)
-            } else {
-                None
-            }
-        })
-        .unwrap_or(Config::default_wait_between_retries());
-    let n_fixed_retries = args.n_fixed_retries.unwrap_or(cfg.n_fixed_retries);
-    let user_agent = args.user_agent.clone().or(cfg.user_agent);
-    let randomize_user_agent = args
-        .randomize_user_agent
-        .unwrap_or(cfg.randomize_user_agent);
-    let proxy_str = args.proxy.clone().or(cfg.proxy);
-    // proxy_str remains an Option<String> and will be handed to the builder;
-    // validation/parsing is performed by the ConfigBuilder validation step.
-    let use_server_time = args.use_server_time.unwrap_or(cfg.use_server_time);
-    let accept_invalid_certs = args
-        .accept_invalid_certs
-        .unwrap_or(cfg.accept_invalid_certs);
-    let http2 = args.http2.unwrap_or(cfg.http2);
-    let speed_limit = args.speed_limit.or(cfg.speed_limit);
-    let connect_timeout = args.timeout.or(cfg.connect_timeout).and_then(|d| {
+    let wait_between_retries = args.wait_between_retries.and_then(|d| {
+        let secs = d.as_secs_f64();
+        if secs.is_finite() && secs >= 0.0 {
+            Some(d)
+        } else {
+            None
+        }
+    });
+    let connect_timeout = args.timeout.and_then(|d| {
         let secs = d.as_secs_f64();
         if secs.is_finite() && secs >= 0.0 {
             Some(d)
@@ -691,31 +686,9 @@ async fn build_download_manager(args: &Args) -> Result<DownloadManager, OdlError
         }
     });
 
-    let mut builder = ConfigBuilder::default(); // Changed to ConfigBuilder
-    builder
-        .config_file(config_file)
-        .connect_timeout(connect_timeout)
-        .max_connections(max_connections)
-        .max_concurrent_downloads(max_concurrent_downloads)
-        .max_retries(max_retries)
-        .n_fixed_retries(n_fixed_retries)
-        .wait_between_retries(wait_between_retries)
-        .user_agent(user_agent)
-        .randomize_user_agent(randomize_user_agent)
-        .proxy(proxy_str)
-        .use_server_time(use_server_time)
-        .accept_invalid_certs(accept_invalid_certs)
-        .http2(http2)
-        .speed_limit(speed_limit);
-
-    // always set download_dir from args or fallback to config
-    let download_dir = args
-        .download_dir
-        .clone()
-        .unwrap_or(cfg.download_dir.clone());
-    builder.download_dir(download_dir);
-
-    if !args.headers.is_empty() {
+    let headers = if args.headers.is_empty() {
+        None
+    } else {
         let mut headers_map = indexmap::IndexMap::new();
         for header in &args.headers {
             if let Some((key, value)) = header.split_once(':') {
@@ -728,11 +701,62 @@ async fn build_download_manager(args: &Args) -> Result<DownloadManager, OdlError
                 });
             }
         }
-        builder.headers(Some(headers_map));
-    }
+        Some(headers_map)
+    };
 
-    let cfg = builder.build()?; // Build the configuration
-    Ok(DownloadManager::new(cfg)) // Create DownloadManager with the new configuration
+    let mut dl_b = cfg.download().clone().into_builder();
+    if let Some(v) = args.max_connections {
+        dl_b.max_connections(v);
+    }
+    if let Some(v) = args.max_retries {
+        dl_b.max_retries(v);
+    }
+    if let Some(v) = wait_between_retries {
+        dl_b.wait_between_retries(v);
+    }
+    if let Some(v) = args.n_fixed_retries {
+        dl_b.n_fixed_retries(v);
+    }
+    if let Some(v) = args.user_agent.clone() {
+        dl_b.user_agent(Some(v));
+    }
+    if let Some(v) = args.randomize_user_agent {
+        dl_b.randomize_user_agent(v);
+    }
+    if let Some(v) = args.proxy.clone() {
+        dl_b.proxy(Some(v));
+    }
+    if let Some(v) = args.use_server_time {
+        dl_b.use_server_time(v);
+    }
+    if let Some(v) = args.accept_invalid_certs {
+        dl_b.accept_invalid_certs(v);
+    }
+    if let Some(v) = args.speed_limit {
+        dl_b.speed_limit(Some(v));
+    }
+    if let Some(v) = connect_timeout {
+        dl_b.connect_timeout(Some(v));
+    }
+    if let Some(v) = headers {
+        dl_b.headers(Some(v));
+    }
+    if let Some(v) = args.http2 {
+        dl_b.http2(v);
+    }
+    let download = dl_b.build()?;
+
+    let mut cfg_b = cfg.into_builder();
+    cfg_b.download(download);
+    if let Some(v) = args.download_dir.clone() {
+        cfg_b.download_dir(v);
+    }
+    if let Some(v) = args.max_concurrent_downloads {
+        cfg_b.max_concurrent_downloads(v);
+    }
+    let cfg = cfg_b.build()?;
+
+    Ok(DownloadManager::new(cfg))
 }
 
 #[instrument(skip(args), name = "Determining download type")]
@@ -806,9 +830,13 @@ async fn download_remote_file(dlm: &DownloadManager, url: Url) -> Result<PathBuf
     // against the same concurrency limits as other downloads
     let _permit = dlm.acquire_download_permit().await?;
 
-    let instruction = dlm.evaluate(url, save_dir, None, &resolver).await?;
+    let instruction = dlm
+        .evaluate(EvaluateRequest::new(url, save_dir, &resolver))
+        .await?;
 
-    let path = dlm.download(instruction, &resolver).await?;
+    let path = dlm
+        .download(DownloadRequest::new(instruction, &resolver))
+        .await?;
 
     // `_permit` will be dropped here when going out of scope, releasing
     // the semaphore permit back to the manager.

@@ -45,8 +45,11 @@ use ulid::Ulid;
 /// because the required `ResponseInfo` type is internal to the crate.
 ///
 /// ```ignore
-/// // pseudo-code: manager.evaluate(url, save_dir, credentials, &save_resolver)
-/// // returns a Download instruction that can be passed to manager.download(...)
+/// // pseudo-code:
+/// // let instr = manager
+/// //     .evaluate(EvaluateRequest::new(url, save_dir, &save_resolver))
+/// //     .await?;
+/// // manager.download(DownloadRequest::new(instr, &server_resolver)).await?;
 /// ```
 #[derive(Builder, Debug, Clone)]
 #[builder(build_fn(validate = "Self::validate", error = "DownloadBuilderError"))]

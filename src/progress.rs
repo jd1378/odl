@@ -192,7 +192,7 @@ impl ProgressReporter for AsyncReporter {
 /// Per-download context: reporter + cancellation token.
 ///
 /// Cheap to clone (`Arc` and a `CancellationToken` clone). One context per
-/// `DownloadManager::download_with` call.
+/// `DownloadManager::download` call (attach via `DownloadRequest::ctx`).
 #[derive(Clone)]
 pub struct DownloadContext {
     pub reporter: Arc<dyn ProgressReporter>,

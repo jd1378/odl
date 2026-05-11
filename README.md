@@ -1,5 +1,8 @@
 # ODL
 
+[![Crates.io](https://img.shields.io/crates/v/odl.svg)](https://crates.io/crates/odl)
+[![Docs.rs](https://docs.rs/odl/badge.svg)](https://docs.rs/odl)
+
 Flexible download library and CLI intended to be fast, reliable, and easy to use.
 
 ## Quick Start
@@ -128,7 +131,7 @@ Note: Flags passed directly to `odl` (for example `--max-connections`, `--speed-
 
 ```no_run
 use odl::config::Config;
-use odl::download_manager::DownloadManager;
+use odl::download_manager::{DownloadManager, DownloadRequest, EvaluateRequest};
 use reqwest::Url;
 
 #[tokio::main]
@@ -139,8 +142,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
   // Implement or reuse a SaveConflictResolver and ServerConflictResolver
   // (omitted for brevity). Then evaluate and download:
-  // let instruction = manager.evaluate(url, save_dir, None, &resolver).await?;
-  // let path = manager.download(instruction, &server_resolver).await?;
+  // let instruction = manager
+  //     .evaluate(EvaluateRequest::new(url, save_dir, &save_resolver))
+  //     .await?;
+  // let path = manager
+  //     .download(DownloadRequest::new(instruction, &server_resolver))
+  //     .await?;
+  //
+  // Per-job override (one download with different settings):
+  // let opts = odl::config::DownloadOptionsBuilder::default()
+  //     .max_connections(8)
+  //     .speed_limit(Some(1_000_000))
+  //     .build()?;
+  // let instruction = manager
+  //     .evaluate(EvaluateRequest::new(url, save_dir, &save_resolver).options(&opts))
+  //     .await?;
+  //
+  // Fields are private; read via getters:
+  // println!("download dir: {}", manager.config().download_dir().display());
   Ok(())
 }
 ```
