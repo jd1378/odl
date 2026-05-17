@@ -29,6 +29,18 @@ impl ResponseInfo {
         }
     }
 
+    /// Construct a `ResponseInfo` from a URL only, without performing any
+    /// HTTP request. Status is 0 and headers are empty, so filename
+    /// extraction falls back to URL path/query and all server-derived
+    /// fields (size, etag, last-modified, hashes, resumability) are absent.
+    pub fn from_url(request_url: Url) -> Self {
+        Self {
+            status_code: 0,
+            request_url,
+            response_headers: HeaderMap::new(),
+        }
+    }
+
     pub fn is_successful(&self) -> bool {
         (self.status_code >= 200) && (self.status_code <= 299)
     }

@@ -268,6 +268,77 @@ impl DownloadManager {
         Ok(instruction)
     }
 
+    /// Build a [`Download`] without contacting the server.
+    ///
+    /// Derives filename from the URL (path/query) and resolves save
+    /// conflicts against `save_dir`, but skips the HTTP probe entirely.
+    /// Server-derived fields are left empty: `size`, `etag`,
+    /// `last_modified`, and `checksums` are `None`/empty, and
+    /// `is_resumable` is `false`.
+    ///
+    /// Intended for callers that need a fast filename/conflict decision
+    /// (e.g. UI previews, batch planning) before committing to a full
+    /// [`Self::evaluate`].
+    ///
+    /// `credentials` is preserved on the returned instruction; `ctx` is
+    /// used only for phase emission and cancellation checks; `options`
+    /// supplies `max_connections` and `use_server_time` (no network knobs
+    /// are read since no request is made).
+    pub async fn quick_evaluate<CR>(
+        &self,
+        req: EvaluateRequest<'_, CR>,
+    ) -> Result<Download, OdlError>
+    where
+        CR: SaveConflictResolver,
+    {
+        let EvaluateRequest {
+            url,
+            save_dir,
+            conflict_resolver,
+            credentials,
+            ctx,
+            options,
+        } = req;
+        let default_ctx;
+        let ctx = match ctx {
+            Some(c) => c,
+            None => {
+                default_ctx = DownloadContext::new();
+                &default_ctx
+            }
+        };
+        let opts = options.unwrap_or(self.config.download());
+        ctx.emit(ProgressEvent::PhaseChanged(Phase::Evaluating));
+        if ctx.is_cancelled() {
+            return Err(OdlError::Cancelled);
+        }
+
+        let info = ResponseInfo::from_url(url);
+        let instruction = Download::from_response_info(
+            self.config.download_dir(),
+            save_dir,
+            info,
+            opts.max_connections(),
+            opts.use_server_time(),
+            credentials,
+            Option::<Proxy>::from(opts),
+            Some(HeaderMap::from(opts)),
+        );
+
+        ctx.emit(ProgressEvent::PhaseChanged(Phase::ResolvingConflicts));
+        let instruction = resolve_save_conflicts(instruction, conflict_resolver).await?;
+
+        ctx.emit(ProgressEvent::FilenameResolved(
+            instruction.filename().to_string(),
+        ));
+        ctx.emit(ProgressEvent::Progress {
+            downloaded: 0,
+            total: instruction.size(),
+        });
+
+        Ok(instruction)
+    }
+
     /// Run a download for an evaluated [`Download`] instruction.
     ///
     /// All inputs are bundled in [`DownloadRequest`]. Optional fields
