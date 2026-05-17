@@ -122,8 +122,7 @@ impl ResponseInfo {
         let name = name_from_query.or_else(|| {
             self.request_url
                 .path_segments()
-                .and_then(|mut segments| segments.next_back())
-                .filter(|s| !s.is_empty())
+                .and_then(|segments| segments.rev().find(|s| !s.is_empty()))
                 .map(|s| s.to_string())
         });
 
@@ -504,8 +503,12 @@ mod tests {
             make_response_info_with_headers("http://example.com/path/to/file.txt", headers.clone());
         assert_eq!(resp.extract_filename(), "file.txt");
 
-        let resp = make_response_info_with_headers("http://example.com/", headers);
+        let resp = make_response_info_with_headers("http://example.com/", headers.clone());
         assert_eq!(resp.extract_filename(), "download");
+
+        // Trailing slash: still pick last non-empty segment
+        let resp = make_response_info_with_headers("http://example.com/path/to/file.txt/", headers);
+        assert_eq!(resp.extract_filename(), "file.txt");
     }
 
     #[test]
