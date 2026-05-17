@@ -1,6 +1,6 @@
 [package]
 name = "odl"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 description = "flexible download library and CLI intended to be fast, reliable, and easy to use."
 repository = "https://github.com/jd1378/odl"
@@ -42,6 +42,7 @@ rand = "0.10"
 tracing = "0.1.41"
 async-trait = "0.1.88"
 percent-encoding = "2.3.1"
+mime_guess = "2"
 indicatif = { version = "0.18.3", optional = true }
 tracing-subscriber = { version = "0.3.20", optional = true }
 serde = { version = "1.0", features = ["derive"] }

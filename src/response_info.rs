@@ -105,17 +105,48 @@ impl ResponseInfo {
                 }
             }
         }
-        // Fallback: extract from URL path
-        if let Some(name) = self
-            .request_url
-            .path_segments()
-            .and_then(|mut segments| segments.next_back())
-            .filter(|s| !s.is_empty())
-        {
-            return name.to_string();
+        // Fallback: try query params (file=, filename=, name=), then URL path
+        let name_from_query = self.request_url.query_pairs().find_map(|(k, v)| {
+            let key = k.as_ref();
+            if (key.eq_ignore_ascii_case("file")
+                || key.eq_ignore_ascii_case("filename")
+                || key.eq_ignore_ascii_case("name"))
+                && !v.is_empty()
+            {
+                Some(v.into_owned())
+            } else {
+                None
+            }
+        });
+
+        let name = name_from_query.or_else(|| {
+            self.request_url
+                .path_segments()
+                .and_then(|mut segments| segments.next_back())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+        });
+
+        if let Some(name) = name {
+            // If name lacks extension, try to append one from Content-Type
+            if !name.contains('.')
+                && let Some(ext) = self.guess_extension()
+            {
+                return format!("{name}.{ext}");
+            }
+            return name;
         }
-        // Default fallback
+
+        // No name anywhere: use "download" + guessed extension if mime known
+        if let Some(ext) = self.guess_extension() {
+            return format!("download.{ext}");
+        }
         "download".to_string()
+    }
+
+    fn guess_extension(&self) -> Option<&'static str> {
+        let mime = self.mime_type()?;
+        mime_guess::get_mime_extensions_str(&mime).and_then(|exts| exts.first().copied())
     }
 
     /// Extracts content range value from response headers
@@ -475,6 +506,79 @@ mod tests {
 
         let resp = make_response_info_with_headers("http://example.com/", headers);
         assert_eq!(resp.extract_filename(), "download");
+    }
+
+    #[test]
+    fn test_extract_filename_appends_extension_from_mime() {
+        // Path segment without extension + known mime
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/pdf"));
+        let resp =
+            make_response_info_with_headers("http://example.com/path/to/report", headers.clone());
+        assert_eq!(resp.extract_filename(), "report.pdf");
+
+        // Path segment with extension already: don't append
+        let resp = make_response_info_with_headers(
+            "http://example.com/path/to/report.pdf",
+            headers.clone(),
+        );
+        assert_eq!(resp.extract_filename(), "report.pdf");
+
+        // Unknown mime: leave name as-is
+        let mut bad = HeaderMap::new();
+        bad.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/x-not-a-real-type"),
+        );
+        let resp = make_response_info_with_headers("http://example.com/path/to/report", bad);
+        assert_eq!(resp.extract_filename(), "report");
+    }
+
+    #[test]
+    fn test_extract_filename_download_with_mime() {
+        // No name in URL, mime present: "download.<ext>"
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/zip"));
+        let resp = make_response_info_with_headers("http://example.com/", headers);
+        assert_eq!(resp.extract_filename(), "download.zip");
+    }
+
+    #[test]
+    fn test_extract_filename_from_query_params() {
+        let headers = HeaderMap::new();
+        // file=
+        let resp = make_response_info_with_headers(
+            "http://example.com/dl?file=archive.tar.gz",
+            headers.clone(),
+        );
+        assert_eq!(resp.extract_filename(), "archive.tar.gz");
+
+        // filename=
+        let resp = make_response_info_with_headers(
+            "http://example.com/dl?filename=image.png",
+            headers.clone(),
+        );
+        assert_eq!(resp.extract_filename(), "image.png");
+
+        // name= takes precedence over path segment
+        let resp = make_response_info_with_headers(
+            "http://example.com/path/segment.bin?name=real.zip",
+            headers.clone(),
+        );
+        assert_eq!(resp.extract_filename(), "real.zip");
+
+        // Empty value falls through to path segment
+        let resp = make_response_info_with_headers(
+            "http://example.com/path/seg.bin?file=",
+            headers.clone(),
+        );
+        assert_eq!(resp.extract_filename(), "seg.bin");
+
+        // Query name without extension + mime → ext appended
+        let mut h = HeaderMap::new();
+        h.insert(CONTENT_TYPE, HeaderValue::from_static("application/pdf"));
+        let resp = make_response_info_with_headers("http://example.com/dl?name=doc", h);
+        assert_eq!(resp.extract_filename(), "doc.pdf");
     }
 
     #[test]
