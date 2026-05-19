@@ -149,15 +149,6 @@ impl From<AcquireError> for OdlError {
     }
 }
 
-impl From<keyring::Error> for OdlError {
-    fn from(e: keyring::Error) -> Self {
-        OdlError::Other {
-            message: e.to_string(),
-            origin: Box::new(e),
-        }
-    }
-}
-
 #[derive(Error, Debug)]
 pub enum DownloadParseError {
     #[error("Failed to parse URL: {message}")]
