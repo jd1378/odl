@@ -27,8 +27,26 @@ use odl::{
 use reqwest::Url;
 use tokio::{self, io::AsyncBufReadExt};
 mod args;
-use args::Args;
+use args::{Args, LogLevel};
 use tracing::instrument;
+
+fn init_tracing(level: LogLevel) {
+    use tracing_subscriber::{EnvFilter, fmt};
+    let default_directive = match level {
+        LogLevel::Off => "off",
+        LogLevel::Error => "error",
+        LogLevel::Warn => "warn",
+        LogLevel::Info => "info",
+        LogLevel::Debug => "debug",
+        LogLevel::Trace => "trace",
+    };
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_directive));
+    fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DownloadType {
@@ -352,6 +370,7 @@ fn build_child_style(metrics: &BarMetrics) -> ProgressStyle {
 #[tokio::main]
 async fn main() -> Result<(), OdlError> {
     let args: Args = Args::parse();
+    init_tracing(args.log_level);
 
     // If no input and no subcommand provided, show help and exit
     if args.command.is_none() && args.input.is_none() {

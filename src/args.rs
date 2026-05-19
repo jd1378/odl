@@ -4,6 +4,16 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+pub enum LogLevel {
+    Off,
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
 #[derive(clap::ValueEnum, Clone, Debug)]
 pub enum FileChangedAction {
     Abort,
@@ -235,6 +245,12 @@ pub struct Args {
     /// When unset, downloads run at full speed.
     #[arg(short, long, value_name = "BYTES_PER_SEC", value_parser = parse_speed)]
     pub speed_limit: Option<u64>,
+
+    /// Diagnostic log severity. Overridden by `RUST_LOG` env var when set.
+    /// Possible values: `off`, `error`, `warn`, `info`, `debug`, `trace`. Default: `warn`.
+    #[arg(long, value_enum, default_value_t = LogLevel::Warn)]
+    pub log_level: LogLevel,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
