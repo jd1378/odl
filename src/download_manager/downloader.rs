@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use bytes::Bytes;
 use reqwest::{
     Client,
-    header::{HeaderValue, RANGE, USER_AGENT},
+    header::{ACCEPT_ENCODING, HeaderValue, RANGE, USER_AGENT},
 };
 use tokio::{
     fs,
@@ -711,6 +711,7 @@ impl Downloader {
     ) -> Result<bool, OdlError> {
         let candidate = active
             .iter()
+            .filter(|(_, task)| task.details.size != crate::download::Download::UNKNOWN_PART_SIZE)
             .filter(|(_, task)| task.remaining_bytes() >= MIN_DYNAMIC_SPLIT_SIZE * 2)
             .max_by_key(|(_, task)| task.remaining_bytes())
             .map(|(ulid, task)| SplitCandidate {
@@ -1146,6 +1147,10 @@ async fn download_part(
     let url = instruction.url().clone();
     let mut current_size;
     let target_size = controller.limit();
+    // Unknown total length: stream until the server closes the body.
+    // We skip the Range header, never cap chunks, and treat EOF as a
+    // successful completion (returning the actual downloaded byte count).
+    let unknown_size = size == crate::download::Download::UNKNOWN_PART_SIZE;
 
     let mut attempts: u32 = 0;
 
@@ -1171,7 +1176,7 @@ async fn download_part(
             }
         };
 
-        if current_size >= target_size {
+        if !unknown_size && current_size >= target_size {
             file.finish().await?;
             ctx.emit(ProgressEvent::PartFinished { ulid: ulid.clone() });
             return Ok(PartEvent::Completed(PartOutcome {
@@ -1180,20 +1185,33 @@ async fn download_part(
             }));
         }
 
-        // build request for the remaining range
+        // build request — when total length is unknown we cannot construct
+        // a meaningful Range, so issue a plain GET and stream until EOF.
         let mut req = client.get(url.clone());
-        let range_header = format!("bytes={}-{}", offset + current_size, offset + size - 1,);
-        let range_value = match HeaderValue::from_str(&range_header) {
-            Ok(v) => v,
-            Err(e) => {
-                let _ = file.finish().await;
-                return Err(OdlError::Other {
-                    message: "Internal Error: Invalid range header".to_string(),
-                    origin: Box::new(e),
-                });
-            }
-        };
-        req = req.header(RANGE, range_value);
+        if !unknown_size {
+            let range_header = format!("bytes={}-{}", offset + current_size, offset + size - 1,);
+            let range_value = match HeaderValue::from_str(&range_header) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = file.finish().await;
+                    return Err(OdlError::Other {
+                        message: "Internal Error: Invalid range header".to_string(),
+                        origin: Box::new(e),
+                    });
+                }
+            };
+            req = req.header(RANGE, range_value);
+            // Force identity transfer encoding on ranged requests. If the
+            // server applies `Content-Encoding: gzip` to a ranged response,
+            // RFC 9110 says the range is over the *compressed* bytes — but
+            // reqwest's gzip/brotli decoders run per-response and cannot be
+            // resumed across parts, so the assembled file would be a
+            // corrupt mix of decoded fragments. Asking for identity avoids
+            // the ambiguity entirely (servers that ignore us and gzip
+            // anyway also tend to drop `Accept-Ranges`, which routes us
+            // through the unknown-size single-stream path).
+            req = req.header(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+        }
         if randomize_user_agent {
             req = req.header(USER_AGENT, random_user_agent())
         }
@@ -1234,7 +1252,7 @@ async fn download_part(
         let mut saw_eof = false;
         loop {
             let allow_until = controller.limit();
-            if controller.downloaded() >= allow_until {
+            if !unknown_size && controller.downloaded() >= allow_until {
                 break;
             }
 
@@ -1300,10 +1318,12 @@ async fn download_part(
                 started_notified = true;
             }
 
-            let downloaded = controller.downloaded();
-            let remaining = allow_until.saturating_sub(downloaded);
-            if chunk.len() as u64 > remaining {
-                chunk = chunk.split_to(remaining as usize);
+            if !unknown_size {
+                let downloaded = controller.downloaded();
+                let remaining = allow_until.saturating_sub(downloaded);
+                if chunk.len() as u64 > remaining {
+                    chunk = chunk.split_to(remaining as usize);
+                }
             }
 
             let len = chunk.len() as u64;
@@ -1334,6 +1354,15 @@ async fn download_part(
         }
 
         file.finish().await?;
+
+        // Unknown-size stream: EOF is the only valid completion signal.
+        // The recorded `final_size` becomes the byte count we actually
+        // received, which `mark_part_finished` persists to PartDetails.
+        if unknown_size && saw_eof {
+            let final_size = controller.downloaded();
+            ctx.emit(ProgressEvent::PartFinished { ulid: ulid.clone() });
+            return Ok(PartEvent::Completed(PartOutcome { ulid, final_size }));
+        }
 
         if controller.downloaded() >= controller.limit() {
             ctx.emit(ProgressEvent::PartFinished { ulid: ulid.clone() });
@@ -1497,6 +1526,78 @@ mod tests {
                 .unwrap_or(false)
         );
         assert!(fs::try_exists(instruction.metadata_path()).await?);
+        get_mock.assert_async().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_downloader_streams_unknown_size_until_eof()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Regression: when the server reports no total length (typical
+        // chunked/gzipped HTML), `determine_parts` emits a single part
+        // tagged with UNKNOWN_PART_SIZE. The downloader must skip the
+        // Range header and drain the body until EOF, then record the
+        // actual byte count on the part — not produce an empty file.
+        let file_content = b"<html><body>hello world</body></html>";
+        let mut server = Server::new_async().await;
+        let base = server.url();
+        let get_mock = server
+            .mock("GET", "/page")
+            .match_header("range", Matcher::Missing)
+            .with_status(200)
+            .with_body(file_content)
+            .create_async()
+            .await;
+
+        let tmp = tempdir()?;
+        let download_dir = tmp.path().join("download");
+        let save_dir = tmp.path().join("save");
+        fs::create_dir_all(&download_dir).await?;
+        fs::create_dir_all(&save_dir).await?;
+
+        let mut parts = HashMap::new();
+        parts.insert(
+            "part1".to_string(),
+            make_part("part1", 0, crate::download::Download::UNKNOWN_PART_SIZE),
+        );
+
+        // Build an instruction with size=None to mirror the real
+        // unknown-length path; `create_instruction` always sets a Some
+        // size, so construct directly here.
+        let download = DownloadBuilder::default()
+            .download_dir(download_dir.clone())
+            .save_dir(save_dir.clone())
+            .filename(TEST_FILENAME.to_string())
+            .url(Url::parse(&format!("{}/page", base))?)
+            .size(None)
+            .parts(parts)
+            .max_connections(1)
+            .is_resumable(false)
+            .build()?;
+        let instruction = Arc::new(download);
+
+        let metadata = instruction.as_metadata();
+        let downloader = Downloader::new(
+            Arc::clone(&instruction),
+            metadata,
+            reqwest::Client::builder().build()?,
+            false,
+            None,
+            true,
+            RampupConfig::disabled(),
+            FixedThenExponentialRetry::default(),
+            DownloadContext::new(),
+        );
+        let updated_metadata = downloader.run().await?;
+
+        let part_bytes = fs::read(instruction.part_path("part1")).await?;
+        assert_eq!(part_bytes, file_content);
+        let part = updated_metadata
+            .parts
+            .get("part1")
+            .expect("part1 present after run");
+        assert!(part.finished);
+        assert_eq!(part.size, file_content.len() as u64);
         get_mock.assert_async().await;
         Ok(())
     }

@@ -703,7 +703,7 @@ async fn grow_parts(
         let candidate = metadata
             .parts
             .values()
-            .filter(|p| !p.finished)
+            .filter(|p| !p.finished && p.size != Download::UNKNOWN_PART_SIZE)
             .filter_map(|p| {
                 let written = *on_disk.get(&p.ulid).unwrap_or(&0);
                 Download::compute_split(p.offset, p.size, written, Download::MIN_PART_SIZE)

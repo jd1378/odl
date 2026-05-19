@@ -123,6 +123,12 @@ impl Download {
     const LOCK_FILENAME: &'static str = "odl.lock";
     pub const PART_EXTENSION: &'static str = "part";
     pub const MIN_PART_SIZE: u64 = 300 * 1024; // 300 KB
+    /// Sentinel value stored in `PartDetails.size` when the server did not
+    /// report a total length (no `Content-Length`, no `Content-Range`).
+    /// The downloader treats such a part as "stream until EOF" and never
+    /// sends a `Range` header. Resumption / dynamic-split / grow_parts all
+    /// skip parts carrying this sentinel.
+    pub const UNKNOWN_PART_SIZE: u64 = u64::MAX;
     /// Assumed filesystem cluster size used to keep part boundaries aligned
     /// so the assembler can reflink parts into the final file.
     ///
@@ -452,6 +458,25 @@ impl Download {
             1
         };
 
+        // Unknown total length (no Content-Length / Content-Range from the
+        // server). Emit a single "stream until EOF" part marked with the
+        // UNKNOWN_PART_SIZE sentinel. The downloader skips Range, drains
+        // the body, and rewrites part.size to the actual byte count when
+        // it completes.
+        if size.is_none() {
+            let ulid = Ulid::new().to_string();
+            parts.insert(
+                ulid.clone(),
+                PartDetails {
+                    offset: 0,
+                    size: Self::UNKNOWN_PART_SIZE,
+                    ulid,
+                    finished: false,
+                },
+            );
+            return parts;
+        }
+
         let size = size.unwrap_or(0);
 
         // Always return at least one part, even if size is 0
@@ -575,6 +600,21 @@ impl From<UninitializedFieldError> for DownloadBuilderError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_determine_parts_unknown_size_streams_until_eof() {
+        // No Content-Length / Content-Range from the server (typical for
+        // chunked HTML, gzipped responses where reqwest strips the length,
+        // etc.) must yield a single unfinished part flagged with the
+        // UNKNOWN_PART_SIZE sentinel so the downloader streams to EOF
+        // instead of treating it as a zero-byte file already complete.
+        let parts = Download::determine_parts(None, 4);
+        assert_eq!(parts.len(), 1);
+        let part = parts.values().next().unwrap();
+        assert_eq!(part.offset, 0);
+        assert_eq!(part.size, Download::UNKNOWN_PART_SIZE);
+        assert!(!part.finished);
+    }
 
     #[test]
     fn test_determine_parts_zero_size() {
