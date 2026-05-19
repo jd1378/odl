@@ -632,26 +632,35 @@ async fn main() -> Result<(), OdlError> {
         // task completes.
         let handle = tokio::spawn(async move {
             let _permit = permit;
-            let mut instruction = dlm
-                .evaluate(EvaluateRequest {
-                    url,
-                    save_dir,
+            let result: Result<PathBuf, OdlError> = async {
+                let mut instruction = dlm
+                    .evaluate(EvaluateRequest {
+                        url,
+                        save_dir,
+                        conflict_resolver: &resolver,
+                        credentials,
+                        ctx: Some(&ctx),
+                        options: None,
+                    })
+                    .await?;
+                if let Some(filename) = user_provided_filename {
+                    instruction.set_filename(filename);
+                }
+                dlm.download(DownloadRequest {
+                    instruction,
                     conflict_resolver: &resolver,
-                    credentials,
                     ctx: Some(&ctx),
                     options: None,
                 })
-                .await?;
-            if let Some(filename) = user_provided_filename {
-                instruction.set_filename(filename);
+                .await
             }
-            dlm.download(DownloadRequest {
-                instruction,
-                conflict_resolver: &resolver,
-                ctx: Some(&ctx),
-                options: None,
-            })
-            .await
+            .await;
+            if let Err(ref e) = result {
+                ctx.emit(ProgressEvent::Failed {
+                    message: e.to_string(),
+                });
+            }
+            result
         });
 
         handles.push(handle);
@@ -668,11 +677,13 @@ async fn main() -> Result<(), OdlError> {
     }
     for res in results {
         if let Err(e) = res {
-            eprintln!("Error: {}", e);
-            #[cfg(debug_assertions)]
-            {
-                eprintln!("{e:?}");
-            }
+            mp.suspend(|| {
+                eprintln!("Error: {}", e);
+                #[cfg(debug_assertions)]
+                {
+                    eprintln!("{e:?}");
+                }
+            });
         }
     }
 
