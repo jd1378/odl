@@ -25,9 +25,14 @@ use odl::{
     },
 };
 use reqwest::Url;
+use serde_json::json;
+use std::process::ExitCode;
 use tokio::{self, io::AsyncBufReadExt};
 mod args;
-use args::{Args, LogLevel};
+mod json;
+use args::{Args, LogLevel, OutputFormat};
+use json::JsonReporter;
+use odl::download_manager::DownloadStatus;
 use tracing::instrument;
 
 fn init_tracing(level: LogLevel) {
@@ -46,6 +51,64 @@ fn init_tracing(level: LogLevel) {
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .init();
+}
+
+/// Stable process exit code for an error, so scripts/agents can branch on
+/// failure class without parsing messages. `0` is success (returned
+/// elsewhere); `130` follows the shell convention for cancellation.
+fn exit_code(e: &OdlError) -> u8 {
+    match e {
+        OdlError::CliError { .. }
+        | OdlError::EmptyInputFile
+        | OdlError::UrlDecodeError { .. }
+        | OdlError::ConfigBuilderError(_)
+        | OdlError::DownloadOptionsBuilderError(_) => 2,
+        OdlError::Network(_) => 3,
+        OdlError::Conflict(_) => 4,
+        OdlError::StdIoError { .. } => 5,
+        OdlError::MetadataError(_) => 6,
+        OdlError::Cancelled => 130,
+        OdlError::Other { .. } => 1,
+    }
+}
+
+/// Stable machine-readable error category string (pairs with [`exit_code`]).
+fn error_kind(e: &OdlError) -> &'static str {
+    match e {
+        OdlError::CliError { .. } => "cli",
+        OdlError::EmptyInputFile => "empty_input_file",
+        OdlError::UrlDecodeError { .. } => "url_decode",
+        OdlError::ConfigBuilderError(_) | OdlError::DownloadOptionsBuilderError(_) => "config",
+        OdlError::Network(_) => "network",
+        OdlError::Conflict(_) => "conflict",
+        OdlError::StdIoError { .. } => "io",
+        OdlError::MetadataError(_) => "metadata",
+        OdlError::Cancelled => "cancelled",
+        OdlError::Other { .. } => "other",
+    }
+}
+
+/// Emit a top-level error in the selected format and return its exit code.
+fn report_error(e: &OdlError, format: OutputFormat) -> ExitCode {
+    match format {
+        OutputFormat::Text => {
+            eprintln!("Error: {}", e);
+            #[cfg(debug_assertions)]
+            {
+                eprintln!("{e:?}");
+            }
+        }
+        OutputFormat::Json => {
+            let v = json!({
+                "type": "error",
+                "kind": error_kind(e),
+                "message": e.to_string(),
+                "exit_code": exit_code(e),
+            });
+            eprintln!("{v}");
+        }
+    }
+    ExitCode::from(exit_code(e))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -368,9 +431,18 @@ fn build_child_style(metrics: &BarMetrics) -> ProgressStyle {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), OdlError> {
+async fn main() -> ExitCode {
     let args: Args = Args::parse();
     init_tracing(args.log_level);
+    let format = args.format;
+    match run(args).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => report_error(&e, format),
+    }
+}
+
+async fn run(args: Args) -> Result<(), OdlError> {
+    let format = args.format;
 
     // If no input and no subcommand provided, show help and exit
     if args.command.is_none() && args.input.is_none() {
@@ -418,16 +490,28 @@ async fn main() -> Result<(), OdlError> {
                     .unwrap_or_default();
 
                 if *show {
-                    println!("# config path: {}", config_path.display());
-                    match toml::to_string_pretty(&cfg) {
-                        Ok(s) => {
-                            if s.trim().is_empty() {
-                                println!("# config is empty")
-                            } else {
-                                println!("{}", s)
+                    match format {
+                        OutputFormat::Json => {
+                            let v = json!({
+                                "type": "config",
+                                "path": config_path.display().to_string(),
+                                "config": cfg,
+                            });
+                            println!("{v}");
+                        }
+                        OutputFormat::Text => {
+                            println!("# config path: {}", config_path.display());
+                            match toml::to_string_pretty(&cfg) {
+                                Ok(s) => {
+                                    if s.trim().is_empty() {
+                                        println!("# config is empty")
+                                    } else {
+                                        println!("{}", s)
+                                    }
+                                }
+                                Err(e) => eprintln!("Failed to format config: {}", e),
                             }
                         }
-                        Err(e) => eprintln!("Failed to format config: {}", e),
                     }
                     return Ok(());
                 }
@@ -486,10 +570,35 @@ async fn main() -> Result<(), OdlError> {
                 cfg = cfg_b.build()?;
 
                 match cfg.save_to_file(&config_path).await {
-                    Ok(()) => println!("Saved configuration to {}", config_path.display()),
-                    Err(e) => eprintln!("Failed to save configuration: {}", e),
+                    Ok(()) => match format {
+                        OutputFormat::Json => {
+                            let v = json!({
+                                "type": "config_saved",
+                                "path": config_path.display().to_string(),
+                            });
+                            println!("{v}");
+                        }
+                        OutputFormat::Text => {
+                            println!("Saved configuration to {}", config_path.display())
+                        }
+                    },
+                    Err(e) => {
+                        return Err(OdlError::StdIoError {
+                            e,
+                            extra_info: Some("failed to save configuration".to_string()),
+                        });
+                    }
                 }
                 return Ok(());
+            }
+            args::Commands::Probe { url } => {
+                return run_probe(&args, url, format).await;
+            }
+            args::Commands::Status { filter } => {
+                return run_status(&args, filter.as_deref(), format, false).await;
+            }
+            args::Commands::List { filter } => {
+                return run_status(&args, filter.as_deref(), format, true).await;
             }
         }
     }
@@ -597,21 +706,29 @@ async fn main() -> Result<(), OdlError> {
     };
 
     for url in urls.into_iter() {
-        let parent_metrics = BarMetrics::new();
-        let parent_style = build_parent_style(&parent_metrics);
+        let reporter: Arc<dyn ProgressReporter> = match format {
+            // NDJSON events go straight to stdout. Progress fires at the
+            // sampler cadence (~8 Hz), so printing on the download task is
+            // cheap and needs no async-forwarder buffering.
+            OutputFormat::Json => Arc::new(JsonReporter::new(url.to_string())),
+            OutputFormat::Text => {
+                let parent_metrics = BarMetrics::new();
+                let parent_style = build_parent_style(&parent_metrics);
 
-        let parent = mp.add(ProgressBar::new(0).with_style(parent_style));
-        parent.set_message(format!("{url} (warming up)"));
-        parent.enable_steady_tick(SAMPLE_INTERVAL);
+                let parent = mp.add(ProgressBar::new(0).with_style(parent_style));
+                parent.set_message(format!("{url} (warming up)"));
+                parent.enable_steady_tick(SAMPLE_INTERVAL);
 
-        // Wrap the CliReporter in an async forwarder so every `emit`
-        // hands the event off to a worker task via a lock-free mpsc and
-        // returns immediately. Indicatif `set_position` / Mutex hops
-        // never run on the download tasks themselves.
-        let cli_reporter = CliReporter::new(Arc::clone(&mp), parent, parent_metrics);
-        let reporter = AsyncReporter::spawn(cli_reporter);
+                // Wrap the CliReporter in an async forwarder so every `emit`
+                // hands the event off to a worker task via a lock-free mpsc
+                // and returns immediately. Indicatif `set_position` / Mutex
+                // hops never run on the download tasks themselves.
+                let cli_reporter = CliReporter::new(Arc::clone(&mp), parent, parent_metrics);
+                AsyncReporter::spawn(cli_reporter) as Arc<dyn ProgressReporter>
+            }
+        };
         let ctx = DownloadContext::new()
-            .with_reporter(reporter as Arc<dyn ProgressReporter>)
+            .with_reporter(reporter)
             .with_url(url.clone());
 
         let dlm = Arc::clone(&dlm);
@@ -675,16 +792,13 @@ async fn main() -> Result<(), OdlError> {
             Err(join_err) => results.push(Err(OdlError::from(join_err))),
         }
     }
-    for res in results {
-        if let Err(e) = res {
-            mp.suspend(|| {
-                eprintln!("Error: {}", e);
-                #[cfg(debug_assertions)]
-                {
-                    eprintln!("{e:?}");
-                }
-            });
-        }
+    // Per-download failures were already surfaced through each download's
+    // reporter (a `Failed` bar line in text mode, a `failed` NDJSON event
+    // in json mode). Propagate the first failure so the process exit code
+    // reflects it; `report_error` prints the single top-level summary.
+    let first_err = results.into_iter().find_map(|r| r.err());
+    if let Some(e) = first_err {
+        return Err(e);
     }
 
     Ok(())
@@ -878,4 +992,184 @@ async fn download_remote_file(dlm: &DownloadManager, url: Url) -> Result<PathBuf
     // `_permit` will be dropped here when going out of scope, releasing
     // the semaphore permit back to the manager.
     Ok(path)
+}
+
+/// Map a metadata checksum to a JSON object with stable string-named
+/// algorithm/encoding fields.
+fn checksum_json(c: &odl::download_metadata::FileChecksum) -> serde_json::Value {
+    use odl::download_metadata::{ChecksumAlgorithm, ChecksumEncoding};
+    let algorithm = ChecksumAlgorithm::try_from(c.algorithm)
+        .map(|a| a.as_str_name())
+        .unwrap_or("unknown");
+    let encoding = ChecksumEncoding::try_from(c.encoding)
+        .map(|e| e.as_str_name())
+        .unwrap_or("unknown");
+    json!({"algorithm": algorithm, "digest": c.digest, "encoding": encoding})
+}
+
+/// `odl probe <url>` — HEAD-probe a URL and report what a download would
+/// resolve to, without writing anything. Uses the same config/flags as a
+/// real download so the reported filename/resumability match.
+async fn run_probe(args: &Args, url_str: &str, format: OutputFormat) -> Result<(), OdlError> {
+    let url = Url::parse(url_str).map_err(|e| OdlError::CliError {
+        message: format!("Invalid URL '{url_str}': {e}"),
+    })?;
+    let dlm = build_download_manager(args).await?;
+    // Resolve against the cwd but never rename/abort: we want the server's
+    // own filename, not a conflict-avoidant alternative.
+    let save_dir = std::env::current_dir()?;
+    let resolver = ForcedResolver;
+    let _permit = dlm.acquire_download_permit().await?;
+    let instruction = dlm
+        .evaluate(EvaluateRequest::new(url, save_dir, &resolver))
+        .await?;
+
+    let checksums: Vec<serde_json::Value> = instruction
+        .as_metadata()
+        .checksums
+        .iter()
+        .map(checksum_json)
+        .collect();
+    let last_modified_rfc3339 = instruction.last_modified_as_date().map(|d| d.to_rfc3339());
+
+    match format {
+        OutputFormat::Json => {
+            let v = json!({
+                "type": "probe",
+                "url": instruction.url().to_string(),
+                "filename": instruction.filename(),
+                "size": instruction.size(),
+                "resumable": instruction.is_resumable(),
+                "etag": instruction.etag(),
+                "last_modified": instruction.last_modified(),
+                "last_modified_rfc3339": last_modified_rfc3339,
+                "requires_auth": instruction.requires_auth(),
+                "requires_basic_auth": instruction.requires_basic_auth(),
+                "checksums": checksums,
+            });
+            println!("{v}");
+        }
+        OutputFormat::Text => {
+            println!("url:           {}", instruction.url());
+            println!("filename:      {}", instruction.filename());
+            match instruction.size() {
+                Some(s) => println!("size:          {} ({} bytes)", HumanBytes(s), s),
+                None => println!("size:          unknown"),
+            }
+            println!("resumable:     {}", instruction.is_resumable());
+            println!(
+                "etag:          {}",
+                instruction.etag().as_deref().unwrap_or("-")
+            );
+            println!(
+                "last_modified: {}",
+                last_modified_rfc3339.as_deref().unwrap_or("-")
+            );
+            println!("requires_auth: {}", instruction.requires_auth());
+            for c in instruction.as_metadata().checksums.iter() {
+                use odl::download_metadata::{ChecksumAlgorithm, ChecksumEncoding};
+                let algo = ChecksumAlgorithm::try_from(c.algorithm)
+                    .map(|a| a.as_str_name())
+                    .unwrap_or("unknown");
+                let enc = ChecksumEncoding::try_from(c.encoding)
+                    .map(|e| e.as_str_name())
+                    .unwrap_or("unknown");
+                println!("checksum:      {} {} ({})", algo, c.digest, enc);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Percent complete for a download. A finished download is 100% even
+/// though its parts have been removed post-assembly (so `downloaded` is
+/// 0); otherwise it is `downloaded / size` when the total size is known.
+fn percent_complete(downloaded: u64, size: Option<u64>, finished: bool) -> Option<f64> {
+    if finished {
+        return Some(100.0);
+    }
+    match size {
+        Some(total) if total > 0 => Some((downloaded as f64 / total as f64) * 100.0),
+        _ => None,
+    }
+}
+
+fn status_json(d: &DownloadStatus) -> serde_json::Value {
+    json!({
+        "filename": d.filename,
+        "url": d.url,
+        "save_dir": d.save_dir.to_string_lossy(),
+        "final_file_path": d.final_file_path.to_string_lossy(),
+        "final_file_exists": d.final_file_exists,
+        "download_dir": d.download_dir.to_string_lossy(),
+        "size": d.size,
+        "downloaded": d.downloaded,
+        "percent": percent_complete(d.downloaded, d.size, d.finished),
+        "finished": d.finished,
+        "resumable": d.is_resumable,
+        "parts_total": d.parts_total,
+        "parts_finished": d.parts_finished,
+    })
+}
+
+/// `odl status [filter]` / `odl list [filter]` — report tracked downloads
+/// from the configured download directory. `brief` controls text density;
+/// JSON output is identical for both.
+async fn run_status(
+    args: &Args,
+    filter: Option<&str>,
+    format: OutputFormat,
+    brief: bool,
+) -> Result<(), OdlError> {
+    let dlm = build_download_manager(args).await?;
+    let mut downloads = dlm.list_downloads().await?;
+    if let Some(f) = filter {
+        downloads.retain(|d| d.url.contains(f) || d.filename.contains(f));
+    }
+
+    match format {
+        OutputFormat::Json => {
+            let items: Vec<serde_json::Value> = downloads.iter().map(status_json).collect();
+            let v = json!({"type": "status", "count": items.len(), "downloads": items});
+            println!("{v}");
+        }
+        OutputFormat::Text => {
+            if downloads.is_empty() {
+                println!("No tracked downloads.");
+                return Ok(());
+            }
+            for d in &downloads {
+                let pct = percent_complete(d.downloaded, d.size, d.finished)
+                    .map(|p| format!("{p:.1}%"))
+                    .unwrap_or_else(|| "?%".to_string());
+                let state = if d.finished {
+                    "done"
+                } else if d.final_file_exists {
+                    "assembled"
+                } else {
+                    "partial"
+                };
+                if brief {
+                    println!("{:>10}  {:>9}  {}", state, pct, d.filename);
+                } else {
+                    println!("{}", d.filename);
+                    println!("  url:        {}", d.url);
+                    println!("  state:      {}", state);
+                    match d.size {
+                        Some(s) => println!(
+                            "  progress:   {} / {} ({})",
+                            HumanBytes(d.downloaded),
+                            HumanBytes(s),
+                            pct
+                        ),
+                        None => println!("  progress:   {} / unknown", HumanBytes(d.downloaded)),
+                    }
+                    println!("  parts:      {}/{}", d.parts_finished, d.parts_total);
+                    println!("  resumable:  {}", d.is_resumable);
+                    println!("  final file: {}", d.final_file_path.display());
+                }
+            }
+        }
+    }
+    Ok(())
 }

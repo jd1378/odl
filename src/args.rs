@@ -4,6 +4,16 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputFormat {
+    /// Human-readable output: progress bars, plain text.
+    Text,
+    /// Machine-readable output: NDJSON progress events (download) or a
+    /// single JSON document (config/probe/status). Intended for agents
+    /// and scripts. Progress bars are suppressed.
+    Json,
+}
+
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]
 pub enum LogLevel {
     Off,
@@ -251,6 +261,14 @@ pub struct Args {
     #[arg(long, value_enum, default_value_t = LogLevel::Warn)]
     pub log_level: LogLevel,
 
+    /// Output format. `text` (default) is human-readable; `json` emits
+    /// machine-readable output for scripts and agents (NDJSON progress
+    /// events while downloading; a single JSON document for
+    /// `config --show`, `probe`, and `status`/`list`). Errors are emitted
+    /// as a JSON object on stderr. See also the per-variant exit codes.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text, global = true)]
+    pub format: OutputFormat,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -327,6 +345,33 @@ pub enum Commands {
         /// Allow mid-flight subdivision of long-running parts.
         #[arg(long)]
         dynamic_split: Option<bool>,
+    },
+
+    /// Probe a URL without downloading: report the resolved filename,
+    /// size, resumability, etag, last-modified, and any server-advertised
+    /// checksums. Pair with `--format json` for machine-readable output.
+    Probe {
+        /// The URL to probe.
+        #[arg(value_name = "URL")]
+        url: String,
+    },
+
+    /// Show tracked downloads in the configured download directory:
+    /// per-download progress (bytes on disk vs. total), part counts, and
+    /// whether the final file has been assembled. Optional FILTER matches
+    /// a substring of the URL or filename.
+    Status {
+        /// Only show downloads whose URL or filename contains this string.
+        #[arg(value_name = "FILTER")]
+        filter: Option<String>,
+    },
+
+    /// List tracked downloads (brief). Alias of `status` with terse
+    /// output; honors `--format json`.
+    List {
+        /// Only show downloads whose URL or filename contains this string.
+        #[arg(value_name = "FILTER")]
+        filter: Option<String>,
     },
 }
 

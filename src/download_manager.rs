@@ -38,7 +38,11 @@ use crate::{
     download_manager::io::sum_parts_on_disk,
 };
 use crate::{credentials::Credentials, user_agents::random_user_agent};
-use crate::{download::Download, download_metadata::PartDetails, error::OdlError};
+use crate::{
+    download::Download,
+    download_metadata::{DownloadMetadata, PartDetails},
+    error::OdlError,
+};
 
 /// High level manager responsible for evaluating and running downloads.
 ///
@@ -137,6 +141,31 @@ impl<'a, CR: ServerConflictResolver> DownloadRequest<'a, CR> {
     }
 }
 
+/// Snapshot of a single tracked download, derived from its on-disk
+/// metadata in the manager's `download_dir`. Plain data so presentation
+/// layers (CLI/GUI) can render or serialize it however they like.
+#[derive(Debug, Clone)]
+pub struct DownloadStatus {
+    pub url: String,
+    pub filename: String,
+    pub save_dir: PathBuf,
+    /// Final file path the download assembles to.
+    pub final_file_path: PathBuf,
+    /// Whether the assembled final file already exists on disk.
+    pub final_file_exists: bool,
+    /// Total size reported by the server, if known.
+    pub size: Option<u64>,
+    /// Bytes currently present across this download's parts on disk.
+    pub downloaded: u64,
+    /// Whether the download has been fully assembled.
+    pub finished: bool,
+    pub is_resumable: bool,
+    pub parts_total: usize,
+    pub parts_finished: usize,
+    /// Directory holding this download's metadata and parts.
+    pub download_dir: PathBuf,
+}
+
 impl DownloadManager {
     pub fn new(config: Config) -> DownloadManager {
         let max_concurrent_downloads = config.max_concurrent_downloads();
@@ -167,6 +196,79 @@ impl DownloadManager {
             _perm.forget();
         }
         Ok(())
+    }
+
+    /// Enumerate downloads tracked in the manager's `download_dir`.
+    ///
+    /// Each tracked download lives in its own subdirectory containing a
+    /// `metadata.pb`. Subdirectories without a readable metadata file are
+    /// skipped silently (they may be mid-write or unrelated). Bytes
+    /// `downloaded` are summed from the part files actually present on
+    /// disk, so the figure reflects resumable progress even for
+    /// interrupted downloads.
+    pub async fn list_downloads(&self) -> Result<Vec<DownloadStatus>, OdlError> {
+        let base = self.config.download_dir();
+        let mut entries = match tokio::fs::read_dir(base).await {
+            Ok(e) => e,
+            // No download dir yet means nothing has been tracked.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(OdlError::from(e)),
+        };
+
+        let mut out = Vec::new();
+        while let Some(entry) = entries.next_entry().await? {
+            let dir = entry.path();
+            if !entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let metadata_path = dir.join("metadata.pb");
+            let metadata = match crate::fs_utils::read_delimited_message_from_path::<
+                DownloadMetadata,
+                _,
+            >(&metadata_path)
+            .await
+            {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
+            let download = match Download::from_metadata(dir.clone(), metadata) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+
+            let parts = download.parts();
+            let parts_total = parts.len();
+            let parts_finished = parts.values().filter(|p| p.finished).count();
+            let mut downloaded: u64 = 0;
+            for ulid in parts.keys() {
+                if let Ok(meta) = tokio::fs::metadata(download.part_path(ulid)).await {
+                    downloaded = downloaded.saturating_add(meta.len());
+                }
+            }
+            let final_file_path = download.final_file_path();
+            let final_file_exists = tokio::fs::try_exists(&final_file_path)
+                .await
+                .unwrap_or(false);
+
+            out.push(DownloadStatus {
+                url: download.url().to_string(),
+                filename: download.filename().to_string(),
+                save_dir: download.save_dir().clone(),
+                final_file_path,
+                final_file_exists,
+                size: download.size(),
+                downloaded,
+                finished: download.finished(),
+                is_resumable: download.is_resumable(),
+                parts_total,
+                parts_finished,
+                download_dir: dir,
+            });
+        }
+
+        out.sort_by(|a, b| a.filename.cmp(&b.filename));
+        Ok(out)
     }
 
     /// Probe the remote URL and resolve save conflicts, returning a
