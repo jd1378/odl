@@ -172,26 +172,9 @@ curl -fsSL https://raw.githubusercontent.com/jd1378/odl/main/tools/install-skill
 curl -fsSL https://raw.githubusercontent.com/jd1378/odl/main/tools/install-skill.sh | sh -s -- cursor --dir ~/.cursor/skills
 ```
 
-From a checkout you can also run `tools/install-skill.sh` directly:
-
-```bash
-# Claude Code — if run inside a project it asks global vs. this project;
-# otherwise installs globally (~/.claude/skills)
-sh tools/install-skill.sh claude
-
-# Force scope
-sh tools/install-skill.sh claude --global     # ~/.claude/skills
-sh tools/install-skill.sh codex  --project    # ./.codex/skills
-
-# Any SKILL.md-compatible agent: install into an explicit directory
-sh tools/install-skill.sh --dir /path/to/agent/skills
-
-# Non-SKILL.md agents: flatten into AGENTS.md
-sh tools/install-skill.sh agents-md ./AGENTS.md
-```
-
-Run `sh tools/install-skill.sh --help` for all agents (claude, codex,
-copilot, gemini, cursor) and their known skill paths.
+For other agents, scopes, `--dir`, or `agents-md` output, see
+`tools/install-skill.sh --help` (or pass `--help` after `--` in the
+one-liner).
 
 Once installed, the agent activates the skill automatically when you ask
 it to download, fetch, resume, or probe something — no extra command. It
