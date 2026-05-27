@@ -129,8 +129,41 @@ fn parse_speed(s: &str) -> Result<u64, String> {
     Ok(bytes as u64)
 }
 
+/// Stable description of the machine-readable interface, shown under
+/// `odl --help`. This is a documented contract: agents and scripts may
+/// rely on these exit codes and JSON shapes across patch/minor releases.
+/// Keep in sync with `exit_code`/`error_kind` in `main.rs` and the
+/// `JsonReporter` in `json.rs`.
+const MACHINE_INTERFACE_HELP: &str = "\
+EXIT CODES:
+  0    success
+  1    other / internal error
+  2    usage or invalid input (bad URL, missing input, invalid config/flags)
+  3    network error (DNS, timeout, HTTP status, connection)
+  4    conflict (save/server conflict, checksum mismatch)
+  5    I/O error
+  6    metadata error (lockfile in use, decode failure)
+  130  cancelled
+
+JSON OUTPUT (--format json):
+  Downloads stream newline-delimited JSON (NDJSON) to stdout, one object
+  per line, each tagged with \"type\" and \"url\":
+    phase      {\"phase\": evaluating|resolving_conflicts|downloading|assembling|flushing|verifying}
+    filename   {\"filename\"}
+    progress   {\"downloaded\", \"total\": <int|null>}
+    message    {\"message\"}
+    completed  {\"path\", \"already_complete\"}
+    failed     {\"message\"}
+    cancelled  {}
+  One-shot commands emit a single JSON document on stdout:
+    probe        {\"type\":\"probe\", filename, size, resumable, etag, last_modified, checksums, ...}
+    status/list  {\"type\":\"status\", count, downloads:[...]}
+    config       {\"type\":\"config\", path, config}  (config_saved on write)
+  Errors print one JSON object to stderr:
+    {\"type\":\"error\", \"kind\", \"message\", \"exit_code\"}";
+
 #[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
+#[command(version, about, long_about = None, after_long_help = MACHINE_INTERFACE_HELP)]
 pub struct Args {
     /// The URL of the file to download, or a path to a file containing one URL per line.
     /// Blank lines and lines starting with `#` or `//` are ignored.

@@ -127,6 +127,88 @@ odl --config-file ~/.config/odl/config.toml https://example.com/file.zip
 
 Note: Flags passed directly to `odl` (for example `--max-connections`, `--speed-limit`, `--user-agent`, etc.) apply only to that invocation and override persistent configuration for that run.
 
+## Machine interface (`--format json`)
+
+For scripts and AI agents, pass `--format json` to get machine-readable
+output instead of human progress bars. This is a documented, stable
+contract — the full specification is printed by `odl --help`.
+
+- **Downloads** stream newline-delimited JSON (NDJSON) on stdout, one
+  object per line, each tagged with `type` and `url`: `phase`,
+  `filename`, `progress`, `message`, `completed`, `failed`, `cancelled`.
+- **`probe`, `status`/`list`, `config --show`** emit a single JSON
+  document on stdout.
+- **Errors** print one JSON object on stderr:
+  `{"type":"error","kind":...,"message":...,"exit_code":N}`.
+
+Exit codes: `0` success, `2` usage/bad input, `3` network, `4` conflict,
+`5` I/O, `6` metadata, `130` cancelled, `1` other.
+
+```bash
+# Probe a URL without downloading (size, filename, resumability)
+odl --format json probe https://example.com/file.zip
+
+# List tracked downloads
+odl --format json status
+```
+
+### Agent skill
+
+This repo ships an [Agent Skill](plugins/odl/skills/odl/)
+(the open `SKILL.md` standard) that teaches SKILL.md-compatible AI agents
+to drive `odl` correctly.
+
+One-liner (no checkout needed; downloads the skill from this repo). Run in
+a terminal it **prompts** for the agent and scope; pass them as arguments
+to skip the prompts. When non-interactive (CI, no terminal) it defaults to
+**Claude Code, global**.
+
+```bash
+# Interactive: asks which agent (claude/codex/…) and global vs. project
+curl -fsSL https://raw.githubusercontent.com/jd1378/odl/main/tools/install-skill.sh | sh
+
+# Non-interactive: name agent/scope after `--` to skip the prompts
+curl -fsSL https://raw.githubusercontent.com/jd1378/odl/main/tools/install-skill.sh | sh -s -- codex --project
+curl -fsSL https://raw.githubusercontent.com/jd1378/odl/main/tools/install-skill.sh | sh -s -- cursor --dir ~/.cursor/skills
+```
+
+From a checkout you can also run `tools/install-skill.sh` directly:
+
+```bash
+# Claude Code — if run inside a project it asks global vs. this project;
+# otherwise installs globally (~/.claude/skills)
+sh tools/install-skill.sh claude
+
+# Force scope
+sh tools/install-skill.sh claude --global     # ~/.claude/skills
+sh tools/install-skill.sh codex  --project    # ./.codex/skills
+
+# Any SKILL.md-compatible agent: install into an explicit directory
+sh tools/install-skill.sh --dir /path/to/agent/skills
+
+# Non-SKILL.md agents: flatten into AGENTS.md
+sh tools/install-skill.sh agents-md ./AGENTS.md
+```
+
+Run `sh tools/install-skill.sh --help` for all agents (claude, codex,
+copilot, gemini, cursor) and their known skill paths.
+
+Once installed, the agent activates the skill automatically when you ask
+it to download, fetch, resume, or probe something — no extra command. It
+then drives `odl` in `--format json` mode and reads the results.
+
+**Claude Code plugin (marketplace):** this repo is also a plugin
+marketplace, so Claude Code users can install and auto-update the skill
+with:
+
+```text
+/plugin marketplace add jd1378/odl
+/plugin install odl@jd1378
+```
+
+The canonical skill lives at `plugins/odl/skills/odl/`;
+`.claude/skills/odl` is a symlink to it for in-repo dogfooding.
+
 ## Library Usage
 
 ```no_run

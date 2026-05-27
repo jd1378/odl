@@ -1,0 +1,10 @@
+{
+  "name": "odl",
+  "version": "1.0.0",
+  "description": "Drive the odl CLI for reliable, resumable, multi-connection downloads with machine-readable NDJSON output and typed exit codes.",
+  "author": { "name": "jd1378" },
+  "homepage": "https://github.com/jd1378/odl",
+  "repository": "https://github.com/jd1378/odl",
+  "license": "MIT",
+  "keywords": ["download", "odl", "cli", "downloader", "resumable"]
+}

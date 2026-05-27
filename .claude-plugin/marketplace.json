@@ -1,0 +1,15 @@
+{
+  "name": "jd1378",
+  "owner": { "name": "jd1378" },
+  "description": "Plugins for the odl download manager.",
+  "plugins": [
+    {
+      "name": "odl",
+      "source": "./plugins/odl",
+      "description": "Teach AI agents to drive the odl CLI: resumable downloads, batch URL lists, probe/status, NDJSON output, typed exit codes.",
+      "version": "1.0.0",
+      "category": "productivity",
+      "tags": ["download", "cli", "agent-skill"]
+    }
+  ]
+}
