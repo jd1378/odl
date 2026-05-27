@@ -17,7 +17,7 @@ where
         .await
         .unwrap_or(false)
     {
-        let resolution: SameDownloadExistsResolution = SameDownloadExistsResolution::Resume;
+        let resolution = conflict_resolver.same_download_exists(&instruction).await;
         match resolution {
             SameDownloadExistsResolution::Abort => {
                 return Err(OdlError::Conflict(ConflictError::Save {
