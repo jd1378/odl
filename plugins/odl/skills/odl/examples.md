@@ -79,7 +79,18 @@ odl --format json status big.iso         # filter by url/filename substring
 odl --format json list                   # brief
 ```
 
-## 8. Bash error-handling loop (retry transient failures)
+## 8. Verify a download against a known checksum
+
+```bash
+odl --format json "https://example.com/file.zip" -o /downloads/ \
+    --checksum "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+```
+The file is hashed after assembly (`phase: verifying`). A mismatch ends
+that URL with `failed` and exits **4** (conflict). Digest is hex by
+default; for base64 use `sha256:base64:<digest>`. `--checksum` is
+repeatable and runs in addition to any checksum the server advertised.
+
+## 9. Bash error-handling loop (retry transient failures)
 
 ```bash
 url="https://example.com/file.zip"

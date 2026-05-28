@@ -8,8 +8,9 @@ description: Download files reliably with the `odl` CLI — resumable, multi-con
 `odl` is a resumable, multi-connection download manager. Drive it in
 machine mode and never parse human output.
 
-Requires `odl` ≥ 1.0 (the `--format json` contract). Verify with
-`odl --version`; the full contract is in `odl --help`.
+Requires `odl` ≥ 1.0 (the `--format json` contract); `--checksum`
+verification needs ≥ 1.1. Verify with `odl --version`; the full contract
+is in `odl --help`.
 
 ## Golden rule
 
@@ -31,6 +32,10 @@ its `"type"`, and attribute it to its `"url"`.
 ```bash
 # Single download (server-provided filename), machine output
 odl --format json "https://example.com/file.zip" -o /downloads/
+
+# Verify against a known hash (exit 4 on mismatch); repeatable
+odl --format json "https://example.com/file.zip" -o /downloads/ \
+    --checksum "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
 
 # Batch from a file of URLs (one per line; '#'/'//' comments ignored)
 odl --format json /path/to/urls.txt -o /downloads/

@@ -123,6 +123,7 @@ In a batch, individual `failed` events also stream to stdout; the stderr
 | `--max-retries N`, `--n-fixed-retries N`, `--wait-between-retries DUR` | retry policy |
 | `--timeout DUR` | connect timeout, e.g. `30s` |
 | `--header "K: V"` | repeatable; use for auth tokens |
+| `--checksum ALGO:DIGEST` | verify the file against a known hash; repeatable. `ALGO`: `md5`/`sha1`/`sha256`/`sha384`/`sha512`. Digest hex by default, or `ALGO:base64:DIGEST`. Mismatch ⇒ exit 4 |
 | `--http-user`, `--http-password` | HTTP basic auth |
 | `--proxy URL` | `http(s)://` or `socks://` |
 | `--on-final-file-exists abort\|replace-and-continue\|add-number-to-name-and-continue` | default `replace-and-continue` (overwrites) |

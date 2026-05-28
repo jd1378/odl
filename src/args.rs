@@ -275,6 +275,15 @@ pub struct Args {
     #[arg(long, value_enum, default_value_t = FinalFileAction::ReplaceAndContinue)]
     pub on_final_file_exists: FinalFileAction,
 
+    /// Expected checksum(s) to verify the assembled file against. Format
+    /// `ALGO:DIGEST` (digest hex-encoded) or `ALGO:ENCODING:DIGEST`.
+    /// ALGO: `md5`, `sha1`, `sha256`, `sha384`, `sha512`.
+    /// ENCODING: `hex` (default) or `base64`.
+    /// Repeatable; checked in addition to any server-advertised checksums.
+    /// A mismatch fails the download with a conflict error (exit code 4).
+    #[arg(long = "checksum", value_name = "ALGO:DIGEST", action = clap::ArgAction::Append)]
+    pub checksums: Vec<String>,
+
     /// HTTP basic authentication username.
     #[arg(long, value_name = "USER")]
     pub http_user: Option<String>,

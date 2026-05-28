@@ -97,6 +97,91 @@ impl HashDigest {
         }
     }
 
+    /// Parse a user-supplied checksum string into a `HashDigest`.
+    ///
+    /// Accepts `ALGO:DIGEST` (digest hex-encoded) or
+    /// `ALGO:ENCODING:DIGEST`. `ALGO` is one of `md5`, `sha1`, `sha256`,
+    /// `sha384`, `sha512`; `ENCODING` is `hex` (default) or `base64`.
+    /// Hex digests are validated for length and lowercased so they match
+    /// the lowercase hex produced during verification.
+    pub fn parse_cli(s: &str) -> Result<HashDigest, String> {
+        let parts: Vec<&str> = s.splitn(3, ':').collect();
+        let (algo_str, encoding, digest) = match parts.as_slice() {
+            [algo, digest] => (*algo, HashEncoding::Hex, (*digest).to_string()),
+            [algo, enc, digest] => {
+                let encoding = match enc.to_ascii_lowercase().as_str() {
+                    "hex" => HashEncoding::Hex,
+                    "base64" | "b64" => HashEncoding::Base64,
+                    other => return Err(format!("unknown checksum encoding '{other}'")),
+                };
+                (*algo, encoding, (*digest).to_string())
+            }
+            _ => {
+                return Err(format!(
+                    "invalid checksum '{s}': expected ALGO:DIGEST or ALGO:ENCODING:DIGEST"
+                ));
+            }
+        };
+
+        let algo = match algo_str.to_ascii_lowercase().as_str() {
+            "md5" => HashAlgorithm::MD5,
+            "sha1" => HashAlgorithm::SHA1,
+            "sha256" => HashAlgorithm::SHA256,
+            "sha384" => HashAlgorithm::SHA384,
+            "sha512" => HashAlgorithm::SHA512,
+            other => return Err(format!("unknown checksum algorithm '{other}'")),
+        };
+
+        if digest.is_empty() {
+            return Err(format!("invalid checksum '{s}': empty digest"));
+        }
+
+        let digest = match encoding {
+            HashEncoding::Hex => {
+                let expected_len = match algo {
+                    HashAlgorithm::MD5 => 32,
+                    HashAlgorithm::SHA1 => 40,
+                    HashAlgorithm::SHA256 => 64,
+                    HashAlgorithm::SHA384 => 96,
+                    HashAlgorithm::SHA512 => 128,
+                };
+                if digest.len() != expected_len || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(format!(
+                        "invalid {algo:?} hex digest: expected {expected_len} hex characters"
+                    ));
+                }
+                digest.to_ascii_lowercase()
+            }
+            HashEncoding::Base64 => {
+                let decoded = general_purpose::STANDARD
+                    .decode(digest.as_bytes())
+                    .map_err(|e| format!("invalid base64 digest: {e}"))?;
+                let expected_bytes = match algo {
+                    HashAlgorithm::MD5 => 16,
+                    HashAlgorithm::SHA1 => 20,
+                    HashAlgorithm::SHA256 => 32,
+                    HashAlgorithm::SHA384 => 48,
+                    HashAlgorithm::SHA512 => 64,
+                };
+                if decoded.len() != expected_bytes {
+                    return Err(format!(
+                        "invalid {algo:?} base64 digest: expected {expected_bytes} bytes, got {}",
+                        decoded.len()
+                    ));
+                }
+                digest
+            }
+        };
+
+        Ok(match algo {
+            HashAlgorithm::MD5 => HashDigest::MD5(digest, encoding),
+            HashAlgorithm::SHA1 => HashDigest::SHA1(digest, encoding),
+            HashAlgorithm::SHA256 => HashDigest::SHA256(digest, encoding),
+            HashAlgorithm::SHA384 => HashDigest::SHA384(digest, encoding),
+            HashAlgorithm::SHA512 => HashDigest::SHA512(digest, encoding),
+        })
+    }
+
     /// Compute a hash from an async reader using the algorithm implied by the HashDigest variant and encoding (async).
     pub async fn from_reader<R: AsyncRead + Unpin>(
         reader: R,
@@ -260,6 +345,50 @@ mod tests {
         let data = b"";
         let hash = hash_hex_async(HashAlgorithm::MD5, data).await;
         assert_eq!(hash, "d41d8cd98f00b204e9800998ecf8427e");
+    }
+
+    #[test]
+    fn parse_cli_hex_sha256_lowercases() {
+        let d = HashDigest::parse_cli(
+            "sha256:B94D27B9934D3E08A52E52D7DA7DABFAC484EFE37A5380EE9088F7ACE2EFCDE9",
+        )
+        .unwrap();
+        assert_eq!(
+            d,
+            HashDigest::SHA256(
+                "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9".to_string(),
+                HashEncoding::Hex,
+            )
+        );
+    }
+
+    #[test]
+    fn parse_cli_explicit_encoding_and_algos() {
+        assert_eq!(
+            HashDigest::parse_cli("md5:hex:5eb63bbbe01eeed093cb22bb8f5acdc3").unwrap(),
+            HashDigest::MD5(
+                "5eb63bbbe01eeed093cb22bb8f5acdc3".to_string(),
+                HashEncoding::Hex
+            )
+        );
+        assert_eq!(
+            HashDigest::parse_cli("sha256:base64:uU0nuZNNPgilLlLX2n2r+sSE7+N6U4DukIj3rOLvzek=")
+                .unwrap(),
+            HashDigest::SHA256(
+                "uU0nuZNNPgilLlLX2n2r+sSE7+N6U4DukIj3rOLvzek=".to_string(),
+                HashEncoding::Base64,
+            )
+        );
+    }
+
+    #[test]
+    fn parse_cli_rejects_bad_input() {
+        assert!(HashDigest::parse_cli("sha256:nothex").is_err());
+        assert!(HashDigest::parse_cli("sha256:abcd").is_err()); // wrong length
+        assert!(HashDigest::parse_cli("bogus:deadbeef").is_err());
+        assert!(HashDigest::parse_cli("sha256").is_err());
+        assert!(HashDigest::parse_cli("sha256:").is_err());
+        assert!(HashDigest::parse_cli("sha256:rot13:deadbeef").is_err());
     }
 
     #[tokio::test]

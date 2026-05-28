@@ -198,6 +198,18 @@ impl Download {
         self.filename = filename;
     }
 
+    /// Merge additional expected checksums (e.g. user-supplied via CLI)
+    /// into the instruction, skipping any already present. These are
+    /// persisted to metadata and verified against the assembled file
+    /// alongside any server-advertised checksums.
+    pub fn add_checksums(&mut self, extra: impl IntoIterator<Item = HashDigest>) {
+        for c in extra {
+            if !self.checksums.contains(&c) {
+                self.checksums.push(c);
+            }
+        }
+    }
+
     pub fn save_dir(&self) -> &path::PathBuf {
         &self.save_dir
     }
@@ -600,6 +612,43 @@ impl From<UninitializedFieldError> for DownloadBuilderError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_download(checksums: Vec<HashDigest>) -> Download {
+        DownloadBuilder::default()
+            .download_dir(PathBuf::from("/tmp/dl"))
+            .save_dir(PathBuf::from("/tmp/save"))
+            .url(Url::parse("https://example.com/file").unwrap())
+            .filename("file".to_string())
+            .max_connections(1)
+            .checksums(checksums)
+            .parts(Download::determine_parts(Some(0), 1))
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn add_checksums_merges_and_dedups() {
+        use crate::hash::HashEncoding;
+        // Instruction already carries a server-advertised SHA256.
+        let server = HashDigest::SHA256("aa".repeat(32), HashEncoding::Hex);
+        let mut dl = test_download(vec![server.clone()]);
+
+        // User supplies the identical SHA256 again (must dedup against the
+        // seeded one) plus a brand-new MD5 (must be kept).
+        let user_new = HashDigest::MD5("bb".repeat(16), HashEncoding::Hex);
+        dl.add_checksums(vec![server.clone(), user_new.clone()]);
+
+        assert_eq!(dl.checksums, vec![server, user_new]);
+    }
+
+    #[test]
+    fn add_checksums_into_empty() {
+        use crate::hash::HashEncoding;
+        let mut dl = test_download(vec![]);
+        let c = HashDigest::SHA512("cc".repeat(64), HashEncoding::Hex);
+        dl.add_checksums(vec![c.clone()]);
+        assert_eq!(dl.checksums, vec![c]);
+    }
 
     #[test]
     fn test_determine_parts_unknown_size_streams_until_eof() {

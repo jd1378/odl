@@ -663,6 +663,13 @@ async fn run(args: Args) -> Result<(), OdlError> {
     // bounded by the download manager's semaphore.
     let mut handles = Vec::new();
 
+    let expected_checksums = args
+        .checksums
+        .iter()
+        .map(|s| odl::hash::HashDigest::parse_cli(s))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|message| OdlError::CliError { message })?;
+
     let dlm = Arc::new(dlm);
     let credentials = if let Some(user) = args.http_user.as_deref() {
         Some(Credentials::new(user, args.http_password.as_deref()))
@@ -735,6 +742,7 @@ async fn run(args: Args) -> Result<(), OdlError> {
         let save_dir = save_dir.clone();
         let user_provided_filename = user_provided_filename.clone();
         let credentials = credentials.clone();
+        let expected_checksums = expected_checksums.clone();
         // `resolver` is `Copy`, closures will capture by value; no extra binding needed.
 
         // Wait here for a permit before spawning the task. This ensures we
@@ -763,6 +771,7 @@ async fn run(args: Args) -> Result<(), OdlError> {
                 if let Some(filename) = user_provided_filename {
                     instruction.set_filename(filename);
                 }
+                instruction.add_checksums(expected_checksums);
                 dlm.download(DownloadRequest {
                     instruction,
                     conflict_resolver: &resolver,
