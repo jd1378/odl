@@ -7,7 +7,7 @@
       "name": "odl",
       "source": "./plugins/odl",
       "description": "Teach AI agents to drive the odl CLI: resumable downloads, batch URL lists, probe/status, NDJSON output, typed exit codes.",
-      "version": "1.1.0",
+      "version": "1.2.0",
       "category": "productivity",
       "tags": ["download", "cli", "agent-skill"]
     }
