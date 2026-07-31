@@ -351,7 +351,13 @@ impl Download {
     /// oversized values skipped, total capped at
     /// [`MAX_STORED_RESPONSE_HEADERS_BYTES`]. Server order and repeated
     /// header names are preserved.
-    pub(crate) fn stored_response_headers(&self) -> Vec<ResponseHeader> {
+    ///
+    /// Prefer this over [`Self::response_headers`] when showing headers to a
+    /// user: a live probe's map still holds `set-cookie`, bearer tokens and
+    /// signed-URL material, and this applies the same filter the on-disk copy
+    /// went through — so a download displays identically before and after a
+    /// restart.
+    pub fn stored_response_headers(&self) -> Vec<ResponseHeader> {
         let Some(headers) = &self.response_headers else {
             return Vec::new();
         };
