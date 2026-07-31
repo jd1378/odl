@@ -87,6 +87,12 @@ pub async fn read_delimited_message_from_path<M: Message + Default, P: AsRef<Pat
     M::decode_length_delimited(&*buf).map_err(io::Error::other)
 }
 
+/// Permissions for files that may embed user secrets: download metadata
+/// (see [`atomic_write`]) and the config file, both of which can hold
+/// user-supplied request headers such as `Authorization` or `Cookie`.
+#[cfg(unix)]
+pub(crate) const OWNER_ONLY_MODE: u32 = 0o600;
+
 pub async fn atomic_replace(src: PathBuf, dst: PathBuf) -> io::Result<()> {
     tokio::task::spawn_blocking(move || atomicwrites::replace_atomic(&src, &dst))
         .await
@@ -99,15 +105,20 @@ pub async fn atomic_replace(src: PathBuf, dst: PathBuf) -> io::Result<()> {
 /// Writes to a temporary file in the same directory and then renames it over the target file.
 /// Ensures that either the entire file is written or not changed at all.
 /// Truncates the tmp_file if it exists
+///
+/// A newly created file is restricted to owner-only access (0600 on unix):
+/// callers persist download metadata, which embeds user-supplied request
+/// headers such as `Authorization` or `Cookie`. Permissions of a temp file
+/// left behind by an earlier run are inherited as-is — that write is
+/// consumed by the rename, so the next one is owner-only again.
 pub async fn atomic_write(path: PathBuf, tmp_path: PathBuf, data: &[u8]) -> io::Result<()> {
     // Write to the temporary file
     {
-        let mut tmp_file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&tmp_path)
-            .await?;
+        let mut opts = OpenOptions::new();
+        opts.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        opts.mode(OWNER_ONLY_MODE);
+        let mut tmp_file = opts.open(&tmp_path).await?;
         tmp_file.write_all(data).await?;
         tmp_file.sync_all().await?;
     }
@@ -348,5 +359,31 @@ mod tests {
         let file_path = dir.path().join("does_not_exist.txt");
         let result = set_file_mtime_async(&file_path, 1_600_000_000).await;
         assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_atomic_write_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("secret.pb");
+        let tmp_path = dir.path().join("secret.pb.temp");
+
+        atomic_write(path.clone(), tmp_path.clone(), b"payload")
+            .await
+            .unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, OWNER_ONLY_MODE, "fresh write must be owner-only");
+        assert_eq!(fs::read(&path).unwrap(), b"payload");
+
+        // Overwriting an existing target stays owner-only: the temp file is
+        // created fresh and the rename replaces the old inode.
+        atomic_write(path.clone(), tmp_path, b"payload2")
+            .await
+            .unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, OWNER_ONLY_MODE, "overwrite must stay owner-only");
+        assert_eq!(fs::read(&path).unwrap(), b"payload2");
     }
 }

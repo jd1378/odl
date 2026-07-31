@@ -10,6 +10,7 @@ use std::{
     time::Duration,
 };
 use tokio::fs;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Semaphore;
 
 #[rustfmt::skip]
@@ -509,13 +510,23 @@ impl Config {
     }
 
     /// Save configuration to `data_dir/config.toml`. Creates parent dir if needed.
+    ///
+    /// A config file created here is owner-only (0600 on unix) since it can
+    /// hold request headers such as `Authorization` or `Cookie`. Permissions
+    /// of an already existing file are left alone — that is the user's call.
     pub async fn save_to_file<P: AsRef<Path>>(&self, cfg_path: P) -> Result<(), io::Error> {
         let pathbuf = cfg_path.as_ref().to_path_buf();
         if let Some(p) = pathbuf.parent() {
             fs::create_dir_all(p).await?;
         }
         let s = toml::to_string_pretty(&self).map_err(io::Error::other)?;
-        fs::write(pathbuf, s).await?;
+        let mut opts = fs::OpenOptions::new();
+        opts.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        opts.mode(crate::fs_utils::OWNER_ONLY_MODE);
+        let mut f = opts.open(&pathbuf).await?;
+        f.write_all(s.as_bytes()).await?;
+        f.sync_all().await?;
         Ok(())
     }
 }
@@ -858,5 +869,25 @@ M-Header = "m"
             cfg.download().max_connections()
         );
         assert_eq!(loaded.download().headers(), cfg.download().headers());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn save_to_file_creates_owner_only_config() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("nested").join("config.toml");
+        let cfg = Config::default();
+
+        cfg.save_to_file(&path).await.unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, crate::fs_utils::OWNER_ONLY_MODE);
+
+        // Permissions the user set on an existing file are preserved.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        cfg.save_to_file(&path).await.unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640);
     }
 }
