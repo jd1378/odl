@@ -26,6 +26,19 @@ message DownloadMetadata {
   uint64 max_connections = 13;
   map<string, PartDetails> parts = 14; // ulid -> PartDetails
   bool finished = 15;
+  // headers of the last successful probe, kept for display purposes only.
+  // credential-bearing headers are dropped and the total is capped, so this
+  // is a filtered view rather than what the server literally sent.
+  // repeated (not a map) to preserve server order and repeated header names.
+  repeated ResponseHeader response_headers = 16;
+  // when those headers were observed (unix seconds). without it, consumers
+  // cannot tell a probe from a minute ago from one from last month.
+  optional int64 response_headers_probed_at = 17;
+}
+
+message ResponseHeader {
+  string name = 1;
+  string value = 2;
 }
 
 message PartDetails {

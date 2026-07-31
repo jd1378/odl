@@ -54,6 +54,13 @@ where
             disk_metadata.requires_basic_auth = instruction.requires_basic_auth();
             disk_metadata.use_server_time = instruction.use_server_time();
             disk_metadata.save_dir = instruction.save_dir().to_string_lossy().into_owned();
+            // Refresh the stored probe. Skipped when this instruction never
+            // probed (`quick_evaluate`), so an older observation survives
+            // rather than being replaced by nothing.
+            if instruction.response_headers().is_some() {
+                disk_metadata.response_headers = instruction.stored_response_headers();
+                disk_metadata.response_headers_probed_at = instruction.response_headers_probed_at();
+            }
             disk_metadata
         }
         Err(e) => {
@@ -184,4 +191,72 @@ where
     persist_metadata(&metadata, instruction).await?;
 
     Ok(metadata)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        download::DownloadBuilder, download_metadata::ResponseHeader,
+        fs_utils::read_delimited_message_from_path,
+    };
+    use async_trait::async_trait;
+    use reqwest::{
+        Url,
+        header::{HeaderMap, HeaderValue},
+    };
+
+    struct RestartResolver;
+    #[async_trait]
+    impl ServerConflictResolver for RestartResolver {
+        async fn resolve_file_changed(&self, _: &Download) -> FileChangedResolution {
+            FileChangedResolution::Restart
+        }
+        async fn resolve_not_resumable(&self, _: &Download) -> NotResumableResolution {
+            NotResumableResolution::Restart
+        }
+    }
+
+    /// A resumed download must show the headers of the probe that just ran,
+    /// not the ones stored when the download first started.
+    #[tokio::test]
+    async fn resume_refreshes_stored_response_headers()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let tmp = tempfile::tempdir()?;
+        let save_dir = tempfile::tempdir()?;
+
+        let mut fresh_headers = HeaderMap::new();
+        fresh_headers.insert("x-cache", HeaderValue::from_static("HIT"));
+
+        let instruction = DownloadBuilder::default()
+            .download_dir(tmp.path().to_path_buf())
+            .save_dir(save_dir.path().to_path_buf())
+            .url(Url::parse("http://example.invalid/file")?)
+            .filename("file".to_string())
+            .size(Some(1024))
+            .is_resumable(true)
+            .max_connections(1)
+            .parts(Download::determine_parts(Some(1024), 1))
+            .response_headers(Some(fresh_headers))
+            .response_headers_probed_at(Some(1_700_000_100))
+            .build()?;
+
+        // Seed disk with a metadata carrying an older probe.
+        let mut on_disk = instruction.as_metadata();
+        on_disk.response_headers = vec![ResponseHeader {
+            name: "x-cache".to_string(),
+            value: "MISS".to_string(),
+        }];
+        on_disk.response_headers_probed_at = Some(1_600_000_000);
+        persist_metadata(&on_disk, &instruction).await?;
+
+        resolve_server_conflicts(&instruction, &RestartResolver).await?;
+
+        let written: DownloadMetadata =
+            read_delimited_message_from_path(&instruction.metadata_path()).await?;
+        assert_eq!(written.response_headers.len(), 1);
+        assert_eq!(written.response_headers[0].value, "HIT");
+        assert_eq!(written.response_headers_probed_at, Some(1_700_000_100));
+        Ok(())
+    }
 }

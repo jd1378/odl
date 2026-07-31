@@ -926,6 +926,7 @@ mod tests {
             max_connections: 1,
             parts,
             finished: false,
+            ..Default::default()
         };
 
         grow_parts(&instruction, &mut metadata, 4).await?;
@@ -978,6 +979,7 @@ mod tests {
             max_connections: 2,
             parts,
             finished: false,
+            ..Default::default()
         };
 
         // Target == current → nothing changes.
@@ -1083,6 +1085,7 @@ mod tests {
             max_connections: 1,
             parts,
             finished: false,
+            ..Default::default()
         };
 
         grow_parts(&instruction, &mut metadata, 2).await?;

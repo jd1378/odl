@@ -1,6 +1,6 @@
 use crate::{
     credentials::Credentials,
-    download_metadata::{DownloadMetadata, FileChecksum, PartDetails},
+    download_metadata::{DownloadMetadata, FileChecksum, PartDetails, ResponseHeader},
     error::MetadataError,
     fs_utils,
     hash::HashDigest,
@@ -94,10 +94,14 @@ pub struct Download {
     proxy: Option<Proxy>,
     #[builder(default = None)]
     headers: Option<HeaderMap>,
-    /// Headers the server sent on the evaluate probe. Not persisted to
-    /// metadata, so this is `None` for instructions rebuilt from disk.
+    /// Headers the server sent on the evaluate probe. Instructions rebuilt
+    /// from disk carry the filtered subset that was persisted (see
+    /// [`Download::stored_response_headers`]).
     #[builder(default = None)]
     response_headers: Option<HeaderMap>,
+    /// When `response_headers` were observed, in unix seconds.
+    #[builder(default = None)]
+    response_headers_probed_at: Option<i64>,
     /// Preferred number of connections for this download.
     /// This will determine the initial number of parts, which will not be decreased after determination,
     /// even if the max_connections is decreased.
@@ -108,6 +112,54 @@ pub struct Download {
     /// Is the download finished?
     #[builder(default = false)]
     finished: bool,
+}
+
+/// Response headers never persisted to metadata: they carry session
+/// material and are useless in a properties dialog anyway.
+const RESPONSE_HEADER_DENYLIST: &[&str] = &[
+    "set-cookie",
+    "set-cookie2",
+    "www-authenticate",
+    "proxy-authenticate",
+    "authentication-info",
+    "proxy-authentication-info",
+    "authorization",
+    "proxy-authorization",
+];
+
+/// Substrings that mark a header as credential-bearing regardless of the
+/// exact name. Vendor headers are open-ended (`x-amz-security-token`,
+/// `x-api-key`, `x-goog-signature`, …), so this fails closed: an unknown
+/// header matching one of these is dropped rather than written to disk.
+const RESPONSE_HEADER_SECRET_MARKERS: &[&str] = &[
+    "auth",
+    "cookie",
+    "credential",
+    "key",
+    "password",
+    "secret",
+    "session",
+    "signature",
+    "token",
+];
+
+/// Cap on the total persisted header bytes (names + values). Servers cap
+/// their own header block around 8 KB (nginx and Apache both default
+/// there), so this bounds the tail — long `link` preload lists, CDN debug
+/// headers — without touching any realistic response.
+const MAX_STORED_RESPONSE_HEADERS_BYTES: usize = 8 * 1024;
+
+/// Cap on a single persisted header value. One pathological value should
+/// not consume the whole budget and crowd out the rest.
+const MAX_STORED_RESPONSE_HEADER_VALUE_BYTES: usize = 1024;
+
+/// Whether a response header may carry credentials and must stay off disk.
+/// `name` is expected lowercase, as [`HeaderName`] guarantees.
+fn is_secret_response_header(name: &str) -> bool {
+    RESPONSE_HEADER_DENYLIST.contains(&name)
+        || RESPONSE_HEADER_SECRET_MARKERS
+            .iter()
+            .any(|marker| name.contains(marker))
 }
 
 /// Result of [`Download::compute_split`]: how to resize an existing
@@ -261,10 +313,26 @@ impl Download {
 
     /// Headers returned by the server during [`crate::download_manager::DownloadManager::evaluate`].
     ///
-    /// `None` when no probe happened (`quick_evaluate`) or when the
-    /// instruction was rebuilt from persisted metadata (resume).
+    /// `None` when no probe happened (`quick_evaluate`) and no probe was
+    /// ever persisted. For an instruction rebuilt from metadata these are
+    /// the filtered, capped subset that was stored — see
+    /// [`Self::stored_response_headers`] — and describe the probe at
+    /// [`Self::response_headers_probed_at`], which may be long past.
     pub fn response_headers(&self) -> Option<&HeaderMap> {
         self.response_headers.as_ref()
+    }
+
+    /// When [`Self::response_headers`] were observed, in unix seconds.
+    ///
+    /// Consumers displaying the headers should show this alongside them:
+    /// the values describe one past probe, not the server's current state.
+    pub fn response_headers_probed_at(&self) -> Option<i64> {
+        self.response_headers_probed_at
+    }
+
+    pub fn response_headers_probed_at_as_date(&self) -> Option<DateTime<Utc>> {
+        self.response_headers_probed_at
+            .and_then(|x| DateTime::from_timestamp(x, 0))
     }
 
     pub fn max_connections(&self) -> u64 {
@@ -277,6 +345,42 @@ impl Download {
 
     pub fn finished(&self) -> bool {
         self.finished
+    }
+
+    /// The response headers as persisted: credential-bearing ones dropped,
+    /// oversized values skipped, total capped at
+    /// [`MAX_STORED_RESPONSE_HEADERS_BYTES`]. Server order and repeated
+    /// header names are preserved.
+    pub(crate) fn stored_response_headers(&self) -> Vec<ResponseHeader> {
+        let Some(headers) = &self.response_headers else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        let mut budget = MAX_STORED_RESPONSE_HEADERS_BYTES;
+        for (name, value) in headers.iter() {
+            let name = name.as_str();
+            if is_secret_response_header(name) {
+                continue;
+            }
+            // Non-UTF8 values are rare (and undisplayable anyway); drop them
+            // rather than lossily mangling what the server sent.
+            let Ok(value) = value.to_str() else {
+                continue;
+            };
+            if value.len() > MAX_STORED_RESPONSE_HEADER_VALUE_BYTES {
+                continue;
+            }
+            let cost = name.len() + value.len();
+            if cost > budget {
+                break;
+            }
+            budget -= cost;
+            out.push(ResponseHeader {
+                name: name.to_string(),
+                value: value.to_string(),
+            });
+        }
+        out
     }
 
     pub fn from_metadata(
@@ -320,7 +424,23 @@ impl Download {
                 }
                 Some(map)
             },
-            response_headers: None,
+            response_headers: if metadata.response_headers.is_empty() {
+                None
+            } else {
+                let mut map = HeaderMap::new();
+                for h in metadata.response_headers {
+                    if let (Ok(name), Ok(value)) = (
+                        HeaderName::from_str(&h.name),
+                        HeaderValue::from_str(&h.value),
+                    ) {
+                        // `append`, not `insert`: a server may send the same
+                        // header more than once and both are worth showing.
+                        map.append(name, value);
+                    }
+                }
+                Some(map)
+            },
+            response_headers_probed_at: metadata.response_headers_probed_at,
             max_connections: metadata.max_connections,
             parts: metadata.parts,
             finished: metadata.finished,
@@ -353,6 +473,8 @@ impl Download {
                         .collect()
                 })
                 .unwrap_or_default(),
+            response_headers: self.stored_response_headers(),
+            response_headers_probed_at: self.response_headers_probed_at,
             max_connections: self.max_connections,
             parts: self.parts.clone(),
             finished: self.finished,
@@ -393,6 +515,7 @@ impl Download {
             requires_basic_auth: response_info.requires_basic_auth(),
             proxy,
             headers,
+            response_headers_probed_at: response_headers.is_some().then(|| Utc::now().timestamp()),
             response_headers,
             max_connections,
             parts: Download::determine_parts(
@@ -644,6 +767,98 @@ mod tests {
             .parts(Download::determine_parts(Some(0), 1))
             .build()
             .unwrap()
+    }
+
+    fn download_with_response_headers(headers: Vec<(&str, &str)>) -> Download {
+        let mut map = HeaderMap::new();
+        for (name, value) in headers {
+            map.append(
+                HeaderName::from_str(name).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        let mut dl = test_download(vec![]);
+        dl.response_headers = Some(map);
+        dl.response_headers_probed_at = Some(1_700_000_000);
+        dl
+    }
+
+    #[test]
+    fn stored_response_headers_drops_credential_bearing_ones() {
+        let dl = download_with_response_headers(vec![
+            ("content-type", "application/zip"),
+            ("set-cookie", "session=secret"),
+            ("www-authenticate", "Basic realm=\"x\""),
+            // Vendor headers no denylist can enumerate — caught by marker.
+            ("x-amz-security-token", "AQoDYXdz"),
+            ("x-api-key", "k-123"),
+            ("x-goog-signature", "deadbeef"),
+            ("x-cache", "HIT"),
+        ]);
+
+        let stored: Vec<String> = dl
+            .stored_response_headers()
+            .into_iter()
+            .map(|h| h.name)
+            .collect();
+
+        assert_eq!(stored, ["content-type", "x-cache"]);
+    }
+
+    #[test]
+    fn stored_response_headers_respects_caps() {
+        let huge = "v".repeat(MAX_STORED_RESPONSE_HEADER_VALUE_BYTES + 1);
+        let dl = download_with_response_headers(vec![
+            ("x-huge", huge.as_str()),
+            ("content-type", "application/zip"),
+        ]);
+        let stored = dl.stored_response_headers();
+        assert_eq!(stored.len(), 1, "oversized value must be skipped");
+        assert_eq!(stored[0].name, "content-type");
+
+        // Many mid-sized headers: accumulation stops at the total budget.
+        let value = "v".repeat(512);
+        let names: Vec<String> = (0..40).map(|i| format!("x-pad-{i}")).collect();
+        let dl = download_with_response_headers(
+            names.iter().map(|n| (n.as_str(), value.as_str())).collect(),
+        );
+        let stored = dl.stored_response_headers();
+        let total: usize = stored.iter().map(|h| h.name.len() + h.value.len()).sum();
+        assert!(total <= MAX_STORED_RESPONSE_HEADERS_BYTES, "total {total}");
+        assert!(!stored.is_empty(), "budget must fit at least some headers");
+        assert!(stored.len() < names.len(), "budget must actually bind");
+    }
+
+    #[test]
+    fn response_headers_round_trip_through_metadata() {
+        let dl = download_with_response_headers(vec![
+            ("content-type", "application/zip"),
+            ("x-trace", "first"),
+            ("x-trace", "second"),
+            ("set-cookie", "session=secret"),
+        ]);
+
+        let metadata = dl.as_metadata();
+        assert!(
+            !metadata
+                .response_headers
+                .iter()
+                .any(|h| h.name == "set-cookie"),
+            "filtering must apply on the way to disk"
+        );
+        assert_eq!(metadata.response_headers_probed_at, Some(1_700_000_000));
+
+        let restored = Download::from_metadata(PathBuf::from("/tmp/dl"), metadata).unwrap();
+        let headers = restored.response_headers().expect("headers survive resume");
+        assert_eq!(headers.get("content-type").unwrap(), "application/zip");
+        let traces: Vec<&str> = headers
+            .get_all("x-trace")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(traces, vec!["first", "second"], "duplicates preserved");
+        assert!(headers.get("set-cookie").is_none());
+        assert_eq!(restored.response_headers_probed_at(), Some(1_700_000_000));
     }
 
     #[test]
