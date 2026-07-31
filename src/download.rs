@@ -94,6 +94,10 @@ pub struct Download {
     proxy: Option<Proxy>,
     #[builder(default = None)]
     headers: Option<HeaderMap>,
+    /// Headers the server sent on the evaluate probe. Not persisted to
+    /// metadata, so this is `None` for instructions rebuilt from disk.
+    #[builder(default = None)]
+    response_headers: Option<HeaderMap>,
     /// Preferred number of connections for this download.
     /// This will determine the initial number of parts, which will not be decreased after determination,
     /// even if the max_connections is decreased.
@@ -255,6 +259,14 @@ impl Download {
         &self.headers
     }
 
+    /// Headers returned by the server during [`crate::download_manager::DownloadManager::evaluate`].
+    ///
+    /// `None` when no probe happened (`quick_evaluate`) or when the
+    /// instruction was rebuilt from persisted metadata (resume).
+    pub fn response_headers(&self) -> Option<&HeaderMap> {
+        self.response_headers.as_ref()
+    }
+
     pub fn max_connections(&self) -> u64 {
         self.max_connections
     }
@@ -308,6 +320,7 @@ impl Download {
                 }
                 Some(map)
             },
+            response_headers: None,
             max_connections: metadata.max_connections,
             parts: metadata.parts,
             finished: metadata.finished,
@@ -358,6 +371,12 @@ impl Download {
         headers: Option<HeaderMap>,
     ) -> Download {
         let filename = fs_utils::cleanup_filename(response_info.extract_filename().as_str());
+        // Empty means no probe was made (`quick_evaluate`), not "server sent
+        // nothing" — keep that distinguishable for downstream consumers.
+        let response_headers = {
+            let h = response_info.response_headers();
+            (!h.is_empty()).then(|| h.clone())
+        };
         Self {
             download_dir: download_dir.join(&filename),
             url: response_info.url().clone(),
@@ -374,6 +393,7 @@ impl Download {
             requires_basic_auth: response_info.requires_basic_auth(),
             proxy,
             headers,
+            response_headers,
             max_connections,
             parts: Download::determine_parts(
                 response_info.total_length(),

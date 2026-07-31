@@ -1243,6 +1243,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_evaluate_exposes_response_headers() -> Result<(), Box<dyn std::error::Error>> {
+        let mut server = Server::new_async().await;
+        let base = server.url();
+
+        let head_mock = server
+            .mock("HEAD", "/headerfile")
+            .with_status(200)
+            .with_header("content-length", "10")
+            .with_header("accept-ranges", "bytes")
+            .with_header("x-custom", "downstream-value")
+            .create_async()
+            .await;
+
+        let tmp_data_dir = tempfile::tempdir()?;
+        let tmp_save_dir = tempfile::tempdir()?;
+        let dlm = DownloadManager::new(test_cfg(tmp_data_dir.path(), 1));
+        let resolver = AlwaysReplaceResolver {};
+
+        let url = Url::parse(&format!("{base}/headerfile")).unwrap();
+        let instruction = dlm
+            .evaluate(EvaluateRequest::new(
+                url.clone(),
+                tmp_save_dir.path().to_path_buf(),
+                &resolver,
+            ))
+            .await?;
+
+        let headers = instruction
+            .response_headers()
+            .expect("evaluate must expose probe response headers");
+        assert_eq!(headers.get("x-custom").unwrap(), "downstream-value");
+        assert_eq!(headers.get("content-length").unwrap(), "10");
+
+        // No probe happened, so there are no server headers to expose.
+        let quick = dlm
+            .quick_evaluate(EvaluateRequest::new(
+                url,
+                tmp_save_dir.path().to_path_buf(),
+                &resolver,
+            ))
+            .await?;
+        assert!(quick.response_headers().is_none());
+
+        head_mock.assert_async().await;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_save_conflict_final_file_exists_abort() -> Result<(), Box<dyn std::error::Error>>
     {
         // Start mock server
