@@ -772,7 +772,7 @@ async fn grow_parts(
     // beyond what's already been written so progress isn't lost.
     let mut on_disk: std::collections::HashMap<String, u64> =
         std::collections::HashMap::with_capacity(metadata.parts.len());
-    for (ulid, _) in metadata.parts.iter() {
+    for ulid in metadata.parts.keys() {
         let path = instruction.part_path(ulid);
         let size = match tokio::fs::metadata(&path).await {
             Ok(m) => m.len(),

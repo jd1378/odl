@@ -233,7 +233,7 @@ mod tests {
             assert_eq!(cleanup_filename(name), format!("{name}_"));
             assert_eq!(
                 cleanup_filename(&name.to_ascii_lowercase()),
-                format!("{}_", &name.to_ascii_lowercase())
+                format!("{}_", name.to_ascii_lowercase())
             );
         }
     }
