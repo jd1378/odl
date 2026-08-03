@@ -1,7 +1,11 @@
 use crate::{
     credentials::Credentials,
-    download_metadata::{DownloadMetadata, FileChecksum, PartDetails, ResponseHeader},
+    download_metadata::{
+        DownloadEngine, DownloadMetadata, EngineDetails, FileChecksum, PartDetails, ResponseHeader,
+        YtdlpDetails,
+    },
     error::MetadataError,
+    format::Quality,
     fs_utils,
     hash::HashDigest,
     response_info::ResponseInfo,
@@ -112,6 +116,13 @@ pub struct Download {
     /// Is the download finished?
     #[builder(default = false)]
     finished: bool,
+    /// Which engine moves the bytes for this download.
+    #[builder(default = DownloadEngine::HttpMultipart)]
+    engine: DownloadEngine,
+    /// Engine-specific state. `HttpMultipart` keeps none — the fields above
+    /// already are its state.
+    #[builder(default = None)]
+    engine_details: Option<EngineDetails>,
 }
 
 /// Response headers never persisted to metadata: they carry session
@@ -162,6 +173,30 @@ fn is_secret_response_header(name: &str) -> bool {
             .any(|marker| name.contains(marker))
 }
 
+/// Inputs for [`Download::from_ytdlp`], gathered by the delegating engine
+/// during extraction.
+#[derive(Debug, Clone)]
+pub struct YtdlpSpec {
+    /// Page URL. Also becomes the download's `url`, because it is what a
+    /// resume re-extracts from.
+    pub source_url: Url,
+    pub title: String,
+    pub extractor: String,
+    /// Concrete format the engine must request on every run, including
+    /// resumes.
+    pub format_id: String,
+    /// Container the chosen format produces.
+    pub ext: String,
+    pub size: Option<u64>,
+    pub size_is_approx: bool,
+    /// What the chosen format offers, kept so the download can still be
+    /// described to a person once the format list is gone.
+    pub quality: Quality,
+    pub use_server_time: bool,
+    pub proxy: Option<Proxy>,
+    pub headers: Option<HeaderMap>,
+}
+
 /// Result of [`Download::compute_split`]: how to resize an existing
 /// part (`new_left_size`) and where the new right-hand part begins
 /// (`new_right_offset` / `new_right_size`).
@@ -207,6 +242,19 @@ impl Download {
 
     pub fn download_dir(&self) -> &path::PathBuf {
         &self.download_dir
+    }
+
+    /// Whether a file in a download directory is odl's own bookkeeping rather
+    /// than downloaded data.
+    ///
+    /// Engines that write files of their own choosing need this to tell their
+    /// output from odl's: counting the metadata as progress would overstate
+    /// it, and deleting the lockfile would break the exclusion it provides.
+    pub fn is_bookkeeping_filename(name: &str) -> bool {
+        matches!(
+            name,
+            Self::METADATA_FILENAME | Self::METADATA_TEMP_FILENAME | Self::LOCK_FILENAME
+        )
     }
 
     pub fn part_path(&self, ulid: &str) -> path::PathBuf {
@@ -347,6 +395,53 @@ impl Download {
         self.finished
     }
 
+    /// Which engine moves the bytes for this download.
+    pub fn engine(&self) -> DownloadEngine {
+        self.engine
+    }
+
+    /// Engine-specific state, if the engine keeps any.
+    pub fn engine_details(&self) -> Option<&EngineDetails> {
+        self.engine_details.as_ref()
+    }
+
+    /// yt-dlp state, or `None` when this download uses another engine.
+    pub fn ytdlp_details(&self) -> Option<&YtdlpDetails> {
+        match self.engine_details.as_ref()? {
+            EngineDetails::YtdlpDetails(d) => Some(d),
+        }
+    }
+
+    /// Whether [`Self::size`] is an estimate rather than an exact figure.
+    /// Only ever true for engines that cannot know the size up front.
+    pub fn size_is_approx(&self) -> bool {
+        self.ytdlp_details().is_some_and(|d| d.size_is_approx)
+    }
+
+    /// What the chosen format offers, for engines that pick between formats.
+    ///
+    /// `None` for engines that download whatever the URL points at, where
+    /// there was no choice to describe.
+    pub fn quality(&self) -> Option<Quality> {
+        let d = self.ytdlp_details()?;
+        // A transcript is recoverable from the pinned id alone.
+        if let Some((lang, automatic)) = crate::format::parse_subtitle_format_id(&d.format_id) {
+            return Some(Quality::Subtitles {
+                lang: lang.to_owned(),
+                automatic,
+            });
+        }
+        Some(if let Some(height) = d.height {
+            Quality::Video { height, fps: d.fps }
+        } else if d.audio_only {
+            Quality::Audio {
+                bitrate_kbps: d.bitrate_kbps.map(|b| b.round() as u32),
+            }
+        } else {
+            Quality::Unknown { note: None }
+        })
+    }
+
     /// The response headers as persisted: credential-bearing ones dropped,
     /// oversized values skipped, total capped at
     /// [`MAX_STORED_RESPONSE_HEADERS_BYTES`]. Server order and repeated
@@ -450,6 +545,18 @@ impl Download {
             max_connections: metadata.max_connections,
             parts: metadata.parts,
             finished: metadata.finished,
+            // An unrecognised discriminant means the file was written by a
+            // newer odl. Falling back to the default engine would hand a
+            // foreign download to the HTTP downloader, so refuse instead.
+            engine: DownloadEngine::try_from(metadata.engine).map_err(|_| {
+                MetadataError::Other {
+                    message: format!(
+                        "unknown download engine {} in metadata; it was likely written by a newer version of odl",
+                        metadata.engine
+                    ),
+                }
+            })?,
+            engine_details: metadata.engine_details,
         })
     }
 
@@ -484,7 +591,99 @@ impl Download {
             max_connections: self.max_connections,
             parts: self.parts.clone(),
             finished: self.finished,
+            engine: self.engine.into(),
+            engine_details: self.engine_details.clone(),
         }
+    }
+
+    /// Build a download that a delegating engine will perform.
+    ///
+    /// The download directory is keyed on the *title* rather than the final
+    /// filename: the container depends on which format was chosen, and a
+    /// directory that moved when the user picked a different quality would
+    /// orphan the partial data it holds.
+    pub fn from_ytdlp(
+        download_root: &std::path::Path,
+        save_dir: path::PathBuf,
+        spec: YtdlpSpec,
+    ) -> Download {
+        let YtdlpSpec {
+            source_url,
+            title,
+            extractor,
+            format_id,
+            ext,
+            size,
+            size_is_approx,
+            quality,
+            use_server_time,
+            proxy,
+            headers,
+        } = spec;
+
+        let (height, fps, bitrate_kbps, audio_only) = match &quality {
+            Quality::Video { height, fps } => (Some(*height), *fps, None, false),
+            Quality::Audio { bitrate_kbps } => (None, None, bitrate_kbps.map(f64::from), true),
+            // A subtitle choice is fully described by its pinned id, which
+            // encodes the language and whether it is machine-generated, so
+            // there is nothing extra to persist.
+            Quality::Subtitles { .. } | Quality::Unknown { .. } => (None, None, None, false),
+        };
+
+        let dir_name = fs_utils::cleanup_filename(&title);
+        let filename = fs_utils::cleanup_filename(&format!("{title}.{ext}"));
+
+        Self {
+            download_dir: download_root.join(&dir_name),
+            url: source_url.clone(),
+            // yt-dlp continues an interrupted transfer, and fragmented
+            // formats keep their own resume state alongside the output.
+            is_resumable: true,
+            use_server_time,
+            filename,
+            save_dir,
+            etag: None,
+            last_modified: None,
+            size,
+            checksums: Vec::new(),
+            credentials: None,
+            requires_auth: false,
+            requires_basic_auth: false,
+            proxy,
+            headers,
+            // The engine never exposes the underlying HTTP exchange.
+            response_headers: None,
+            response_headers_probed_at: None,
+            // The transfer is one opaque unit: there is no part table to
+            // schedule, and the single entry exists so status reporting has
+            // something to count.
+            max_connections: 1,
+            parts: Download::determine_parts(size, 1),
+            finished: false,
+            engine: DownloadEngine::Ytdlp,
+            engine_details: Some(EngineDetails::YtdlpDetails(YtdlpDetails {
+                source_url: source_url.to_string(),
+                format_id,
+                extractor,
+                title,
+                size_is_approx,
+                height,
+                fps,
+                bitrate_kbps,
+                audio_only,
+            })),
+        }
+    }
+
+    /// Mark this instruction as not yet evaluated.
+    ///
+    /// Used by [`crate::download_manager::DownloadManager::quick_evaluate`],
+    /// whose whole point is to skip the probe: what it returns is a
+    /// placeholder good enough to show in a queue, not something that can be
+    /// downloaded. Evaluating the URL later produces a real instruction.
+    pub(crate) fn mark_unresolved(&mut self) {
+        self.engine = DownloadEngine::Unresolved;
+        self.engine_details = None;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -533,6 +732,8 @@ impl Download {
                 },
             ),
             finished: false,
+            engine: DownloadEngine::HttpMultipart,
+            engine_details: None,
         }
     }
 
@@ -1131,5 +1332,66 @@ mod tests {
             "boundary must move past already-consumed prefix"
         );
         assert_eq!(split.new_left_size + split.new_right_size, size);
+    }
+
+    /// Metadata written before the engine field existed must keep loading as
+    /// an ordinary HTTP download. Every download already on a user's disk
+    /// depends on this.
+    #[test]
+    fn metadata_without_engine_fields_loads_as_http_multipart() {
+        use prost::Message;
+
+        let mut legacy = test_download(vec![]).as_metadata();
+        // Simulate a file written by the previous version: the fields simply
+        // were not there, which on the wire is indistinguishable from their
+        // defaults.
+        legacy.engine = 0;
+        legacy.engine_details = None;
+        let encoded = legacy.encode_to_vec();
+
+        let decoded = DownloadMetadata::decode(encoded.as_slice()).expect("decode");
+        let download = Download::from_metadata(PathBuf::from("/tmp/dl"), decoded).expect("load");
+
+        assert_eq!(download.engine(), DownloadEngine::HttpMultipart);
+        assert!(download.engine_details().is_none());
+        assert!(!download.size_is_approx());
+    }
+
+    #[test]
+    fn engine_details_round_trip_through_metadata() {
+        let mut download = test_download(vec![]);
+        download.engine = DownloadEngine::Ytdlp;
+        download.engine_details = Some(EngineDetails::YtdlpDetails(YtdlpDetails {
+            source_url: "https://www.youtube.com/watch?v=x".to_owned(),
+            format_id: "137+251".to_owned(),
+            extractor: "youtube".to_owned(),
+            title: "A Title".to_owned(),
+            size_is_approx: true,
+            height: Some(1080),
+            fps: Some(60.0),
+            bitrate_kbps: None,
+            audio_only: false,
+        }));
+
+        let restored = Download::from_metadata(PathBuf::from("/tmp/dl"), download.as_metadata())
+            .expect("load");
+
+        assert_eq!(restored.engine(), DownloadEngine::Ytdlp);
+        let details = restored.ytdlp_details().expect("ytdlp details");
+        // The pinned format is what makes a resume safe; losing it in a
+        // round-trip would let a resume append bytes of a different format.
+        assert_eq!(details.format_id, "137+251");
+        assert_eq!(details.source_url, "https://www.youtube.com/watch?v=x");
+        assert!(restored.size_is_approx());
+    }
+
+    #[test]
+    fn unknown_engine_is_rejected_rather_than_defaulted() {
+        // A file from a future odl using an engine we cannot drive. Silently
+        // treating it as HTTP would hand a foreign download to the wrong
+        // downloader.
+        let mut metadata = test_download(vec![]).as_metadata();
+        metadata.engine = 9999;
+        assert!(Download::from_metadata(PathBuf::from("/tmp/dl"), metadata).is_err());
     }
 }

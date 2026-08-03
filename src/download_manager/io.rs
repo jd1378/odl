@@ -205,6 +205,9 @@ fn assemble_blocking(
             continue;
         }
         let mut part_file = std::fs::File::open(&part_path)?;
+        // Only the non-Windows reflink path consults this — see the tail
+        // exception below.
+        #[cfg_attr(windows, allow(unused_variables))]
         let is_last = idx == last_idx;
 
         // Reflink requires both endpoints on a cluster boundary, except the

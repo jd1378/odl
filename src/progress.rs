@@ -36,6 +36,9 @@ pub use tokio_util::sync::CancellationToken;
 
 /// High-level lifecycle phase a download is currently in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+// Engines bring phases the built-in downloader has no equivalent for, so this
+// stays open rather than breaking every consumer each time one is added.
+#[non_exhaustive]
 pub enum Phase {
     /// Probing the server (HEAD request, redirect resolution, etc.).
     Evaluating,
@@ -43,6 +46,9 @@ pub enum Phase {
     ResolvingConflicts,
     /// Actively downloading file parts.
     Downloading,
+    /// Work an external tool performs on the downloaded data before it is
+    /// usable — muxing separate video and audio streams, for instance.
+    PostProcessing,
     /// Concatenating / reflinking parts into the final file.
     Assembling,
     /// `fsync`ing the final file to durable storage.
@@ -105,8 +111,27 @@ pub enum ProgressEvent {
 
 /// Sink for [`ProgressEvent`]s.
 ///
-/// Implementations must be cheap to call from hot paths: every received byte
-/// triggers at least one `on_event(Progress { .. })` call.
+/// Rate depends on the engine, but neither one calls per chunk:
+///
+/// - The built-in multipart downloader samples on a timer, emitting
+///   [`ProgressEvent::Progress`], [`ProgressEvent::Speed`] and the per-part
+///   equivalents every [`SAMPLE_INTERVAL`] (8 Hz) regardless of how chunks
+///   arrive. A stalled transfer keeps ticking with an unchanged byte count.
+/// - An engine that delegates to an external downloader forwards whatever
+///   that tool reports, capped at a comparable rate. Those events are
+///   data-driven rather than clock-driven, so a stalled transfer goes quiet
+///   instead of reporting zero — detecting a stall needs the consumer's own
+///   wall clock.
+///
+/// Lifecycle events ([`ProgressEvent::PhaseChanged`],
+/// [`ProgressEvent::PartFinished`], [`ProgressEvent::Completed`], …) are
+/// emitted when they occur, on top of the sampled ones.
+///
+/// Implementations should still return promptly: `on_event` runs on the task
+/// driving the download, so blocking here — a mutex, a redraw, a disk write —
+/// back-pressures the transfer. Wrap anything non-trivial in
+/// [`AsyncReporter`], which hands events to a worker task and returns
+/// immediately.
 pub trait ProgressReporter: Send + Sync + 'static {
     /// Receive an event.
     fn on_event(&self, event: ProgressEvent);

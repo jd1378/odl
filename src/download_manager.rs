@@ -1,4 +1,5 @@
 mod checksum;
+mod delegated;
 mod downloader;
 mod io;
 mod recover_metadata;
@@ -29,7 +30,10 @@ use crate::download_manager::{
 };
 use crate::download_manager::{io::assemble_final_file, server_conflict::resolve_server_conflicts};
 use crate::download_manager::{io::remove_all_parts, save_conflict::resolve_save_conflicts};
+use crate::download_metadata::DownloadEngine;
+use crate::engine::EnginePreference;
 use crate::error::MetadataError;
+use crate::format::{FormatSelector, Quality};
 use crate::progress::{DownloadContext, Phase, ProgressEvent};
 use crate::response_info::ResponseInfo;
 use crate::retry_policies::{FixedThenExponentialRetry, wait_for_retry};
@@ -77,7 +81,6 @@ pub struct DownloadManager {
 
 /// Inputs to [`DownloadManager::evaluate`]. Required fields are positional
 /// in [`Self::new`]; optional fields are set via chainable builders.
-#[derive(Debug)]
 pub struct EvaluateRequest<'a, CR: SaveConflictResolver> {
     pub url: Url,
     pub save_dir: PathBuf,
@@ -85,6 +88,18 @@ pub struct EvaluateRequest<'a, CR: SaveConflictResolver> {
     pub credentials: Option<Credentials>,
     pub ctx: Option<&'a DownloadContext>,
     pub options: Option<&'a DownloadOptions>,
+    /// Which engine to use. Defaults to [`EnginePreference::Auto`], which
+    /// delegates only the hosts configured for it and otherwise probes the
+    /// URL over HTTP as before.
+    pub engine: EnginePreference,
+    /// Chooses among the formats a delegating engine offers. Ignored by the
+    /// HTTP engine. Defaults to taking the engine's own best choice.
+    pub format_selector: Option<&'a dyn FormatSelector>,
+    /// Ask `format_selector` again even for a download that already pinned a
+    /// format. Set this only when the caller means to *change* quality:
+    /// picking a different one discards the partial data and starts over,
+    /// since encodings cannot be spliced together.
+    pub reselect_format: bool,
 }
 
 impl<'a, CR: SaveConflictResolver> EvaluateRequest<'a, CR> {
@@ -96,6 +111,9 @@ impl<'a, CR: SaveConflictResolver> EvaluateRequest<'a, CR> {
             credentials: None,
             ctx: None,
             options: None,
+            engine: EnginePreference::Auto,
+            format_selector: None,
+            reselect_format: false,
         }
     }
     pub fn credentials(mut self, c: Credentials) -> Self {
@@ -109,6 +127,29 @@ impl<'a, CR: SaveConflictResolver> EvaluateRequest<'a, CR> {
     pub fn options(mut self, o: &'a DownloadOptions) -> Self {
         self.options = Some(o);
         self
+    }
+    pub fn engine(mut self, e: EnginePreference) -> Self {
+        self.engine = e;
+        self
+    }
+    pub fn format_selector(mut self, s: &'a dyn FormatSelector) -> Self {
+        self.format_selector = Some(s);
+        self
+    }
+    pub fn reselect_format(mut self, yes: bool) -> Self {
+        self.reselect_format = yes;
+        self
+    }
+}
+
+impl<CR: SaveConflictResolver> std::fmt::Debug for EvaluateRequest<'_, CR> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EvaluateRequest")
+            .field("url", &self.url)
+            .field("save_dir", &self.save_dir)
+            .field("engine", &self.engine)
+            .field("has_format_selector", &self.format_selector.is_some())
+            .finish_non_exhaustive()
     }
 }
 
@@ -145,6 +186,9 @@ impl<'a, CR: ServerConflictResolver> DownloadRequest<'a, CR> {
 /// metadata in the manager's `download_dir`. Plain data so presentation
 /// layers (CLI/GUI) can render or serialize it however they like.
 #[derive(Debug, Clone)]
+// Engines keep adding things worth reporting; leaving this open means adding
+// one does not break downstream construction.
+#[non_exhaustive]
 pub struct DownloadStatus {
     pub url: String,
     pub filename: String,
@@ -164,6 +208,14 @@ pub struct DownloadStatus {
     pub parts_finished: usize,
     /// Directory holding this download's metadata and parts.
     pub download_dir: PathBuf,
+    /// Which engine moves the bytes. Determines which of the fields above are
+    /// meaningful — see [`crate::engine::EngineCapabilities`].
+    pub engine: DownloadEngine,
+    /// Whether `size` is an estimate rather than an exact figure.
+    pub size_is_approx: bool,
+    /// What the chosen format offers, for engines that pick between formats.
+    /// `None` when the engine downloads whatever the URL points at.
+    pub quality: Option<Quality>,
 }
 
 impl DownloadManager {
@@ -240,12 +292,19 @@ impl DownloadManager {
             let parts = download.parts();
             let parts_total = parts.len();
             let parts_finished = parts.values().filter(|p| p.finished).count();
-            let mut downloaded: u64 = 0;
-            for ulid in parts.keys() {
-                if let Ok(meta) = tokio::fs::metadata(download.part_path(ulid)).await {
-                    downloaded = downloaded.saturating_add(meta.len());
+            // A delegating engine writes files of its own choosing rather than
+            // the part table's, so its bytes are counted from the directory.
+            let downloaded: u64 = if download.engine() == DownloadEngine::HttpMultipart {
+                let mut sum = 0u64;
+                for ulid in parts.keys() {
+                    if let Ok(meta) = tokio::fs::metadata(download.part_path(ulid)).await {
+                        sum = sum.saturating_add(meta.len());
+                    }
                 }
-            }
+                sum
+            } else {
+                delegated::bytes_on_disk(&dir).await
+            };
             let final_file_path = download.final_file_path();
             let final_file_exists = tokio::fs::try_exists(&final_file_path)
                 .await
@@ -264,11 +323,29 @@ impl DownloadManager {
                 parts_total,
                 parts_finished,
                 download_dir: dir,
+                engine: download.engine(),
+                size_is_approx: download.size_is_approx(),
+                quality: download.quality(),
             });
         }
 
         out.sort_by(|a, b| a.filename.cmp(&b.filename));
         Ok(out)
+    }
+
+    /// Which engine [`Self::evaluate`] would use for `url`, without
+    /// evaluating it.
+    ///
+    /// Answers the question a queue row needs before anything is downloaded:
+    /// "will this go through an external tool?" It accounts for both the host
+    /// rules and whether that tool is actually usable, so the answer matches
+    /// what evaluating would really do rather than what it would prefer.
+    ///
+    /// Cheap to call repeatedly: the host check is a string comparison, and
+    /// the tool's version check is memoized for the life of the process. Still
+    /// `async` because deciding whether a tool is usable means running it once.
+    pub async fn engine_for(&self, url: &Url, preference: EnginePreference) -> DownloadEngine {
+        delegated::planned_engine(&self.config, url, preference).await
     }
 
     /// Probe the remote URL and resolve save conflicts, returning a
@@ -288,6 +365,9 @@ impl DownloadManager {
             credentials,
             ctx,
             options,
+            engine,
+            format_selector,
+            reselect_format,
         } = req;
         let default_ctx;
         let ctx = match ctx {
@@ -302,6 +382,23 @@ impl DownloadManager {
         if ctx.is_cancelled() {
             return Err(OdlError::Cancelled);
         }
+
+        if let Some(instruction) = delegated::try_evaluate(delegated::DelegateInputs {
+            config: &self.config,
+            url: &url,
+            save_dir: &save_dir,
+            conflict_resolver,
+            ctx,
+            opts,
+            preference: engine,
+            selector: format_selector,
+            reselect_format,
+        })
+        .await?
+        {
+            return Ok(instruction);
+        }
+
         let client = self.get_client(opts)?;
 
         let retry_policy = FixedThenExponentialRetry {
@@ -380,7 +477,17 @@ impl DownloadManager {
     ///
     /// Intended for callers that need a fast filename/conflict decision
     /// (e.g. UI previews, batch planning) before committing to a full
-    /// [`Self::evaluate`].
+    /// [`Self::evaluate`]. A download manager can use it to accept a pasted
+    /// link into a queue immediately, and evaluate it when the user actually
+    /// starts it.
+    ///
+    /// The returned instruction is marked
+    /// [`DownloadEngine::Unresolved`](crate::download_metadata::DownloadEngine::Unresolved)
+    /// and **cannot be downloaded**: which engine handles a URL, and the
+    /// filename it will produce, are only known after a real evaluation.
+    /// Passing one to [`Self::download`] is an error rather than a guess —
+    /// guessing would, for a media link, quietly fetch the web page instead of
+    /// the video. Call [`Self::evaluate`] with the same URL when ready.
     ///
     /// `credentials` is preserved on the returned instruction; `ctx` is
     /// used only for phase emission and cancellation checks; `options`
@@ -400,6 +507,11 @@ impl DownloadManager {
             credentials,
             ctx,
             options,
+            // No probe is made here, so there is nothing for an engine to
+            // delegate: `quick_evaluate` is always the built-in path.
+            engine: _,
+            format_selector: _,
+            reselect_format: _,
         } = req;
         let default_ctx;
         let ctx = match ctx {
@@ -428,7 +540,8 @@ impl DownloadManager {
         );
 
         ctx.emit(ProgressEvent::PhaseChanged(Phase::ResolvingConflicts));
-        let instruction = resolve_save_conflicts(instruction, conflict_resolver).await?;
+        let mut instruction = resolve_save_conflicts(instruction, conflict_resolver).await?;
+        instruction.mark_unresolved();
 
         ctx.emit(ProgressEvent::FilenameResolved(
             instruction.filename().to_string(),
@@ -498,6 +611,8 @@ impl DownloadManager {
     {
         // we want to know issues about directory creation very early.
         tokio::fs::create_dir_all(instruction.download_dir()).await?;
+        // The lockfile below is shared by every engine, so an engine that
+        // moves its own bytes still gets the same single-writer guarantee.
 
         let f = tokio::fs::OpenOptions::new()
             .read(true)
@@ -589,6 +704,17 @@ impl DownloadManager {
         tokio::fs::create_dir_all(instruction.save_dir()).await?;
 
         recover_metadata(&instruction).await?;
+
+        if instruction.engine() == DownloadEngine::Unresolved {
+            return Err(OdlError::NotEvaluated {
+                url: instruction.url().to_string(),
+            });
+        }
+
+        if instruction.engine() != DownloadEngine::HttpMultipart {
+            return delegated::process(&self.config, instruction, conflict_resolver, ctx, opts)
+                .await;
+        }
 
         ctx.emit(ProgressEvent::PhaseChanged(Phase::ResolvingConflicts));
         let mut metadata = resolve_server_conflicts(&instruction, conflict_resolver).await?;

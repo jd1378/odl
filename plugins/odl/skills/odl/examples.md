@@ -108,3 +108,37 @@ done
 ```
 Because `--download-dir` is stable, each retry resumes rather than
 restarting.
+
+## 10. Download from a media site (YouTube and friends)
+
+Delegation is automatic when `yt-dlp` is installed; no flag turns it on.
+Always pass `--choose-format never` so a quality prompt can never appear.
+
+```bash
+odl --format json --choose-format never \
+    "https://www.youtube.com/watch?v=VIDEO_ID" -o /downloads/
+```
+
+Check what a link would produce before committing to it:
+
+```bash
+odl --format json --choose-format never probe "https://www.youtube.com/watch?v=VIDEO_ID"
+```
+```json
+{"type":"probe","engine":"ytdlp","filename":"Some Title.mkv","size":743212891,
+ "size_is_approx":true,"resumable":true,"etag":null,"checksums":[]}
+```
+
+`"engine":"ytdlp"` means yt-dlp performs the transfer, so `etag`,
+`last_modified` and `checksums` are `null`/empty — that engine cannot observe
+them. `"size_is_approx":true` means the figure is an estimate until the
+download finishes.
+
+Exit `7` means yt-dlp is missing, too old, or rejected the URL; read the
+stderr `error` object's `message`. It is not retryable — install or update
+`yt-dlp`. To force a plain HTTP download of the same URL, pass
+`--engine http`.
+
+Resume works the same as anywhere else: re-run with the same
+`--download-dir`. The quality chosen on the first run is pinned, so a resume
+never mixes encodings.

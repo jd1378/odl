@@ -50,6 +50,64 @@ pub enum FinalFileAction {
     AddNumberToNameAndContinue,
 }
 
+/// Which download engine to use.
+/// What `odl tools` should do.
+#[derive(clap::Subcommand, Debug)]
+pub enum ToolsAction {
+    /// Report which helpers are installed, where, and which version.
+    Status,
+    /// Download helpers into odl's data directory and record their paths in
+    /// the config file. Downloads are verified against checksums published
+    /// with them, and the latest release is always used — extractors break as
+    /// sites change, so a pinned version would rot.
+    Install {
+        /// Which helper to install. Both, when omitted.
+        #[arg(value_enum)]
+        tool: Option<ToolChoice>,
+        /// Install without asking for confirmation.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolChoice {
+    #[value(name = "yt-dlp")]
+    Ytdlp,
+    Ffmpeg,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EngineChoice {
+    /// Delegate configured media hosts to yt-dlp when it is installed, and
+    /// download everything else over HTTP.
+    #[default]
+    Auto,
+    /// Always use odl's own multipart HTTP downloader.
+    Http,
+    /// Always delegate to yt-dlp, failing if it is unavailable.
+    Ytdlp,
+}
+
+/// When to ask which quality to download.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ChooseFormat {
+    /// Ask when the terminal is interactive and there is a single download to
+    /// decide about; take the best available otherwise.
+    #[default]
+    Auto,
+    /// Always ask, even for a download that already picked a format. Choosing
+    /// a different quality discards what was downloaded and starts over,
+    /// since two encodings cannot be joined; pair it with
+    /// `--on-file-changed restart` to accept that without a prompt.
+    ///
+    /// Still silent without a terminal or with `--format json`: a question
+    /// nobody can answer is a hang, not a prompt.
+    Always,
+    /// Never ask; take the best available.
+    Never,
+}
+
 fn parse_speed(s: &str) -> Result<u64, String> {
     let s = s.trim();
     if s.is_empty() {
@@ -143,12 +201,13 @@ EXIT CODES:
   4    conflict (save/server conflict, checksum mismatch)
   5    I/O error
   6    metadata error (lockfile in use, decode failure)
+  7    yt-dlp error (missing, too old, failed, or unsupported URL)
   130  cancelled
 
 JSON OUTPUT (--format json):
   Downloads stream newline-delimited JSON (NDJSON) to stdout, one object
   per line, each tagged with \"type\" and \"url\":
-    phase      {\"phase\": evaluating|resolving_conflicts|downloading|assembling|flushing|verifying}
+    phase      {\"phase\": evaluating|resolving_conflicts|downloading|post_processing|assembling|flushing|verifying}
     filename   {\"filename\"}
     progress   {\"downloaded\", \"total\": <int|null>}
     message    {\"message\"}
@@ -156,11 +215,23 @@ JSON OUTPUT (--format json):
     failed     {\"message\"}
     cancelled  {}
   One-shot commands emit a single JSON document on stdout:
-    probe        {\"type\":\"probe\", filename, size, resumable, etag, last_modified, checksums, ...}
+    probe        {\"type\":\"probe\", filename, size, size_is_approx, engine, quality, resumable, etag, last_modified, checksums, ...}
     status/list  {\"type\":\"status\", count, downloads:[...]}
     config       {\"type\":\"config\", path, config}  (config_saved on write)
   Errors print one JSON object to stderr:
-    {\"type\":\"error\", \"kind\", \"message\", \"exit_code\"}";
+    {\"type\":\"error\", \"kind\", \"message\", \"exit_code\"}
+
+ENGINES:
+  Links on known media hosts are handed to an installed `yt-dlp`; everything
+  else uses odl's own multipart HTTP downloader. `--engine` forces the choice.
+  A delegated download reports \"engine\":\"ytdlp\" and cannot observe the
+  underlying HTTP exchange, so etag/last_modified are null and checksums is
+  empty; sizes may be estimates (\"size_is_approx\": true). Configure it under
+  [ytdlp] in config.toml.
+
+  Quality is chosen once and pinned: a resume never mixes encodings. To change
+  it, name another format (--format-id) or ask again (--choose-format always);
+  either discards what was downloaded and starts over.";
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None, after_long_help = MACHINE_INTERFACE_HELP)]
@@ -173,6 +244,20 @@ pub struct Args {
     /// If true, tries to download the file at url and read it as a text file and then use it as input
     #[arg(long, default_value_t = false)]
     pub remote_list: bool,
+
+    /// Which download engine to use.
+    #[arg(long, value_enum, default_value_t = EngineChoice::Auto)]
+    pub engine: EngineChoice,
+
+    /// Whether to ask which quality to download when a media host is delegated to yt-dlp.
+    #[arg(long, value_enum, default_value_t = ChooseFormat::Auto)]
+    pub choose_format: ChooseFormat,
+
+    /// Download this exact media format instead of asking or picking the best.
+    /// Naming a different format than a download already started discards what
+    /// was downloaded and starts over, since encodings cannot be joined.
+    #[arg(long, value_name = "ID")]
+    pub format_id: Option<String>,
 
     /// Max connections that download manager can make in parallel for a single file
     #[arg(long, value_name = "COUNT")]
@@ -387,6 +472,18 @@ pub enum Commands {
         /// Allow mid-flight subdivision of long-running parts.
         #[arg(long)]
         dynamic_split: Option<bool>,
+    },
+
+    /// Install or inspect the helper programs odl uses for media sites.
+    ///
+    /// `yt-dlp` turns a media page link into a downloadable video; `ffmpeg`
+    /// joins the separate video and audio streams that sites serve for higher
+    /// qualities. Both are optional, and installing them yourself and setting
+    /// `ytdlp.binary_path` / `ytdlp.ffmpeg_path` in config.toml works equally
+    /// well.
+    Tools {
+        #[command(subcommand)]
+        action: ToolsAction,
     },
 
     /// Probe a URL without downloading: report the resolved filename,

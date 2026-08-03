@@ -21,11 +21,12 @@ odl [OPTIONS] [INPUT] [COMMAND]
 |------|----------------------|---------|
 | 0 | — | success |
 | 1 | `other` | other / internal error |
-| 2 | `cli`, `empty_input_file`, `url_decode`, `config` | usage or invalid input |
-| 3 | `network` | DNS, timeout, HTTP status, connection |
+| 2 | `cli`, `empty_input_file`, `url_decode`, `config`, `not_evaluated`, `invalid_request` | usage or invalid input |
+| 3 | `network` | DNS, timeout, HTTP status, connection; also a site refusing us as too frequent (HTTP 429) — **retryable** |
 | 4 | `conflict` | save/server conflict, checksum mismatch |
 | 5 | `io` | I/O error |
 | 6 | `metadata` | lockfile in use, decode failure |
+| 7 | `ytdlp` | yt-dlp missing, too old, or failed; unsupported URL. **Not** retryable — fix the toolchain |
 | 130 | `cancelled` | cancelled |
 
 ## NDJSON stream (downloads → stdout)
@@ -34,9 +35,9 @@ One JSON object per line. Every object has `"type"` and `"url"`.
 
 | `type` | fields | notes |
 |--------|--------|-------|
-| `phase` | `phase` | one of `evaluating`, `resolving_conflicts`, `downloading`, `assembling`, `flushing`, `verifying` |
+| `phase` | `phase` | one of `evaluating`, `resolving_conflicts`, `downloading`, `post_processing`, `assembling`, `flushing`, `verifying`; treat an unknown value as informational |
 | `filename` | `filename` | resolved final filename |
-| `progress` | `downloaded`, `total` | `total` is `null` when the server sent no Content-Length; ~8 events/sec |
+| `progress` | `downloaded`, `total` | `total` is `null` when the size is unknown; up to ~8 events/sec. With the `ytdlp` engine these are data-driven, so a stalled transfer emits nothing at all — use your own clock to detect a stall |
 | `message` | `message` | free-form status (e.g. retry countdown) |
 | `completed` | `path`, `already_complete` | terminal; `already_complete: true` ⇒ nothing was downloaded |
 | `failed` | `message` | terminal; this URL failed |
@@ -59,6 +60,9 @@ A single JSON object (not NDJSON).
   "url": "https://…",
   "filename": "file.zip",
   "size": 12345,                 // or null if unknown
+  "size_is_approx": false,       // true ⇒ `size` is an estimate
+  "engine": "http_multipart",    // or "ytdlp"
+  "quality": "1080p60",          // null unless the engine chose a format
   "resumable": true,
   "etag": "\"abc\"",             // or null
   "last_modified": 1700000000,   // unix seconds, or null
@@ -68,6 +72,12 @@ A single JSON object (not NDJSON).
   "checksums": [ { "algorithm": "sha256", "digest": "…", "encoding": "hex" } ]
 }
 ```
+
+Keys are always present so parsing stays uniform. With `"engine": "ytdlp"` the
+transfer is performed by yt-dlp, which never exposes the underlying HTTP
+exchange: `etag`, `last_modified`, `last_modified_rfc3339` are `null` and
+`checksums` is empty. That means "this engine cannot know", not "the server
+sent nothing".
 
 ### `status` / `list`
 ```json
@@ -83,11 +93,14 @@ A single JSON object (not NDJSON).
       "final_file_exists": true,
       "download_dir": "/home/u/.local/share/odl/file.zip",
       "size": 12345,             // or null
-      "downloaded": 12345,       // bytes present across parts on disk
+      "size_is_approx": false,   // true ⇒ `size` is an estimate
+      "engine": "http_multipart",// or "ytdlp"
+      "quality": "1080p60",      // null unless the engine chose a format
+      "downloaded": 12345,       // bytes still in the working dir; 0 once finished
       "percent": 100.0,          // null when size unknown and not finished
       "finished": true,
       "resumable": true,
-      "parts_total": 4,
+      "parts_total": 4,          // always 1 for "ytdlp"; not a real part count
       "parts_finished": 4
     }
   ]
@@ -96,11 +109,62 @@ A single JSON object (not NDJSON).
 `list` returns the same JSON as `status`; they differ only in text mode.
 Both accept an optional `FILTER` substring matched against url/filename.
 
+`downloaded` is the literal byte count in the working directory, so a finished
+download reports `0` — its parts were removed after assembly, or its file was
+moved to `save_dir`. Use `finished`/`percent`, not `downloaded`, to judge
+completion. For `"engine": "ytdlp"`, `parts_*` are a placeholder: that engine
+has no part table.
+
 ### `config --show` / config write
 ```json
 { "type": "config", "path": "/…/config.toml", "config": { /* full config */ } }
 { "type": "config_saved", "path": "/…/config.toml" }
 ```
+
+## Helper programs (`odl tools`)
+
+Media links need `yt-dlp`; higher qualities additionally need `ffmpeg`. Neither
+is bundled. **Nothing here ever prompts in `--format json` mode**, so an agent
+cannot hang on a question: the install offer is skipped entirely unless stdin
+is a terminal *and* output is text.
+
+```bash
+odl --format json tools status
+```
+```json
+{
+  "type": "tools",
+  "config_path": "/…/config.toml",
+  "tools_dir": "/…/odl/tools",
+  "yt_dlp": "/usr/bin/yt-dlp",
+  "ffmpeg": null,
+  "can_install_yt_dlp": true,
+  "can_install_ffmpeg": true
+}
+```
+`yt_dlp` / `ffmpeg` are `null` when not installed. `can_install_ffmpeg` is
+`false` on macOS, where odl has no build with a checksum it can verify.
+
+Install without interaction by passing `-y`:
+
+```bash
+odl tools install yt-dlp -y     # exit 0 on success, 7 on failure
+odl tools install -y            # both, yt-dlp first
+```
+
+Binaries come from the official yt-dlp releases and the ffmpeg builds the
+yt-dlp project maintains, land in `tools_dir`, and are recorded in
+`config_path`. The latest release is always used.
+
+The asset is fetched by odl's own downloader, so an install resumes after an
+interruption and is verified against the SHA-256 published with it — a
+mismatch exits `4` (`conflict`) and installs nothing.
+
+Without `-y` **and** without a terminal, `install` prints what it would do,
+changes nothing, and exits 0 — re-check `tools status` rather than assuming it
+installed. Declining an interactive offer is recorded
+(`ytdlp.offer_*_install = false`) and never asked again; an explicit
+`odl tools install` overrides that.
 
 ## Error object (→ stderr)
 
@@ -123,6 +187,10 @@ In a batch, individual `failed` events also stream to stdout; the stderr
 | `--max-retries N`, `--n-fixed-retries N`, `--wait-between-retries DUR` | retry policy |
 | `--timeout DUR` | connect timeout, e.g. `30s` |
 | `--header "K: V"` | repeatable; use for auth tokens |
+| `--engine auto\|http\|ytdlp` | `auto` (default) delegates known media hosts to yt-dlp when installed; `ytdlp` fails if it is unavailable |
+| `--choose-format auto\|always\|never` | quality prompt for delegated downloads. **Agents should pass `never`** — `auto` already declines to prompt without a terminal, but `never` states it |
+| `--engine` / `--format-id` note | `odl tools status --format json` reports which helpers are installed and whether odl can fetch them; `odl tools install <tool> -y` installs non-interactively |
+| `--format-id ID` | download this exact media format. `subs:<lang>` / `autosubs:<lang>` fetch that transcript instead of the media. Naming a different id than an in-progress download discards it and starts over — quality is pinned so a resume never mixes encodings |
 | `--checksum ALGO:DIGEST` | verify the file against a known hash; repeatable. `ALGO`: `md5`/`sha1`/`sha256`/`sha384`/`sha512`. Digest hex by default, or `ALGO:base64:DIGEST`. Mismatch ⇒ exit 4 |
 | `--http-user`, `--http-password` | HTTP basic auth |
 | `--proxy URL` | `http(s)://` or `socks://` |

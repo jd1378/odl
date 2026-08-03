@@ -53,10 +53,54 @@ pub enum MetadataError {
     Other { message: String },
 }
 
+/// Failures specific to delegating a download to an external `yt-dlp`.
+///
+/// Kept separate from [`NetworkError`] because these describe the local
+/// toolchain — a missing, unusable, or failing helper program — which calls
+/// for a different remedy than a network fault.
 #[derive(Error, Debug)]
+pub enum YtdlpError {
+    #[error("yt-dlp was not found{}", .searched_path.as_deref().map(|p| format!(" (looked for `{p}`)")).unwrap_or_default())]
+    NotFound { searched_path: Option<String> },
+    #[error("yt-dlp at `{path}` is not usable: {message}")]
+    NotUsable { path: String, message: String },
+    #[error("yt-dlp at `{path}` is version {found}, but {required} or newer is required")]
+    TooOld {
+        path: String,
+        found: String,
+        required: String,
+    },
+    #[error("yt-dlp exited with {}{}",
+        code.map(|c| format!("code {c}")).unwrap_or_else(|| "a signal".to_owned()),
+        stderr.as_deref().map(|s| format!(": {s}")).unwrap_or_default())]
+    ProcessFailed {
+        code: Option<i32>,
+        stderr: Option<String>,
+    },
+    #[error("yt-dlp does not support this URL")]
+    UnsupportedUrl,
+    #[error(
+        "the site refused the request as too frequent (HTTP 429){}. Nothing is wrong with the download itself — wait and try again, or pass credentials with `cookies_from_browser` in the config. Some endpoints, subtitles especially, are limited far more tightly than the media itself, so a video may still download while its transcript will not",
+        .detail.as_deref().map(|d| format!(": {d}")).unwrap_or_default()
+    )]
+    RateLimited { detail: Option<String> },
+    #[error(
+        "format {format_id} is no longer offered for this URL; the partial download was discarded, so running the same command again will pick a currently available format"
+    )]
+    FormatUnavailable { format_id: String },
+    #[error("yt-dlp error: {message}")]
+    Other { message: String },
+}
+
+#[derive(Error, Debug)]
+// New engines bring new failure modes; leaving this open means adding one
+// does not break every downstream `match`.
+#[non_exhaustive]
 pub enum OdlError {
     #[error(transparent)]
     Network(#[from] NetworkError),
+    #[error(transparent)]
+    Ytdlp(#[from] YtdlpError),
     #[error(transparent)]
     Conflict(#[from] ConflictError),
     #[error("The input file is empty")]
@@ -70,6 +114,17 @@ pub enum OdlError {
     },
     #[error("CLI error: {message}")]
     CliError { message: String },
+    #[error(
+        "`{url}` has not been evaluated yet, so there is nothing to download; call `evaluate` first"
+    )]
+    NotEvaluated { url: String },
+    /// A request that cannot be honoured as written.
+    ///
+    /// Distinct from [`Self::CliError`], which names a mistake on the command
+    /// line: this one is reachable from the library API, where "CLI error"
+    /// would be a confusing thing to be told.
+    #[error("invalid request: {message}")]
+    InvalidRequest { message: String },
     #[error("download cancelled")]
     Cancelled,
     #[error(transparent)]

@@ -19,13 +19,19 @@ use odl::{
     },
     credentials::Credentials,
     download_manager::{DownloadManager, DownloadRequest, EvaluateRequest},
+    engine::EnginePreference,
     error::OdlError,
+    format::{
+        DefaultFormatSelector, FixedFormatSelector, FormatOffer, FormatSelector, QualityTier,
+    },
     progress::{
-        AsyncReporter, DownloadContext, Phase, ProgressEvent, ProgressReporter, SAMPLE_INTERVAL,
+        AsyncReporter, CancellationToken, DownloadContext, Phase, ProgressEvent, ProgressReporter,
+        SAMPLE_INTERVAL,
     },
 };
 use reqwest::Url;
 use serde_json::json;
+use std::io::IsTerminal;
 use std::process::ExitCode;
 use tokio::{self, io::AsyncBufReadExt};
 mod args;
@@ -33,6 +39,8 @@ mod json;
 use args::{Args, LogLevel, OutputFormat};
 use json::JsonReporter;
 use odl::download_manager::DownloadStatus;
+use odl::download_metadata::DownloadEngine;
+use odl::engine::DownloadEngineExt;
 use tracing::instrument;
 
 fn init_tracing(level: LogLevel) {
@@ -63,12 +71,19 @@ fn exit_code(e: &OdlError) -> u8 {
         | OdlError::UrlDecodeError { .. }
         | OdlError::ConfigBuilderError(_)
         | OdlError::DownloadOptionsBuilderError(_) => 2,
-        OdlError::Network(_) => 3,
+        // The site refused us, which is a transient network-class condition
+        // rather than a broken toolchain: scripts that retry on 3 should
+        // retry on this too.
+        OdlError::Network(_) | OdlError::Ytdlp(odl::error::YtdlpError::RateLimited { .. }) => 3,
         OdlError::Conflict(_) => 4,
         OdlError::StdIoError { .. } => 5,
         OdlError::MetadataError(_) => 6,
+        OdlError::Ytdlp(_) => 7,
+        OdlError::NotEvaluated { .. } | OdlError::InvalidRequest { .. } => 2,
         OdlError::Cancelled => 130,
-        OdlError::Other { .. } => 1,
+        // `OdlError` is non-exhaustive so new engines can add failure modes.
+        // Anything unclassified shares the generic failure code.
+        OdlError::Other { .. } | _ => 1,
     }
 }
 
@@ -79,18 +94,27 @@ fn error_kind(e: &OdlError) -> &'static str {
         OdlError::EmptyInputFile => "empty_input_file",
         OdlError::UrlDecodeError { .. } => "url_decode",
         OdlError::ConfigBuilderError(_) | OdlError::DownloadOptionsBuilderError(_) => "config",
-        OdlError::Network(_) => "network",
+        OdlError::Network(_) | OdlError::Ytdlp(odl::error::YtdlpError::RateLimited { .. }) => {
+            "network"
+        }
         OdlError::Conflict(_) => "conflict",
         OdlError::StdIoError { .. } => "io",
         OdlError::MetadataError(_) => "metadata",
+        OdlError::Ytdlp(_) => "ytdlp",
+        OdlError::NotEvaluated { .. } => "not_evaluated",
+        OdlError::InvalidRequest { .. } => "invalid_request",
         OdlError::Cancelled => "cancelled",
-        OdlError::Other { .. } => "other",
+        OdlError::Other { .. } | _ => "other",
     }
 }
 
 /// Emit a top-level error in the selected format and return its exit code.
 fn report_error(e: &OdlError, format: OutputFormat) -> ExitCode {
     match format {
+        // Cancelling is something the user just did on purpose. The interrupt
+        // handler already acknowledged it and every download's own line shows
+        // it, so a third "Error:" banner is noise.
+        OutputFormat::Text if matches!(e, OdlError::Cancelled) => {}
         OutputFormat::Text => {
             eprintln!("Error: {}", e);
             #[cfg(debug_assertions)]
@@ -161,6 +185,189 @@ impl SaveConflictResolver for CliResolver {
     }
 }
 
+/// Asks which quality to download, on the terminal.
+///
+/// Progress bars are suspended for the duration so the menu is not overwritten
+/// by a redraw, and the prompt goes to stderr so a piped stdout stays clean.
+struct InteractiveFormatSelector {
+    mp: Arc<MultiProgress>,
+}
+
+#[async_trait]
+impl FormatSelector for InteractiveFormatSelector {
+    async fn select(&self, offer: &FormatOffer) -> Option<String> {
+        let tiers = offer.quality_tiers();
+        // Nothing to decide: asking would be noise.
+        if tiers.len() < 2 {
+            return DefaultFormatSelector.select(offer).await;
+        }
+
+        let mp = Arc::clone(&self.mp);
+        let title = offer.title.clone();
+        let can_merge = offer.can_merge;
+        let fallback = DefaultFormatSelector.select(offer).await;
+
+        tokio::task::spawn_blocking(move || {
+            mp.suspend(|| prompt_for_quality(&title, &tiers, can_merge, fallback))
+        })
+        .await
+        .unwrap_or(None)
+    }
+}
+
+/// Render the quality menu and read a choice. Blocking; call off the runtime.
+fn prompt_for_quality(
+    title: &str,
+    tiers: &[QualityTier],
+    can_merge: bool,
+    fallback: Option<String>,
+) -> Option<String> {
+    use std::io::Write;
+
+    let mut err = std::io::stderr();
+    // The title is the one piece of context saying *what* is being chosen.
+    // Printed bare it reads like stray output.
+    let _ = writeln!(err, "\nTitle:  {title}");
+
+    // The default is the best tier that can actually be downloaded, which is
+    // not the first one when higher qualities need a muxer we lack.
+    let default = tiers.iter().position(|t| t.available)?;
+    let width = tiers
+        .iter()
+        .map(|t| t.quality.to_string().chars().count())
+        .max()
+        .unwrap_or(8);
+    let ext_width = tiers
+        .iter()
+        .map(|t| t.ext.chars().count())
+        .max()
+        .unwrap_or(4);
+
+    for (i, tier) in tiers.iter().enumerate() {
+        let size = match tier.size {
+            Some(s) if tier.size_is_approx => format!("~{}", HumanBytes(s)),
+            Some(s) => HumanBytes(s).to_string(),
+            None => "size unknown".to_owned(),
+        };
+        // Unavailable tiers stay listed with the reason attached: a menu that
+        // silently stopped at 480p would read as all the site offers.
+        let note = if tier.available {
+            ""
+        } else {
+            "  — needs ffmpeg"
+        };
+        let marker = if i == default { '*' } else { ' ' };
+        let quality = tier.quality.to_string();
+        // The container matters as much as the resolution: it decides what
+        // will actually open the file.
+        let _ = writeln!(
+            err,
+            " {marker}{:>2}) {quality:<width$}  {:<ext_width$}  {size}{note}",
+            i + 1,
+            tier.ext
+        );
+    }
+
+    if !can_merge && tiers.iter().any(|t| !t.available) {
+        let _ = writeln!(
+            err,
+            "\n  Higher qualities are served as separate video and audio streams,\n  \
+             which need ffmpeg to join. Install it with `odl tools install ffmpeg`."
+        );
+    }
+    let _ = write!(
+        err,
+        "\nQuality [1-{}, default {}]: ",
+        tiers.len(),
+        default + 1
+    );
+    let _ = err.flush();
+
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return fallback;
+    }
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Some(tiers[default].format_id.clone());
+    }
+    match trimmed.parse::<usize>() {
+        Ok(n) if (1..=tiers.len()).contains(&n) && tiers[n - 1].available => {
+            Some(tiers[n - 1].format_id.clone())
+        }
+        // Choosing something that needs a missing tool is a specific mistake
+        // and deserves a specific answer rather than a silent substitution.
+        Ok(n) if (1..=tiers.len()).contains(&n) => {
+            let _ = writeln!(
+                err,
+                "That quality needs ffmpeg, which is not installed; taking {} instead.",
+                tiers[default].quality
+            );
+            Some(tiers[default].format_id.clone())
+        }
+        _ => {
+            let _ = writeln!(err, "Not a listed choice; taking the best available.");
+            Some(tiers[default].format_id.clone())
+        }
+    }
+}
+
+/// Turn the first interrupt into a cancellation, and a second one into an
+/// immediate exit.
+///
+/// This matters most for engines that drive a helper process: those run in a
+/// process group of their own so odl controls their teardown, which also
+/// means a terminal's Ctrl-C never reaches them. Without this, dying on the
+/// signal would leave the helper — and anything it spawned — running.
+///
+/// The second interrupt is the escape hatch for a teardown that itself hangs.
+/// It skips cleanup deliberately: a user pressing Ctrl-C twice wants out.
+fn spawn_interrupt_handler(cancel: CancellationToken) {
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_err() {
+            // No handler could be installed; leave the default disposition
+            // rather than pretending cancellation is wired up.
+            return;
+        }
+        eprintln!("\nInterrupted; finishing up. Press Ctrl-C again to quit immediately.");
+        cancel.cancel();
+
+        if tokio::signal::ctrl_c().await.is_ok() {
+            // Exiting here skips every destructor, so the helpers' own
+            // teardown never runs. Kill their process groups first, or
+            // "quit immediately" would mean leaving a downloader running
+            // with nothing left to stop it.
+            #[cfg(feature = "ytdlp")]
+            odl::ytdlp::process::kill_all_groups();
+            std::process::exit(130);
+        }
+    });
+}
+
+/// Whether to prompt for quality, given the CLI flags and the environment.
+fn should_prompt_for_format(
+    choice: args::ChooseFormat,
+    format: OutputFormat,
+    url_count: usize,
+) -> bool {
+    // A prompt needs a terminal on both ends and human-readable output. This
+    // is checked even for `Always`: a question nobody can answer is a hang,
+    // and `--format json` is exactly where an automated caller lives.
+    let can_ask = format == OutputFormat::Text
+        && std::io::stdin().is_terminal()
+        && std::io::stderr().is_terminal();
+    if !can_ask {
+        return false;
+    }
+    match choice {
+        args::ChooseFormat::Never => false,
+        args::ChooseFormat::Always => true,
+        // One decision is a question; a hundred-URL list would be an
+        // interrogation, so `auto` stays quiet for batches.
+        args::ChooseFormat::Auto => url_count == 1,
+    }
+}
+
 pub const PROGRESS_CHARS: &str = "█▇▆▅▄▃▂▁";
 
 /// Atomics shared between a bar and its indicatif style closures so the
@@ -197,16 +404,65 @@ struct CliReporter {
     /// transient phases (Evaluating / ResolvingConflicts / retry
     /// countdown) clear, so the bar lands back on the file label.
     filename: Mutex<Option<String>>,
+    /// What this download was asked for, for messages raised before a
+    /// filename is known.
+    url: String,
+    /// Stand-in row for an engine that transfers in one piece.
+    ///
+    /// The parent line is a header: it carries the name and the totals, and
+    /// leaves the bar to the rows beneath it. An engine with no parts would
+    /// otherwise draw no bar at all, so it gets a single row of its own —
+    /// same shape as a part row, so every download reads the same way.
+    solo: Mutex<Option<PartBar>>,
 }
 
 impl CliReporter {
-    fn new(mp: Arc<MultiProgress>, parent: ProgressBar, parent_metrics: BarMetrics) -> Self {
+    fn new(
+        mp: Arc<MultiProgress>,
+        parent: ProgressBar,
+        parent_metrics: BarMetrics,
+        url: String,
+    ) -> Self {
         Self {
+            url,
             mp,
             parent,
             parts: Mutex::new(HashMap::new()),
             parent_metrics,
             filename: Mutex::new(None),
+            solo: Mutex::new(None),
+        }
+    }
+
+    /// Add the stand-in row, unless real parts are doing the drawing.
+    fn ensure_solo_row(&self) {
+        if !self.parts.lock().unwrap().is_empty() {
+            return;
+        }
+        let mut solo = self.solo.lock().unwrap();
+        if solo.is_some() {
+            return;
+        }
+        let metrics = BarMetrics::new();
+        // A bar whose length is zero renders as complete, so a download would
+        // appear finished before it began. The total is usually known by now
+        // from evaluate; when it is not, a length-less bar draws empty and
+        // gets its real length from the first progress event.
+        let total = self.parent_metrics.total.load(Ordering::Relaxed);
+        let bar = if total > 0 {
+            ProgressBar::new(total)
+        } else {
+            ProgressBar::new_spinner()
+        };
+        let bar = self.mp.add(bar.with_style(build_solo_row_style()));
+        bar.enable_steady_tick(SAMPLE_INTERVAL);
+        *solo = Some(PartBar { bar, metrics });
+    }
+
+    /// Clear the stand-in row, if there is one.
+    fn clear_solo_row(&self) {
+        if let Some(p) = self.solo.lock().unwrap().take() {
+            p.bar.finish_and_clear();
         }
     }
 }
@@ -216,9 +472,45 @@ fn phase_label(phase: Phase) -> &'static str {
         Phase::Evaluating => "Evaluating",
         Phase::ResolvingConflicts => "Resolving conflicts",
         Phase::Downloading => "Downloading",
+        Phase::PostProcessing => "Processing",
         Phase::Assembling => "Assembling",
         Phase::Flushing => "Flushing data to disk",
         Phase::Verifying => "Verifying checksum",
+        _ => "Working",
+    }
+}
+
+impl CliReporter {
+    /// Name this download goes by in a one-line status.
+    ///
+    /// Falls back to the URL rather than a generic word: a failure raised
+    /// before the filename is known still has to say *which* download failed.
+    fn describe_target(&self) -> String {
+        self.filename
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| self.url.clone())
+    }
+
+    /// Collapse the whole bar group down to a single final line.
+    ///
+    /// Child bars are drained first so nothing is left dangling, and the
+    /// parent's template is replaced rather than abandoned in place — an
+    /// abandoned progress template keeps rendering the last percentage and
+    /// speed, which read as current long after they stopped being so.
+    fn finish_with_status(&self, template: &str, message: String) {
+        self.clear_solo_row();
+        {
+            let mut parts = self.parts.lock().unwrap();
+            for (_, p) in parts.drain() {
+                p.bar.finish_and_clear();
+            }
+        }
+        let style =
+            ProgressStyle::with_template(template).expect("templating a status line cannot fail");
+        self.parent.set_style(style);
+        self.parent.finish_with_message(message);
     }
 }
 
@@ -240,6 +532,9 @@ impl ProgressReporter for CliReporter {
                         if let Some(name) = self.filename.lock().unwrap().clone() {
                             self.parent.set_message(name);
                         }
+                        // An engine with parts announces them instead; this
+                        // only takes effect when none ever arrive.
+                        self.ensure_solo_row();
                     }
                     _ => {
                         self.parent.set_message(phase_label(phase));
@@ -255,13 +550,31 @@ impl ProgressReporter for CliReporter {
                     self.parent.set_length(t);
                 }
                 self.parent.set_position(downloaded);
+
+                // With no parts to report their own share, the aggregate is
+                // what the stand-in row shows.
+                if let Some(p) = self.solo.lock().unwrap().as_ref() {
+                    p.metrics.downloaded.store(downloaded, Ordering::Relaxed);
+                    if let Some(t) = total {
+                        p.metrics.total.store(t, Ordering::Relaxed);
+                        p.bar.set_length(t);
+                    }
+                    p.bar.set_position(downloaded);
+                }
             }
             ProgressEvent::Speed { bytes_per_second } => {
                 self.parent_metrics
                     .speed_bits
                     .store(bytes_per_second.to_bits(), Ordering::Relaxed);
+                if let Some(p) = self.solo.lock().unwrap().as_ref() {
+                    p.metrics
+                        .speed_bits
+                        .store(bytes_per_second.to_bits(), Ordering::Relaxed);
+                }
             }
             ProgressEvent::PartAdded { ulid, size, .. } => {
+                // Real parts draw their own rows, so the stand-in steps aside.
+                self.clear_solo_row();
                 let metrics = BarMetrics::new();
                 metrics.total.store(size, Ordering::Relaxed);
                 let style = build_child_style(&metrics);
@@ -316,6 +629,7 @@ impl ProgressReporter for CliReporter {
                 // Drain child bars first so the final parent line lands at
                 // the bottom of the group with no leftover assembly /
                 // part rows.
+                self.clear_solo_row();
                 {
                     let mut parts = self.parts.lock().unwrap();
                     for (_, p) in parts.drain() {
@@ -339,23 +653,16 @@ impl ProgressReporter for CliReporter {
                     .finish_with_message(format!("{}{}", path.display(), suffix));
             }
             ProgressEvent::Cancelled => {
-                {
-                    let mut parts = self.parts.lock().unwrap();
-                    for (_, p) in parts.drain() {
-                        p.bar.finish_and_clear();
-                    }
-                }
-                self.parent.abandon_with_message("Cancelled");
+                self.finish_with_status("✕ Cancelled: {msg}", self.describe_target());
             }
             ProgressEvent::Failed { message } => {
-                {
-                    let mut parts = self.parts.lock().unwrap();
-                    for (_, p) in parts.drain() {
-                        p.bar.finish_and_clear();
-                    }
-                }
-                self.parent
-                    .abandon_with_message(format!("Failed: {message}"));
+                // The bar's own template is dropped first: leaving it would
+                // freeze a percentage, speed and ETA next to the failure, all
+                // of which stopped being true the moment it failed.
+                self.finish_with_status(
+                    "✕ {msg}",
+                    format!("{}: {message}", self.describe_target()),
+                );
             }
         }
     }
@@ -400,6 +707,18 @@ fn install_metric_keys(style: ProgressStyle, metrics: &BarMetrics) -> ProgressSt
                 );
             },
         )
+}
+
+/// Style for the stand-in row of a single-piece download.
+///
+/// Only the bar: the header above it already carries the size, speed and ETA,
+/// and repeating them verbatim one line down would read as a rendering fault
+/// rather than as detail. Same width as a part row, so a download looks the
+/// same whether or not it has parts.
+fn build_solo_row_style() -> ProgressStyle {
+    ProgressStyle::with_template("  ↳ {bar:30.cyan/blue} {msg}")
+        .expect("templating progress bar should not fail")
+        .progress_chars(PROGRESS_CHARS)
 }
 
 fn build_parent_style(metrics: &BarMetrics) -> ProgressStyle {
@@ -591,6 +910,9 @@ async fn run(args: Args) -> Result<(), OdlError> {
                 }
                 return Ok(());
             }
+            args::Commands::Tools { action } => {
+                return run_tools(&args, action, format).await;
+            }
             args::Commands::Probe { url } => {
                 return run_probe(&args, url, format).await;
             }
@@ -614,7 +936,7 @@ async fn run(args: Args) -> Result<(), OdlError> {
     }
 
     let mut user_provided_filename: Option<String> = None;
-    let save_dir: PathBuf = if let Some(path) = args.output {
+    let save_dir: PathBuf = if let Some(path) = args.output.clone() {
         if let DownloadType::Url(_) = &download_type {
             user_provided_filename = path
                 .file_name()
@@ -712,6 +1034,42 @@ async fn run(args: Args) -> Result<(), OdlError> {
         }
     };
 
+    let engine_preference = match args.engine {
+        args::EngineChoice::Auto => EnginePreference::Auto,
+        args::EngineChoice::Http => EnginePreference::Engine(DownloadEngine::HttpMultipart),
+        args::EngineChoice::Ytdlp => EnginePreference::Engine(DownloadEngine::Ytdlp),
+    };
+
+    // Before anything is downloaded: if one of these links needs a helper that
+    // is missing, this is the moment to offer it — mid-download would be too
+    // late, and after the fact would mean the wrong file was already fetched.
+    // Rebuilt when this installs something: the manager holds a snapshot of
+    // the config taken before the install, so without this the helper it just
+    // fetched would be invisible for the rest of the run — and a media link
+    // would quietly fall back to fetching the web page.
+    let dlm = if maybe_offer_missing_tools(&args, &urls, format, &dlm).await? {
+        Arc::new(build_download_manager(&args).await?)
+    } else {
+        dlm
+    };
+
+    let cancel = CancellationToken::new();
+    spawn_interrupt_handler(cancel.clone());
+
+    // Naming a format is itself a decision to re-decide: it would be useless
+    // if an already-pinned download ignored it.
+    let reselect_format =
+        args.format_id.is_some() || args.choose_format == args::ChooseFormat::Always;
+    let format_selector: Arc<dyn FormatSelector> = match args.format_id.clone() {
+        Some(id) => Arc::new(FixedFormatSelector(id)),
+        None if should_prompt_for_format(args.choose_format, format, urls.len()) => {
+            Arc::new(InteractiveFormatSelector {
+                mp: Arc::clone(&mp),
+            })
+        }
+        None => Arc::new(DefaultFormatSelector),
+    };
+
     for url in urls.into_iter() {
         let reporter: Arc<dyn ProgressReporter> = match format {
             // NDJSON events go straight to stdout. Progress fires at the
@@ -722,7 +1080,10 @@ async fn run(args: Args) -> Result<(), OdlError> {
                 let parent_metrics = BarMetrics::new();
                 let parent_style = build_parent_style(&parent_metrics);
 
-                let parent = mp.add(ProgressBar::new(0).with_style(parent_style));
+                // Length-less rather than zero-length: a zero-length bar reads
+                // as 100% complete, so the header would claim the download had
+                // finished while it was still being evaluated.
+                let parent = mp.add(ProgressBar::new_spinner().with_style(parent_style));
                 parent.set_message(format!("{url} (warming up)"));
                 parent.enable_steady_tick(SAMPLE_INTERVAL);
 
@@ -730,19 +1091,24 @@ async fn run(args: Args) -> Result<(), OdlError> {
                 // hands the event off to a worker task via a lock-free mpsc
                 // and returns immediately. Indicatif `set_position` / Mutex
                 // hops never run on the download tasks themselves.
-                let cli_reporter = CliReporter::new(Arc::clone(&mp), parent, parent_metrics);
+                let cli_reporter =
+                    CliReporter::new(Arc::clone(&mp), parent, parent_metrics, url.to_string());
                 AsyncReporter::spawn(cli_reporter) as Arc<dyn ProgressReporter>
             }
         };
         let ctx = DownloadContext::new()
             .with_reporter(reporter)
-            .with_url(url.clone());
+            .with_url(url.clone())
+            // One token for every download, so a single interrupt stops the
+            // whole run rather than the one job that happened to be first.
+            .with_cancel(cancel.clone());
 
         let dlm = Arc::clone(&dlm);
         let save_dir = save_dir.clone();
         let user_provided_filename = user_provided_filename.clone();
         let credentials = credentials.clone();
         let expected_checksums = expected_checksums.clone();
+        let format_selector = Arc::clone(&format_selector);
         // `resolver` is `Copy`, closures will capture by value; no extra binding needed.
 
         // Wait here for a permit before spawning the task. This ensures we
@@ -758,7 +1124,12 @@ async fn run(args: Args) -> Result<(), OdlError> {
         let handle = tokio::spawn(async move {
             let _permit = permit;
             let result: Result<PathBuf, OdlError> = async {
-                let mut instruction = dlm
+                // `download` emits its own terminal event; `evaluate` does
+                // not, so only the evaluate half reports here. Emitting for
+                // both would give one download two endings — the transcript
+                // showed "Cancelled" and "Failed: download cancelled" for a
+                // single Ctrl-C.
+                let mut instruction = match dlm
                     .evaluate(EvaluateRequest {
                         url,
                         save_dir,
@@ -766,8 +1137,26 @@ async fn run(args: Args) -> Result<(), OdlError> {
                         credentials,
                         ctx: Some(&ctx),
                         options: None,
+                        engine: engine_preference,
+                        format_selector: Some(&*format_selector),
+                        // Asking explicitly is also how a user changes the
+                        // quality of a download they already started.
+                        reselect_format,
                     })
-                    .await?;
+                    .await
+                {
+                    Ok(instruction) => instruction,
+                    Err(OdlError::Cancelled) => {
+                        ctx.emit(ProgressEvent::Cancelled);
+                        return Err(OdlError::Cancelled);
+                    }
+                    Err(e) => {
+                        ctx.emit(ProgressEvent::Failed {
+                            message: e.to_string(),
+                        });
+                        return Err(e);
+                    }
+                };
                 if let Some(filename) = user_provided_filename {
                     instruction.set_filename(filename);
                 }
@@ -781,11 +1170,6 @@ async fn run(args: Args) -> Result<(), OdlError> {
                 .await
             }
             .await;
-            if let Err(ref e) = result {
-                ctx.emit(ProgressEvent::Failed {
-                    message: e.to_string(),
-                });
-            }
             result
         });
 
@@ -991,7 +1375,12 @@ async fn download_remote_file(dlm: &DownloadManager, url: Url) -> Result<PathBuf
     let _permit = dlm.acquire_download_permit().await?;
 
     let instruction = dlm
-        .evaluate(EvaluateRequest::new(url, save_dir, &resolver))
+        .evaluate(
+            // A list of links is a plain text file, never a media page: an
+            // engine that resolves media would be the wrong tool entirely.
+            EvaluateRequest::new(url, save_dir, &resolver)
+                .engine(EnginePreference::Engine(DownloadEngine::HttpMultipart)),
+        )
         .await?;
 
     let path = dlm
@@ -1014,6 +1403,435 @@ fn checksum_json(c: &odl::download_metadata::FileChecksum) -> serde_json::Value 
         .map(|e| e.as_str_name())
         .unwrap_or("unknown");
     json!({"algorithm": algorithm, "digest": c.digest, "encoding": encoding})
+}
+
+/// Offer to install the helpers when a link needs them and they are absent.
+///
+/// Only ever asks on a terminal, only when a link actually calls for the
+/// engine, and only for a helper that is genuinely missing. ffmpeg is asked
+/// about after yt-dlp, and only if yt-dlp is now present: on its own it would
+/// do nothing.
+#[cfg(feature = "ytdlp")]
+async fn maybe_offer_missing_tools(
+    args: &Args,
+    urls: &[Url],
+    format: OutputFormat,
+    dlm: &DownloadManager,
+) -> Result<bool, OdlError> {
+    use odl::ytdlp::install::{self, Tool};
+
+    // A prompt would corrupt a JSON stream and cannot be answered by a script.
+    if format != OutputFormat::Text
+        || !std::io::stdin().is_terminal()
+        || args.engine == args::EngineChoice::Http
+    {
+        return Ok(false);
+    }
+
+    let config_path = config_path_for(args);
+    let mut cfg = Config::load_from_file(&config_path).await?;
+    if !cfg.ytdlp().enabled() {
+        return Ok(false);
+    }
+
+    let forced = args.engine == args::EngineChoice::Ytdlp;
+    let wanted = forced
+        || urls
+            .iter()
+            .any(|u| odl::ytdlp::should_delegate(u, cfg.ytdlp()));
+    if !wanted {
+        return Ok(false);
+    }
+
+    let mut tools = odl::ytdlp::tools(cfg.ytdlp()).await.ok();
+    let mut changed = false;
+    let mut installed_something = false;
+
+    // A previous decline is remembered: being asked the same question on every
+    // media link would be nagging, and the answer was already given.
+    if tools.is_none() && cfg.ytdlp().offer_ytdlp_install() {
+        let mut ytdlp_cfg = cfg.ytdlp().clone();
+        match offer_tool(Tool::Ytdlp, None, &config_path, cfg.download(), dlm, false).await? {
+            OfferOutcome::Installed(path) => {
+                ytdlp_cfg.set_binary_path(Some(path));
+                changed = true;
+                installed_something = true;
+            }
+            OfferOutcome::Declined => {
+                ytdlp_cfg.set_offer_ytdlp_install(false);
+                changed = true;
+            }
+            OfferOutcome::NothingToDo => {}
+        }
+        cfg = cfg.into_builder().ytdlp(ytdlp_cfg).build()?;
+        if changed {
+            tools = odl::ytdlp::tools(cfg.ytdlp()).await.ok();
+        }
+    }
+
+    // Only worth asking once the engine that would use it exists.
+    if let Some(t) = &tools
+        && t.ffmpeg.is_none()
+        && cfg.ytdlp().offer_ffmpeg_install()
+        && install::can_install(Tool::Ffmpeg)
+    {
+        let mut ytdlp_cfg = cfg.ytdlp().clone();
+        match offer_tool(Tool::Ffmpeg, None, &config_path, cfg.download(), dlm, false).await? {
+            OfferOutcome::Installed(path) => {
+                ytdlp_cfg.set_ffmpeg_path(Some(path));
+                changed = true;
+                installed_something = true;
+            }
+            OfferOutcome::Declined => {
+                ytdlp_cfg.set_offer_ffmpeg_install(false);
+                changed = true;
+            }
+            OfferOutcome::NothingToDo => {}
+        }
+        cfg = cfg.into_builder().ytdlp(ytdlp_cfg).build()?;
+    }
+
+    if changed {
+        cfg.save_to_file(&config_path).await?;
+        eprintln!("Updated {}\n", config_path.display());
+    }
+    // Only an install changes what a download can do; a recorded decline does
+    // not, so it is not worth rebuilding the manager for.
+    Ok(installed_something)
+}
+
+#[cfg(not(feature = "ytdlp"))]
+async fn maybe_offer_missing_tools(
+    _args: &Args,
+    _urls: &[Url],
+    _format: OutputFormat,
+    _dlm: &DownloadManager,
+) -> Result<bool, OdlError> {
+    Ok(false)
+}
+
+/// Path of the config file this invocation reads and writes.
+///
+/// Only the helper-install paths need it, which a build without a delegating
+/// engine does not compile.
+#[cfg(feature = "ytdlp")]
+fn config_path_for(args: &Args) -> PathBuf {
+    args.config_file
+        .clone()
+        .unwrap_or_else(Config::default_config_file)
+}
+
+/// Ask a yes/no question on the terminal.
+///
+///
+/// Returns `false` without prompting when there is no terminal to ask on:
+/// a script must never be blocked by a question it cannot see.
+#[cfg(feature = "ytdlp")]
+fn confirm(question: &str) -> Option<bool> {
+    use std::io::Write;
+    // `None`, not `false`: "nobody could be asked" is not the same as "the
+    // user said no". Recording the second when only the first happened would
+    // silently disable a future offer on the strength of a question that was
+    // never put.
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        return None;
+    }
+    let mut err = std::io::stderr();
+    let _ = write!(err, "{question} [y/N]: ");
+    let _ = err.flush();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return None;
+    }
+    Some(matches!(
+        line.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+/// HTTP client for fetching a helper.
+///
+/// Built from the user's own download settings rather than from invented
+/// constants: someone who needs a proxy to reach the internet needs it here
+/// too, and a connect timeout they chose should not be silently overridden.
+#[cfg(feature = "ytdlp")]
+fn install_client(net: &odl::config::DownloadOptions) -> Result<reqwest::Client, OdlError> {
+    let mut builder = reqwest::Client::builder();
+    if let Some(proxy) = Option::<reqwest::Proxy>::from(net) {
+        builder = builder.proxy(proxy);
+    }
+    if net.accept_invalid_certs() {
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+    if let Some(timeout) = net.connect_timeout() {
+        builder = builder.connect_timeout(timeout);
+    }
+    builder.build().map_err(|e| OdlError::CliError {
+        message: format!("could not create an HTTP client: {e}"),
+    })
+}
+
+/// What came of offering to install a helper.
+#[cfg(feature = "ytdlp")]
+enum OfferOutcome {
+    Installed(PathBuf),
+    /// The user said no. Recorded so the question is not repeated.
+    Declined,
+    /// Nothing was asked: it is already there, or there is no build to offer.
+    NothingToDo,
+}
+
+/// Describe one helper, and offer to install it when it is missing.
+#[cfg(feature = "ytdlp")]
+async fn offer_tool(
+    tool: odl::ytdlp::install::Tool,
+    installed: Option<&std::path::Path>,
+    config_path: &std::path::Path,
+    net: &odl::config::DownloadOptions,
+    dlm: &DownloadManager,
+    assume_yes: bool,
+) -> Result<OfferOutcome, OdlError> {
+    use odl::ytdlp::install;
+
+    if let Some(path) = installed {
+        eprintln!("{}: already installed at {}", tool.as_str(), path.display());
+        return Ok(OfferOutcome::NothingToDo);
+    }
+    if !install::can_install(tool) {
+        eprintln!(
+            "{}: not installed, and odl has no verified build for this platform.\n  Install it yourself — {} — then set `{}` in {}.",
+            tool.as_str(),
+            tool.manual_instructions(),
+            tool.config_key(),
+            config_path.display(),
+        );
+        return Ok(OfferOutcome::NothingToDo);
+    }
+
+    let dir = install::tools_dir();
+    eprintln!("\n{} is not installed.", tool.as_str());
+    eprintln!("  {}", tool.purpose());
+    eprintln!("  odl can download it from {}.", tool.source_description());
+    eprintln!("  It will be verified against the checksums published with it, saved to");
+    eprintln!(
+        "  {}, and recorded as `{}` in",
+        dir.display(),
+        tool.config_key()
+    );
+    eprintln!("  {}.", config_path.display());
+    eprintln!(
+        "  Or install it yourself — {} — and set that key by hand.",
+        tool.manual_instructions()
+    );
+
+    if !assume_yes {
+        match confirm(&format!("Download {} now?", tool.as_str())) {
+            Some(true) => {}
+            Some(false) => {
+                eprintln!(
+                    "Skipped {0}. odl will not ask again; run `odl tools install {0}` when you want it.",
+                    tool.as_str()
+                );
+                return Ok(OfferOutcome::Declined);
+            }
+            // Nothing to answer with. Say what would have happened and leave
+            // the configuration untouched, so a scripted run cannot record a
+            // refusal the user never made.
+            None => {
+                eprintln!(
+                    "Not installing {0}: no terminal to confirm on. Re-run with `-y` to install it without asking.",
+                    tool.as_str()
+                );
+                return Ok(OfferOutcome::NothingToDo);
+            }
+        }
+    }
+
+    // The release listing is a few kilobytes of JSON, fetched directly with
+    // the user's own network settings — their proxy, connect timeout and
+    // certificate policy.
+    let client = install_client(net)?;
+    let plan = install::plan(&client, tool).await.map_err(OdlError::from)?;
+
+    // The asset itself goes through odl's own downloader: resumable, retrying,
+    // checksum-verified. Fetching forty megabytes over a bad line is the
+    // problem this program exists to solve, and doing it worse here would be
+    // a poor advertisement.
+    eprintln!("Downloading {} ({})…", tool.as_str(), plan.name);
+    let downloaded = download_asset(dlm, &plan).await?;
+
+    let path = install::finish(tool, &downloaded, &dir)
+        .await
+        .map_err(OdlError::from)?;
+    // The staged copy has served its purpose; leaving it would double the disk
+    // cost of every installed tool.
+    let _ = tokio::fs::remove_file(&downloaded).await;
+
+    eprintln!("Installed {} to {}", tool.as_str(), path.display());
+    Ok(OfferOutcome::Installed(path))
+}
+
+/// Fetch one release asset with odl itself, and return where it landed.
+///
+/// The HTTP engine is forced rather than left to `auto`: the engine that
+/// resolves media links is the very thing being installed, so letting it be
+/// chosen here would be circular.
+#[cfg(feature = "ytdlp")]
+async fn download_asset(
+    dlm: &DownloadManager,
+    plan: &odl::ytdlp::install::AssetPlan,
+) -> Result<PathBuf, OdlError> {
+    use odl::ytdlp::install;
+
+    let url = Url::parse(&plan.url).map_err(|e| OdlError::CliError {
+        message: format!("release asset URL is not usable: {e}"),
+    })?;
+    let staging = install::staging_dir();
+    tokio::fs::create_dir_all(&staging).await?;
+
+    // Resume what is there, replace a stale complete file, restart if the
+    // asset changed underneath us — a release moving on is not a conflict
+    // worth stopping for.
+    let resolver = ForcedResolver {};
+    let mut instruction = dlm
+        .evaluate(
+            EvaluateRequest::new(url, staging, &resolver)
+                .engine(EnginePreference::Engine(DownloadEngine::HttpMultipart)),
+        )
+        .await?;
+    // Name it after the asset rather than whatever the URL's last segment
+    // happens to be, so a resume finds the same file next time.
+    instruction.set_filename(plan.name.clone());
+
+    // Verification is the downloader's job: it checks after assembly and
+    // fails with a conflict rather than leaving a bad binary in place.
+    let digest = odl::hash::HashDigest::parse_cli(&format!("sha256:{}", plan.sha256))
+        .map_err(|message| OdlError::CliError { message })?;
+    instruction.add_checksums([digest]);
+
+    dlm.download(DownloadRequest::new(instruction, &resolver))
+        .await
+}
+
+/// `odl tools status` / `odl tools install` — manage the helper programs.
+#[cfg(feature = "ytdlp")]
+async fn run_tools(
+    args: &Args,
+    action: &args::ToolsAction,
+    format: OutputFormat,
+) -> Result<(), OdlError> {
+    use odl::ytdlp::install::Tool;
+
+    let config_path = config_path_for(args);
+    let mut cfg = Config::load_from_file(&config_path).await?;
+    let dlm = build_download_manager(args).await?;
+    let found = odl::ytdlp::tools(cfg.ytdlp()).await.ok();
+    let ytdlp_path = found.as_ref().map(|t| t.ytdlp.clone());
+    let ffmpeg_path = found.as_ref().and_then(|t| t.ffmpeg.clone());
+
+    match action {
+        args::ToolsAction::Status => {
+            match format {
+                OutputFormat::Json => {
+                    let v = json!({
+                        "type": "tools",
+                        "config_path": config_path.to_string_lossy(),
+                        "tools_dir": odl::ytdlp::install::tools_dir().to_string_lossy(),
+                        "yt_dlp": ytdlp_path.as_ref().map(|p| p.to_string_lossy()),
+                        "ffmpeg": ffmpeg_path.as_ref().map(|p| p.to_string_lossy()),
+                        "can_install_yt_dlp": odl::ytdlp::install::can_install(Tool::Ytdlp),
+                        "can_install_ffmpeg": odl::ytdlp::install::can_install(Tool::Ffmpeg),
+                    });
+                    println!("{v}");
+                }
+                OutputFormat::Text => {
+                    println!(
+                        "yt-dlp:  {}",
+                        ytdlp_path
+                            .as_ref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "not installed".to_owned())
+                    );
+                    println!(
+                        "ffmpeg:  {}",
+                        ffmpeg_path
+                            .as_ref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "not installed".to_owned())
+                    );
+                    println!("config:  {}", config_path.display());
+                }
+            }
+            Ok(())
+        }
+        args::ToolsAction::Install { tool, yes } => {
+            // ffmpeg is offered after yt-dlp: it is only worth having once the
+            // engine that uses it exists.
+            let wanted: Vec<Tool> = match tool {
+                Some(args::ToolChoice::Ytdlp) => vec![Tool::Ytdlp],
+                Some(args::ToolChoice::Ffmpeg) => vec![Tool::Ffmpeg],
+                None => vec![Tool::Ytdlp, Tool::Ffmpeg],
+            };
+
+            let mut changed = false;
+            for t in wanted {
+                let current = match t {
+                    Tool::Ytdlp => ytdlp_path.clone(),
+                    Tool::Ffmpeg => ffmpeg_path.clone(),
+                };
+                // An explicit `odl tools install` overrides a past decline:
+                // asking for it now is a clearer signal than the old no.
+                let outcome = offer_tool(
+                    t,
+                    current.as_deref(),
+                    &config_path,
+                    cfg.download(),
+                    &dlm,
+                    *yes,
+                )
+                .await?;
+                let mut ytdlp_cfg = cfg.ytdlp().clone();
+                match (t, outcome) {
+                    (Tool::Ytdlp, OfferOutcome::Installed(path)) => {
+                        ytdlp_cfg.set_binary_path(Some(path));
+                        ytdlp_cfg.set_offer_ytdlp_install(true);
+                        changed = true;
+                    }
+                    (Tool::Ffmpeg, OfferOutcome::Installed(path)) => {
+                        ytdlp_cfg.set_ffmpeg_path(Some(path));
+                        ytdlp_cfg.set_offer_ffmpeg_install(true);
+                        changed = true;
+                    }
+                    (Tool::Ytdlp, OfferOutcome::Declined) => {
+                        ytdlp_cfg.set_offer_ytdlp_install(false);
+                        changed = true;
+                    }
+                    (Tool::Ffmpeg, OfferOutcome::Declined) => {
+                        ytdlp_cfg.set_offer_ffmpeg_install(false);
+                        changed = true;
+                    }
+                    (_, OfferOutcome::NothingToDo) => {}
+                }
+                cfg = cfg.into_builder().ytdlp(ytdlp_cfg).build()?;
+            }
+            if changed {
+                cfg.save_to_file(&config_path).await?;
+                eprintln!("Updated {}", config_path.display());
+            }
+            Ok(())
+        }
+    }
+}
+
+#[cfg(not(feature = "ytdlp"))]
+async fn run_tools(
+    _args: &Args,
+    _action: &args::ToolsAction,
+    _format: OutputFormat,
+) -> Result<(), OdlError> {
+    Err(OdlError::CliError {
+        message: "this build of odl was compiled without yt-dlp support".to_owned(),
+    })
 }
 
 /// `odl probe <url>` — HEAD-probe a URL and report what a download would
@@ -1041,6 +1859,9 @@ async fn run_probe(args: &Args, url_str: &str, format: OutputFormat) -> Result<(
         .collect();
     let last_modified_rfc3339 = instruction.last_modified_as_date().map(|d| d.to_rfc3339());
 
+    let engine = instruction.engine();
+    let caps = engine.capabilities();
+
     match format {
         OutputFormat::Json => {
             let v = json!({
@@ -1048,6 +1869,9 @@ async fn run_probe(args: &Args, url_str: &str, format: OutputFormat) -> Result<(
                 "url": instruction.url().to_string(),
                 "filename": instruction.filename(),
                 "size": instruction.size(),
+                "size_is_approx": instruction.size_is_approx(),
+                "engine": engine.as_str(),
+                "quality": instruction.quality().map(|q| q.to_string()),
                 "resumable": instruction.is_resumable(),
                 "etag": instruction.etag(),
                 "last_modified": instruction.last_modified(),
@@ -1061,20 +1885,35 @@ async fn run_probe(args: &Args, url_str: &str, format: OutputFormat) -> Result<(
         OutputFormat::Text => {
             println!("url:           {}", instruction.url());
             println!("filename:      {}", instruction.filename());
+            if engine != DownloadEngine::HttpMultipart {
+                println!("engine:        {}", engine.as_str());
+            }
+            if let Some(quality) = instruction.quality() {
+                println!("quality:       {quality}");
+            }
+            let approx = if instruction.size_is_approx() {
+                "~"
+            } else {
+                ""
+            };
             match instruction.size() {
-                Some(s) => println!("size:          {} ({} bytes)", HumanBytes(s), s),
+                Some(s) => println!("size:          {}{} ({} bytes)", approx, HumanBytes(s), s),
                 None => println!("size:          unknown"),
             }
             println!("resumable:     {}", instruction.is_resumable());
-            println!(
-                "etag:          {}",
-                instruction.etag().as_deref().unwrap_or("-")
-            );
-            println!(
-                "last_modified: {}",
-                last_modified_rfc3339.as_deref().unwrap_or("-")
-            );
-            println!("requires_auth: {}", instruction.requires_auth());
+            // Fields the engine cannot observe are left out rather than shown
+            // as `-`, which would read as "the server sent nothing".
+            if caps.response_headers {
+                println!(
+                    "etag:          {}",
+                    instruction.etag().as_deref().unwrap_or("-")
+                );
+                println!(
+                    "last_modified: {}",
+                    last_modified_rfc3339.as_deref().unwrap_or("-")
+                );
+                println!("requires_auth: {}", instruction.requires_auth());
+            }
             for c in instruction.as_metadata().checksums.iter() {
                 use odl::download_metadata::{ChecksumAlgorithm, ChecksumEncoding};
                 let algo = ChecksumAlgorithm::try_from(c.algorithm)
@@ -1118,6 +1957,9 @@ fn status_json(d: &DownloadStatus) -> serde_json::Value {
         "resumable": d.is_resumable,
         "parts_total": d.parts_total,
         "parts_finished": d.parts_finished,
+        "engine": d.engine.as_str(),
+        "size_is_approx": d.size_is_approx,
+        "quality": d.quality.as_ref().map(|q| q.to_string()),
     })
 }
 
@@ -1161,19 +2003,50 @@ async fn run_status(
                 if brief {
                     println!("{:>10}  {:>9}  {}", state, pct, d.filename);
                 } else {
+                    let caps = d.engine.capabilities();
                     println!("{}", d.filename);
                     println!("  url:        {}", d.url);
                     println!("  state:      {}", state);
+                    if d.engine != DownloadEngine::HttpMultipart {
+                        println!("  engine:     {}", d.engine.as_str());
+                    }
+                    if let Some(quality) = &d.quality {
+                        println!("  quality:    {quality}");
+                    }
+                    // A `~` marks a size the engine could only estimate, so a
+                    // percentage that drifts past 100 reads as expected rather
+                    // than as a bug.
+                    let approx = if d.size_is_approx { "~" } else { "" };
+                    // A finished download has no bytes left in its working
+                    // directory — parts are removed after assembly, and a
+                    // delegated file is moved out — so the live counter reads
+                    // zero. Showing "0 B / 12 MiB (100%)" invites reading a
+                    // completed download as a failed one.
+                    let downloaded = if d.finished {
+                        d.size.unwrap_or(d.downloaded)
+                    } else {
+                        d.downloaded
+                    };
                     match d.size {
                         Some(s) => println!(
-                            "  progress:   {} / {} ({})",
-                            HumanBytes(d.downloaded),
+                            "  progress:   {} / {}{} ({})",
+                            HumanBytes(downloaded),
+                            approx,
                             HumanBytes(s),
                             pct
                         ),
-                        None => println!("  progress:   {} / unknown", HumanBytes(d.downloaded)),
+                        // A finished download whose size was never advertised
+                        // has nothing meaningful to put on either side of the
+                        // slash; "0 B / unknown" would read as a failure.
+                        None if d.finished => println!("  progress:   complete"),
+                        None => println!("  progress:   {} / unknown", HumanBytes(downloaded)),
                     }
-                    println!("  parts:      {}/{}", d.parts_finished, d.parts_total);
+                    // Part counts are an artefact of the multipart engine;
+                    // showing "1/1" for an engine that has no parts would
+                    // invite reading it as a stalled download.
+                    if caps.multipart {
+                        println!("  parts:      {}/{}", d.parts_finished, d.parts_total);
+                    }
                     println!("  resumable:  {}", d.is_resumable);
                     println!("  final file: {}", d.final_file_path.display());
                 }

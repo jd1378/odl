@@ -57,16 +57,17 @@ odl https://example.com/file.zip
 
 ## Features
 
-| Feature                                           | Description                                                                                   |
-|---------------------------------------------------|-----------------------------------------------------------------------------------------------|
-| ⚡ Multi-part downloads                            | Configurable parallel connections for faster downloads                                        |
-| 🔄 Automatic resume support                       | Seamlessly continue interrupted downloads (if server supports range requests)                  |
-| 📝 Conflict resolution                            | Handles file changes and existing files intelligently (configurable)                                         |
-| 🛡️ Crash resilient                               | Minimizes data loss during unexpected interruptions                                           |
-| 🌐 Custom HTTP headers & proxy support            | Flexible networking options for advanced use cases                                            |
-| 🔁 Retry logic                                   | Automatic retries with configurable backoff on failures                                       |
-| 🕒 Preserve modification times (optional)         | Optionally keeps server file modification timestamps                                          |
-| 🏷️ Server-sent file names         | Uses server-provided file names when available; otherwise falls back to the URL's last segment. |
+| Feature | Description |
+| --- | --- |
+| ⚡ Multi-part downloads | Configurable parallel connections for faster downloads |
+| 🔄 Automatic resume support | Seamlessly continue interrupted downloads (if server supports range requests) |
+| 📝 Conflict resolution | Handles file changes and existing files intelligently (configurable) |
+| 🛡️ Crash resilient | Minimizes data loss during unexpected interruptions |
+| 🌐 Custom HTTP headers & proxy support | Flexible networking options for advanced use cases |
+| 🔁 Retry logic | Automatic retries with configurable backoff on failures |
+| 🕒 Preserve modification times (optional) | Optionally keeps server file modification timestamps |
+| 🏷️ Server-sent file names | Uses server-provided file names when available; otherwise falls back to the URL's last segment |
+| 🎬 Media sites via yt-dlp | Delegates known media hosts to an installed `yt-dlp`, with quality selection and resumable downloads |
 
 This project provides both a command-line program (`odl`) and a Rust library (`odl` crate). Use the CLI for quick downloads and scripting; use the library when you need programmatic control inside an application.
 
@@ -127,6 +128,117 @@ odl --config-file ~/.config/odl/config.toml https://example.com/file.zip
 
 Note: Flags passed directly to `odl` (for example `--max-connections`, `--speed-limit`, `--user-agent`, etc.) apply only to that invocation and override persistent configuration for that run.
 
+## Media sites (yt-dlp)
+
+Links to major media hosts — YouTube, Vimeo, Twitch, Bilibili, X/Twitter,
+SoundCloud and a handful of others — are handed to
+[`yt-dlp`](https://github.com/yt-dlp/yt-dlp) when it is installed. Everything
+else downloads over odl's own multipart HTTP engine exactly as before.
+
+`yt-dlp` is **not bundled**. It is looked up on `PATH` at runtime, and if it is
+missing the link is simply downloaded over HTTP instead. Installing it is
+enough to enable this; nothing needs to be configured.
+
+If you paste a media link and the helpers are missing, odl offers to fetch them
+for you — asking about each separately, saying where they come from, and
+pointing out that installing them yourself works just as well. You can also do
+it explicitly:
+
+```bash
+odl tools status          # what is installed, and where
+odl tools install         # offers yt-dlp, then ffmpeg
+odl tools install ffmpeg -y
+```
+
+Downloads come from the official [yt-dlp releases](https://github.com/yt-dlp/yt-dlp/releases)
+and the [ffmpeg builds the yt-dlp project maintains](https://github.com/yt-dlp/FFmpeg-Builds),
+land in odl's data directory, and are recorded in your config. odl fetches them
+with its own downloader — so an install survives a dropped connection and picks
+up where it left off — and verifies each against the SHA-256 published
+alongside it. An install that cannot be verified is refused rather than
+completed with a warning. Note this protects
+against a corrupted or tampered *transfer*, not against a compromised upstream
+repository — the checksums come from the same release as the files.
+
+Versions are never pinned: extractors break as sites change, so odl always
+takes the current release. On macOS, ffmpeg is not offered automatically —
+there is no build with a checksum odl can vouch for — so use
+`brew install ffmpeg`.
+
+```bash
+# Delegated automatically: odl asks which quality you want, then downloads
+odl "https://www.youtube.com/watch?v=…"
+
+# Take the best available without asking (the default when not on a terminal)
+odl --choose-format never "https://www.youtube.com/watch?v=…"
+
+# Change your mind about quality: both discard what was downloaded and restart,
+# because two encodings cannot be joined into one file
+odl --choose-format always --on-file-changed restart "https://www.youtube.com/watch?v=…"
+odl --format-id 137+251     --on-file-changed restart "https://www.youtube.com/watch?v=…"
+
+# Force an engine instead of letting the host decide
+odl --engine http  https://example.com/file.zip
+odl --engine ytdlp "https://some-other-site.example/video/1"
+```
+
+The menu shows the container each choice produces (`mp4`, `mkv`, `m4a`, …) and,
+when the site publishes them, transcript tracks — subtitles download as a
+`.srt`/`.vtt` file instead of the media. Author-supplied tracks are listed
+before machine-generated captions, which are capped at a few languages to keep
+the menu readable; any other language is reachable with
+`--format-id subs:<lang>` or `--format-id autosubs:<lang>`.
+
+Install `ffmpeg` alongside it for the best results: without a muxer only
+formats that come as a single file can be downloaded, which caps quality on
+sites that serve video and audio separately. The quality menu still lists the
+qualities you are missing, marked `— needs ffmpeg`, rather than quietly
+stopping short and looking like all the site offers.
+
+### What differs from a plain HTTP download
+
+The transfer belongs to `yt-dlp`, so some things odl normally reports do not
+exist:
+
+- No multi-part downloading — `max_connections` only maps to fragment
+  parallelism, and only for fragmented formats.
+- No server checksums, ETag, or `last-modified`; `odl status` and `probe` omit
+  those fields rather than showing them empty.
+- Sizes are estimates for adaptive formats until the download finishes, shown
+  with a leading `~`.
+
+Resuming works: the page URL is stored rather than the (short-lived) media URL,
+so a resume re-resolves it, and the chosen format is pinned so a partial file is
+never continued in a different encoding. An ordinary re-run therefore keeps the
+original quality; changing quality is an explicit act that starts the download
+over.
+
+Playlists are not supported yet — a playlist URL is refused with a clear
+message rather than partially handled.
+
+### Configuration
+
+```toml
+[ytdlp]
+enabled = true              # master switch
+binary_path = "/usr/bin/yt-dlp"   # default: found on PATH
+ffmpeg_path = "/usr/bin/ffmpeg"   # default: found on PATH
+format = "bv*+ba/b"         # default: chosen from ffmpeg availability
+extra_hosts = ["some.video.site"] # delegate these too
+excluded_hosts = ["reddit.com"]   # never delegate these
+extra_args = ["--retries", "5"]   # appended to every yt-dlp invocation
+cookies_from_browser = "firefox"  # off by default; reads your cookie store
+offer_ytdlp_install = true        # set to false by declining the offer
+offer_ffmpeg_install = true       # ditto; `odl tools install` ignores both
+```
+
+Declining an install offer is remembered — odl will not ask again for that
+tool. Running `odl tools install <tool>` explicitly overrides the decline.
+
+`extra_args` and `cookies_from_browser` are powerful enough to run arbitrary
+commands or expose browser credentials, so they are settable from the config
+file only — never from the command line.
+
 ## Machine interface (`--format json`)
 
 For scripts and AI agents, pass `--format json` to get machine-readable
@@ -142,7 +254,7 @@ contract — the full specification is printed by `odl --help`.
   `{"type":"error","kind":...,"message":...,"exit_code":N}`.
 
 Exit codes: `0` success, `2` usage/bad input, `3` network, `4` conflict,
-`5` I/O, `6` metadata, `130` cancelled, `1` other.
+`5` I/O, `6` metadata, `7` yt-dlp, `130` cancelled, `1` other.
 
 ```bash
 # Probe a URL without downloading (size, filename, resumability)

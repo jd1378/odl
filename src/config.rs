@@ -42,6 +42,13 @@ mod defaults {
     pub fn default_rampup_batch_size() -> u64 { 2 }
     pub fn default_rampup_delay_min() -> Duration { Duration::from_millis(300) }
     pub fn default_rampup_delay_max() -> Duration { Duration::from_millis(1000) }
+    pub fn default_ytdlp_enabled() -> bool { true }
+    pub fn default_ytdlp_binary_path() -> Option<PathBuf> { None }
+    pub fn default_ytdlp_ffmpeg_path() -> Option<PathBuf> { None }
+    pub fn default_ytdlp_format() -> Option<String> { None }
+    pub fn default_ytdlp_cookies_from_browser() -> Option<String> { None }
+    pub fn default_ytdlp_string_list() -> Vec<String> { Vec::new() }
+    pub fn default_ytdlp_offer_install() -> bool { true }
 }
 
 use defaults::*;
@@ -361,6 +368,207 @@ impl DownloadOptionsBuilder {
     }
 }
 
+/// Settings for the `yt-dlp` delegation engine.
+///
+/// `yt-dlp` is never bundled: it is discovered at runtime, and downloads fall
+/// back to the built-in HTTP engine when it is absent. These knobs live at the
+/// manager level rather than on [`DownloadOptions`] because they describe the
+/// local toolchain, not a single job.
+///
+/// # Security
+///
+/// **Treat a `YtdlpOptions` value as trusted input.** Several fields reach an
+/// external program, so a config from an untrusted source is equivalent to
+/// letting that source run commands as the current user:
+///
+/// - [`Self::extra_args`] is appended to every invocation. yt-dlp's own flags
+///   include `--exec`, which runs an arbitrary shell command per download, and
+///   `--load-info-json`, which replaces the extraction result wholesale. There
+///   is no allow-list: filtering flags would be a guess at yt-dlp's evolving
+///   surface, and a partial filter reads as a guarantee it cannot make.
+/// - [`Self::binary_path`] and [`Self::ffmpeg_path`] name programs to execute.
+///   They are used verbatim, never searched for on `PATH`, so a value pointing
+///   at an attacker-writable file executes that file.
+/// - [`Self::cookies_from_browser`] makes yt-dlp read the user's browser
+///   cookie store — session cookies for every site they are signed in to —
+///   and attach them to requests. Off by default for that reason. On macOS and
+///   Windows it may also prompt for keychain access.
+/// - [`Self::extra_hosts`] widens which URLs are handed to the extractor.
+///
+/// The CLI keeps these safe by construction: they are settable only from
+/// `config.toml`, which it creates owner-only (0600 on unix), and never from
+/// a command-line flag or an environment variable. A library consumer that
+/// deserializes `Config` from anywhere else — a synced settings file, a
+/// server response, a preferences pane fed by another process — inherits the
+/// responsibility for that boundary.
+///
+/// Delegation as a whole can be switched off with [`Self::enabled`], and a
+/// build without the `ytdlp` feature never spawns a process at all.
+///
+/// Example in `config.toml`:
+///
+/// ```toml
+/// [ytdlp]
+/// enabled = true
+/// format = "bv*+ba/b"
+/// extra_hosts = ["some.video.site"]
+/// ```
+#[derive(Builder, Debug, Clone, Serialize, Deserialize)]
+#[builder(default)]
+pub struct YtdlpOptions {
+    /// Master switch for delegating to `yt-dlp`.
+    #[serde(default = "default_ytdlp_enabled")]
+    enabled: bool,
+
+    /// Explicit path to the `yt-dlp` executable. When unset it is looked up
+    /// on `PATH`.
+    #[serde(default = "default_ytdlp_binary_path")]
+    binary_path: Option<PathBuf>,
+
+    /// Explicit path to `ffmpeg`. When unset it is looked up on `PATH`.
+    /// Without it, only formats needing no muxing can be downloaded.
+    #[serde(default = "default_ytdlp_ffmpeg_path")]
+    ffmpeg_path: Option<PathBuf>,
+
+    /// Format selector passed to `yt-dlp -f`. When unset, a selector is
+    /// chosen based on whether `ffmpeg` is available.
+    #[serde(default = "default_ytdlp_format")]
+    format: Option<String>,
+
+    /// Extra arguments appended verbatim to every `yt-dlp` invocation.
+    ///
+    /// Treated as trusted input: flags such as `--exec` make this equivalent
+    /// to running arbitrary commands. Settable from the config file only,
+    /// which is created owner-only for exactly this reason.
+    #[serde(default = "default_ytdlp_string_list")]
+    extra_args: Vec<String>,
+
+    /// Additional registrable domains to delegate, beyond the built-in list.
+    #[serde(default = "default_ytdlp_string_list")]
+    extra_hosts: Vec<String>,
+
+    /// Domains never delegated, even when built in. Takes precedence over
+    /// both the built-in list and `extra_hosts`.
+    #[serde(default = "default_ytdlp_string_list")]
+    excluded_hosts: Vec<String>,
+
+    /// Browser to read cookies from, passed to `--cookies-from-browser`.
+    /// Off by default: it reads the user's browser cookie store.
+    #[serde(default = "default_ytdlp_cookies_from_browser")]
+    cookies_from_browser: Option<String>,
+
+    /// Whether odl may offer to download `yt-dlp` when a link needs it.
+    ///
+    /// Declining the offer sets this to `false` so the same question is never
+    /// asked twice — being asked again on every media link would be nagging.
+    /// Set it back to `true`, or run `odl tools install`, to reconsider.
+    #[serde(default = "default_ytdlp_offer_install")]
+    offer_ytdlp_install: bool,
+
+    /// Whether odl may offer to download `ffmpeg`. Declining sets it to
+    /// `false`, exactly as for [`Self::offer_ytdlp_install`].
+    #[serde(default = "default_ytdlp_offer_install")]
+    offer_ffmpeg_install: bool,
+}
+
+impl Default for YtdlpOptions {
+    fn default() -> Self {
+        Self {
+            enabled: default_ytdlp_enabled(),
+            binary_path: default_ytdlp_binary_path(),
+            ffmpeg_path: default_ytdlp_ffmpeg_path(),
+            format: default_ytdlp_format(),
+            extra_args: default_ytdlp_string_list(),
+            extra_hosts: default_ytdlp_string_list(),
+            excluded_hosts: default_ytdlp_string_list(),
+            cookies_from_browser: default_ytdlp_cookies_from_browser(),
+            offer_ytdlp_install: default_ytdlp_offer_install(),
+            offer_ffmpeg_install: default_ytdlp_offer_install(),
+        }
+    }
+}
+
+impl YtdlpOptions {
+    // Getters
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+    pub fn binary_path(&self) -> Option<&Path> {
+        self.binary_path.as_deref()
+    }
+    pub fn ffmpeg_path(&self) -> Option<&Path> {
+        self.ffmpeg_path.as_deref()
+    }
+    pub fn format(&self) -> Option<&str> {
+        self.format.as_deref()
+    }
+    pub fn extra_args(&self) -> &[String] {
+        &self.extra_args
+    }
+    pub fn extra_hosts(&self) -> &[String] {
+        &self.extra_hosts
+    }
+    pub fn excluded_hosts(&self) -> &[String] {
+        &self.excluded_hosts
+    }
+    pub fn cookies_from_browser(&self) -> Option<&str> {
+        self.cookies_from_browser.as_deref()
+    }
+    pub fn offer_ytdlp_install(&self) -> bool {
+        self.offer_ytdlp_install
+    }
+    pub fn offer_ffmpeg_install(&self) -> bool {
+        self.offer_ffmpeg_install
+    }
+
+    /// Remember that the user said no, so odl stops asking.
+    pub fn set_offer_ytdlp_install(&mut self, offer: bool) {
+        self.offer_ytdlp_install = offer;
+    }
+
+    /// Remember that the user said no, so odl stops asking.
+    pub fn set_offer_ffmpeg_install(&mut self, offer: bool) {
+        self.offer_ffmpeg_install = offer;
+    }
+
+    /// Point odl at an installed `yt-dlp`. `None` restores the `PATH` lookup.
+    pub fn set_binary_path(&mut self, path: Option<PathBuf>) {
+        self.binary_path = path;
+    }
+
+    /// Point odl at an installed `ffmpeg`. `None` restores the `PATH` lookup.
+    pub fn set_ffmpeg_path(&mut self, path: Option<PathBuf>) {
+        self.ffmpeg_path = path;
+    }
+
+    /// Normalize host lists so matching can assume lowercase, dot-trimmed
+    /// entries, and drop anything that cannot be a host.
+    fn sanitize(&mut self) {
+        for (label, list) in [
+            ("extra_hosts", &mut self.extra_hosts),
+            ("excluded_hosts", &mut self.excluded_hosts),
+        ] {
+            for host in list.iter_mut() {
+                *host = host.trim().trim_matches('.').to_ascii_lowercase();
+            }
+            list.retain(|host| {
+                // A host entry is a bare registrable domain: no scheme, no
+                // path, no port. Anything else is a typo that would silently
+                // never match.
+                let looks_like_host = !host.is_empty()
+                    && host.contains('.')
+                    && !host.contains('/')
+                    && !host.contains(':')
+                    && host.is_ascii();
+                if !looks_like_host {
+                    tracing::warn!("invalid ytdlp.{} entry {:?}; dropping", label, host);
+                }
+                looks_like_host
+            });
+        }
+    }
+}
+
 /// `Config` holds user-visible defaults for the manager and is used by
 /// `DownloadManager` to build HTTP clients and control concurrency.
 ///
@@ -404,6 +612,12 @@ pub struct Config {
     /// Flattened in TOML so on-disk layout remains a single flat table.
     #[serde(flatten, default)]
     download: DownloadOptions,
+
+    /// Settings for the `yt-dlp` delegation engine. Serialized as a nested
+    /// `[ytdlp]` table, so it must stay the last field: TOML requires every
+    /// bare key to precede the first table header.
+    #[serde(default)]
+    ytdlp: YtdlpOptions,
 }
 
 impl From<Config> for ConfigBuilder {
@@ -411,7 +625,8 @@ impl From<Config> for ConfigBuilder {
         let mut b = Self::default();
         b.download_dir(c.download_dir)
             .max_concurrent_downloads(c.max_concurrent_downloads)
-            .download(c.download);
+            .download(c.download)
+            .ytdlp(c.ytdlp);
         b
     }
 }
@@ -422,6 +637,7 @@ impl Default for Config {
             download_dir: default_download_dir(),
             max_concurrent_downloads: default_max_concurrent_downloads(),
             download: DownloadOptions::default(),
+            ytdlp: YtdlpOptions::default(),
         }
     }
 }
@@ -458,6 +674,9 @@ impl Config {
     pub fn download(&self) -> &DownloadOptions {
         &self.download
     }
+    pub fn ytdlp(&self) -> &YtdlpOptions {
+        &self.ytdlp
+    }
 
     /// Clamp manager-level values that have safe fallbacks; also runs
     /// [`DownloadOptions::sanitize`] on the nested options. Hard rejects
@@ -477,6 +696,7 @@ impl Config {
             self.max_concurrent_downloads = fallback;
         }
         self.download.sanitize();
+        self.ytdlp.sanitize();
     }
 
     fn validate_self(&self) -> Result<(), DownloadOptionsBuilderError> {
@@ -869,6 +1089,84 @@ M-Header = "m"
             cfg.download().max_connections()
         );
         assert_eq!(loaded.download().headers(), cfg.download().headers());
+    }
+
+    #[tokio::test]
+    async fn ytdlp_section_round_trips_alongside_flattened_options() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let ytdlp = YtdlpOptionsBuilder::default()
+            .format(Some("bv*+ba/b".to_owned()))
+            .extra_hosts(vec!["video.example".to_owned()])
+            .excluded_hosts(vec!["youtube.com".to_owned()])
+            .build()
+            .unwrap();
+        let cfg = ConfigBuilder::default()
+            .download_dir(dir.path().to_path_buf())
+            // `headers` serializes as a table too; the `[ytdlp]` table has to
+            // survive next to it, which TOML only allows in one order.
+            .download(sample_options())
+            .ytdlp(ytdlp)
+            .build()
+            .unwrap();
+
+        cfg.save_to_file(&path).await.unwrap();
+        let loaded = Config::load_from_file(&path).await.unwrap();
+
+        assert_eq!(loaded.ytdlp().format(), Some("bv*+ba/b"));
+        assert_eq!(loaded.ytdlp().extra_hosts(), ["video.example"]);
+        assert_eq!(loaded.ytdlp().excluded_hosts(), ["youtube.com"]);
+        assert!(loaded.ytdlp().enabled());
+        assert_eq!(loaded.download().headers(), cfg.download().headers());
+    }
+
+    #[tokio::test]
+    async fn a_declined_install_offer_survives_a_restart() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = Config::default();
+
+        let mut ytdlp = cfg.ytdlp().clone();
+        ytdlp.set_offer_ffmpeg_install(false);
+        cfg = cfg.into_builder().ytdlp(ytdlp).build().unwrap();
+        cfg.save_to_file(&path).await.unwrap();
+
+        // Being asked again on every media link would be nagging; the answer
+        // was already given.
+        let loaded = Config::load_from_file(&path).await.unwrap();
+        assert!(!loaded.ytdlp().offer_ffmpeg_install());
+        assert!(
+            loaded.ytdlp().offer_ytdlp_install(),
+            "declines are per tool"
+        );
+    }
+
+    #[test]
+    fn config_without_ytdlp_section_uses_defaults() {
+        // Configs written before the section existed must keep loading.
+        let cfg: Config = toml::from_str("max_connections = 2").expect("parse");
+        assert!(cfg.ytdlp().enabled());
+        assert_eq!(cfg.ytdlp().format(), None);
+        assert!(cfg.ytdlp().extra_hosts().is_empty());
+        // A config written before these existed must not read as "declined".
+        assert!(cfg.ytdlp().offer_ytdlp_install());
+        assert!(cfg.ytdlp().offer_ffmpeg_install());
+    }
+
+    #[test]
+    fn ytdlp_host_lists_are_normalized_and_filtered() {
+        let mut cfg: Config = toml::from_str(
+            r#"
+[ytdlp]
+extra_hosts = ["  Video.Example. ", "https://bad.example/path", "localhost", "ok.example"]
+"#,
+        )
+        .expect("parse");
+        cfg.sanitize();
+
+        // Trimmed and lowercased; entries that could never match are dropped
+        // rather than sitting in the config looking effective.
+        assert_eq!(cfg.ytdlp().extra_hosts(), ["video.example", "ok.example"]);
     }
 
     #[cfg(unix)]

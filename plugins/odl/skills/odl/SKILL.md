@@ -61,6 +61,7 @@ odl --format json config --show
 | 4 | conflict (file exists / changed / checksum) | no — change `--on-*` flags |
 | 5 | I/O | no — check disk/permissions |
 | 6 | metadata (lockfile held / corrupt) | maybe — another odl may be running |
+| 7 | yt-dlp missing/too old/failed, or unsupported URL | no — install or update yt-dlp |
 | 130 | cancelled | — |
 | 1 | other/internal | maybe |
 
@@ -80,6 +81,24 @@ odl --format json config --show
 - **`progress` may show `"downloaded":0,"total":null`** for chunked
   responses with no Content-Length. That is normal, not a stall — wait for
   `completed`.
+- **Media links go to yt-dlp.** URLs on major media hosts (YouTube, Vimeo,
+  Twitch, X, …) are handed to an installed `yt-dlp`; everything else uses
+  odl's own engine. Pass `--choose-format never` so a quality prompt can
+  never appear, and expect `"engine":"ytdlp"` in `probe`/`status`, where
+  `etag`, `last_modified` and `checksums` are `null`/empty because that
+  engine cannot observe them. Sizes may be estimates (`size_is_approx`).
+  Playlists are refused. Force the choice with `--engine http|ytdlp`.
+- **Never let a prompt block you.** `--format json` disables every interactive
+  question — the quality menu and the helper-install offer — so the documented
+  invocation cannot hang. If you ever drop `--format json`, add
+  `--choose-format never`, and only run `odl tools install` with `-y`.
+- **Exit 7 is a setup problem, not something to retry.** It means `yt-dlp` is
+  missing, too old, or rejected the URL. Check
+  `odl --format json tools status`, then either `odl tools install yt-dlp -y`
+  or tell the user to install it. Repeating the download unchanged fails
+  identically.
+- **Transcripts**: `--format-id subs:<lang>` (or `autosubs:<lang>`) downloads
+  the subtitle file instead of the video.
 - **Secrets**: pass auth via `--header "Authorization: Bearer $TOKEN"` or
   `--http-user/--http-password`, reading values from the environment.
   Never hardcode tokens into commands you save.

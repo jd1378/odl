@@ -17,9 +17,13 @@ pub fn phase_str(phase: Phase) -> &'static str {
         Phase::Evaluating => "evaluating",
         Phase::ResolvingConflicts => "resolving_conflicts",
         Phase::Downloading => "downloading",
+        Phase::PostProcessing => "post_processing",
         Phase::Assembling => "assembling",
         Phase::Flushing => "flushing",
         Phase::Verifying => "verifying",
+        // `Phase` is non-exhaustive; an unknown phase is still a phase, and a
+        // consumer parsing this stream should not choke on it.
+        _ => "unknown",
     }
 }
 

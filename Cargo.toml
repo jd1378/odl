@@ -1,6 +1,6 @@
 [package]
 name = "odl"
-version = "1.3.0"
+version = "2.0.0"
 edition = "2024"
 description = "flexible download library and CLI intended to be fast, reliable, and easy to use."
 repository = "https://github.com/jd1378/odl"
@@ -50,6 +50,12 @@ indexmap = { version = "2", features = ["serde"] }
 humantime = "2"
 reflink-copy = { version = "0.1.29", features = ["tracing"] }
 
+[target.'cfg(windows)'.dependencies]
+# Job Objects are the only reliable way to tear down a spawned yt-dlp together
+# with the grandchildren it spawns (ffmpeg). Bindings-only crate: the code it
+# calls lives in the OS, so the binary-size cost is negligible.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading"], optional = true }
+
 [dev-dependencies]
 reqwest = { version = "0.13", default-features = false, features = ["http2", "gzip", "brotli", "native-tls", "socks", "stream", "blocking"] }
 mockito = "1.7.0"
@@ -59,8 +65,15 @@ prost-build = "0.14"
 protobuf-src = { version = "2.1", optional = true }
 
 [features]
-default = ["cli"]
-cli = ["dep:clap", "dep:indicatif", "dep:tracing-subscriber", "dep:serde_json"]
+default = ["cli", "ytdlp"]
+# `tokio/signal` powers the interrupt handler: engines that drive a helper
+# process isolate it in its own process group, so a terminal's Ctrl-C never
+# reaches it and odl has to do the teardown itself.
+cli = ["dep:clap", "dep:indicatif", "dep:tracing-subscriber", "dep:serde_json", "tokio/signal"]
+# Delegate downloads of known media hosts to an externally installed `yt-dlp`.
+# Adds no crate dependencies of its own beyond JSON parsing and process control;
+# `yt-dlp` itself is discovered at runtime and is never bundled.
+ytdlp = ["dep:serde_json", "dep:windows-sys", "tokio/process", "tokio/io-util"]
 vendored-protoc = ["protobuf-src"]
 
 [[bin]]

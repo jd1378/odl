@@ -34,6 +34,59 @@ message DownloadMetadata {
   // when those headers were observed (unix seconds). without it, consumers
   // cannot tell a probe from a minute ago from one from last month.
   optional int64 response_headers_probed_at = 17;
+  // which engine performs the transfer. absent (the proto3 default of 0) is
+  // `http_multipart`, which is what every metadata file written before this
+  // field existed used — so old files decode correctly without migration.
+  DownloadEngine engine = 18;
+  // engine-specific state. `http_multipart` needs none: the fields above
+  // already are its state. absent means "no engine-specific state".
+  oneof engine_details {
+    YtdlpDetails ytdlp_details = 19;
+    // TorrentDetails torrent_details = 20; // planned
+  }
+}
+
+// Named after what the engine does rather than a version number: a version
+// says nothing about behaviour, and a second HTTP strategy would be a
+// sibling rather than a successor.
+//
+// Value 0 cannot be an `unspecified` sentinel here — metadata written before
+// the field existed decodes as 0 and means `http_multipart`.
+enum DownloadEngine {
+  http_multipart = 0;
+  ytdlp = 1;
+  // torrent = 2; // planned
+  // The URL has not been evaluated yet, so which engine will handle it is
+  // still unknown. Produced by a cheap, network-free inspection so a queue can
+  // hold a pasted link without waiting; evaluating it later replaces this with
+  // a real engine. Nothing downloadable: attempting to transfer one is an
+  // error rather than a guess.
+  unresolved = 3;
+}
+
+// State needed to safely resume a download delegated to `yt-dlp`.
+message YtdlpDetails {
+  // page URL the media was extracted from. `DownloadMetadata.url` holds the
+  // same value: extracted media URLs are short-lived and signed, so the page
+  // URL is what we re-extract from on every resume.
+  string source_url = 1;
+  // format selected on the first run. resuming under a different format would
+  // append incompatible bytes to an existing `.part` and yield a corrupt file
+  // with a zero exit code, so this is pinned rather than re-selected.
+  string format_id = 2;
+  string extractor = 3;
+  string title = 4;
+  // true when `size` came from yt-dlp's estimate rather than an exact value.
+  bool size_is_approx = 5;
+  // Enough of the chosen format to describe it to a person after the fact.
+  // The format list is gone by then, and "137+251" is not a quality anyone
+  // recognises. Stored structured rather than as a rendered string so a UI
+  // can phrase it in its own language.
+  optional uint32 height = 6;
+  optional double fps = 7;
+  optional double bitrate_kbps = 8;
+  // The chosen format carries sound but no picture.
+  bool audio_only = 9;
 }
 
 message ResponseHeader {
