@@ -56,6 +56,83 @@ mod imp {
     use crate::progress::{Phase, ProgressEvent};
     use reqwest::{Proxy, header::HeaderMap};
 
+    /// Whether a failure is worth a fresh process.
+    ///
+    /// Only a non-zero exit from the tool qualifies: by then it has already
+    /// exhausted its own retries, so what is left to try is a new extraction.
+    /// It resumes from its own partial file, so this continues rather than
+    /// starting the transfer over.
+    ///
+    /// Everything else is settled — an unsupported URL, a vanished format, a
+    /// missing or too-old binary — and repeating it would only spend the
+    /// user's time to reach the same answer. A rate-limited refusal is
+    /// deliberately excluded too: the configured backoff is measured in
+    /// seconds, far too short to clear a limit that is usually minutes or
+    /// hours, and retrying into it risks extending the block. That one
+    /// surfaces as a retryable exit code so the *caller* can come back later.
+    fn is_worth_retrying(e: &OdlError) -> bool {
+        matches!(e, OdlError::Ytdlp(YtdlpError::ProcessFailed { .. }))
+    }
+
+    /// How many times a failed *download* is started afresh.
+    ///
+    /// The transfer's own retries belong to yt-dlp, which repeats a request
+    /// against the URL it already holds — no re-extraction, no second process,
+    /// no extra call on the site's metadata API. Re-running the whole thing
+    /// costs a fresh extraction (measured at roughly three seconds) and is
+    /// worth it only for what an internal retry cannot fix: a media URL that
+    /// expired mid-download, or the tool dying outright.
+    ///
+    /// So: one attempt, not `max_retries` of them. Scaling this with the
+    /// configured number would multiply against the retries yt-dlp is already
+    /// doing, turning "three tries" into sixteen.
+    const RESPAWN_ATTEMPTS: u32 = 1;
+
+    /// Run `op`, retrying up to `budget` times on the configured backoff.
+    ///
+    /// The budget is per phase rather than global, because the two phases have
+    /// different owners: odl retries extraction itself, while the tool retries
+    /// the transfer and odl only restarts it.
+    async fn with_retries<T, F, Fut>(
+        opts: &DownloadOptions,
+        ctx: &DownloadContext,
+        budget: u32,
+        mut op: F,
+    ) -> Result<T, OdlError>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T, OdlError>>,
+    {
+        // A user who asked for no retries gets none at any level.
+        let budget = if opts.max_retries() == 0 { 0 } else { budget };
+        let policy = crate::retry_policies::FixedThenExponentialRetry {
+            max_n_retries: budget,
+            wait_time: opts.wait_between_retries(),
+            n_fixed_retries: opts.n_fixed_retries().max(1),
+        };
+        let mut attempts: u32 = 0;
+        loop {
+            match op().await {
+                Ok(value) => return Ok(value),
+                Err(e) => {
+                    if !is_worth_retrying(&e) {
+                        return Err(e);
+                    }
+                    attempts = attempts.saturating_add(1);
+                    // Also the cancellation check: a user who stopped the
+                    // download should not wait out a backoff first.
+                    if !crate::retry_policies::wait_for_retry(&policy, attempts, ctx).await {
+                        return Err(e);
+                    }
+                    tracing::info!(attempt = attempts, error = %e, "retrying yt-dlp");
+                    ctx.emit(ProgressEvent::Message(format!(
+                        "Retrying ({attempts}/{budget})…"
+                    )));
+                }
+            }
+        }
+    }
+
     /// Metadata already on disk for this download, if any is readable.
     async fn existing_metadata(dir: &Path) -> Option<DownloadMetadata> {
         read_delimited_message_from_path::<DownloadMetadata, PathBuf>(&dir.join("metadata.pb"))
@@ -208,7 +285,14 @@ mod imp {
             .format()
             .unwrap_or_else(|| extract::default_selector(can_merge));
 
-        let info = extract::extract(url, ytdlp_opts, &tools, opts.proxy(), selector_expr).await?;
+        // Extraction is odl's to retry: the tool was told not to, so each
+        // failure is counted, reported and interruptible here.
+        let info = with_retries(opts, ctx, opts.max_retries(), || async {
+            extract::extract(url, ytdlp_opts, &tools, opts.proxy(), selector_expr)
+                .await
+                .map_err(OdlError::from)
+        })
+        .await?;
         if ctx.is_cancelled() {
             return Err(OdlError::Cancelled);
         }
@@ -368,9 +452,15 @@ mod imp {
             speed_limit: opts.speed_limit(),
             headers: instruction.headers().as_ref(),
             concurrent_fragments: opts.max_connections(),
+            max_retries: opts.max_retries(),
+            wait_between_retries: opts.wait_between_retries(),
         };
 
-        let produced = match run::run_download(&plan, ytdlp_opts, &tools, ctx).await {
+        let produced = match with_retries(opts, ctx, RESPAWN_ATTEMPTS, || {
+            run::run_download(&plan, ytdlp_opts, &tools, ctx)
+        })
+        .await
+        {
             Ok(path) => path,
             Err(OdlError::Ytdlp(YtdlpError::FormatUnavailable { format_id })) => {
                 // The bytes on disk are of an encoding the site no longer

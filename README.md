@@ -207,6 +207,25 @@ exist:
 - Sizes are estimates for adaptive formats until the download finishes, shown
   with a leading `~`.
 
+`max_retries` and `wait_between_retries` do apply, split by which layer can act
+on the failure most cheaply:
+
+- **Transfer errors** stay with yt-dlp (`--retries`, `--fragment-retries`, set
+  from your configured number). A retry there re-uses the media URL it already
+  holds — no second process, no extra call on the site's metadata API.
+- **Extraction errors** are odl's. yt-dlp is told not to retry them, so each
+  failure is counted against your policy, reported as progress, and can be
+  interrupted — none of which is true of a retry hidden inside the process.
+- **A finished-but-failed run** is restarted once. That costs a fresh
+  extraction (a few seconds), and earns it only for what an internal retry
+  cannot fix: a media URL that expired mid-download, or the tool dying
+  outright. Scaling it with `max_retries` would multiply against the retries
+  yt-dlp is already doing.
+
+Settled failures — an unsupported URL, a format the site no longer offers, a
+rate-limited refusal — are not retried at all, since the answer would not
+change. `--max-retries 0` means exactly one attempt everywhere.
+
 Resuming works: the page URL is stored rather than the (short-lived) media URL,
 so a resume re-resolves it, and the chosen format is pinned so a partial file is
 never continued in a different encoding. An ordinary re-run therefore keeps the

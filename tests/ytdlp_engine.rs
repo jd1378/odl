@@ -76,6 +76,18 @@ while [ $# -gt 0 ]; do
 done
 
 if [ "$DUMP_JSON" = "1" ]; then
+  EXTRACT_FAILS="$(dirname "$0")/extract_fails"
+  if [ -f "$EXTRACT_FAILS" ]; then
+    want=$(cat "$EXTRACT_FAILS")
+    seen_file="$(dirname "$0")/extract_attempts"
+    seen=0
+    if [ -f "$seen_file" ]; then seen=$(cat "$seen_file"); fi
+    seen=$((seen+1)); echo "$seen" > "$seen_file"
+    if [ "$seen" -le "$want" ]; then
+      echo "ERROR: unable to extract player response" >&2
+      exit 1
+    fi
+  fi
   cat <<'JSON'
 {info}
 JSON
@@ -103,6 +115,27 @@ esac
     )
     .unwrap();
     path
+}
+
+/// A stand-in that fails its first `fail_times` download attempts, then
+/// succeeds — the shape of a connection that drops and later recovers.
+///
+/// Attempts are counted through a file so the count survives each process.
+fn flaky_download_body(fail_times: usize) -> String {
+    format!(
+        r#"
+COUNT_FILE="$OUT_DIR/../attempts"
+n=0
+if [ -f "$COUNT_FILE" ]; then n=$(cat "$COUNT_FILE"); fi
+n=$((n+1))
+echo "$n" > "$COUNT_FILE"
+if [ "$n" -le {fail_times} ]; then
+  echo "ERROR: unable to download video data: connection reset" >&2
+  exit 1
+fi
+{success}"#,
+        success = successful_download_body()
+    )
 }
 
 /// A stand-in that downloads successfully, reporting progress for both halves
@@ -878,4 +911,130 @@ fn an_unanswerable_install_offer_records_nothing() {
         !written.contains("offer_ytdlp_install = false"),
         "a decline was recorded without anyone being asked:\n{written}"
     );
+}
+
+#[test]
+fn a_process_that_died_is_started_afresh_once() {
+    // The tool exhausts its own retries before exiting, so what a failure
+    // leaves worth trying is a new extraction — once, not once per configured
+    // retry.
+    let fx = Fixture::new(&flaky_download_body(1));
+    let out = fx.run(&["--max-retries", "3", "--wait-between-retries", "10ms"]);
+    assert!(
+        out.status.success(),
+        "a fresh process should recover the download: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(fx.save_dir.join("Fixture Video.mkv").exists());
+    assert_eq!(attempts(&fx), 2, "one failure, then one fresh run");
+}
+
+#[test]
+fn restarting_does_not_multiply_the_configured_retries() {
+    // Stacking a respawn loop on the tool's own would turn a configured
+    // "three tries" into sixteen. The transfer retries belong to yt-dlp; only
+    // the re-extraction belongs here.
+    let fx = Fixture::new(&flaky_download_body(99));
+    let out = fx.run(&["--max-retries", "3", "--wait-between-retries", "10ms"]);
+    assert_eq!(out.status.code(), Some(7), "the download should fail");
+    assert_eq!(attempts(&fx), 2, "one attempt plus one restart");
+
+    let call = fx
+        .calls()
+        .lines()
+        .find(|c| c.contains("--paths"))
+        .expect("a download invocation")
+        .to_owned();
+    // The transfer retries stay with the tool, where a retry reuses the URL
+    // it already has instead of costing a fresh extraction.
+    assert!(call.contains("--retries 3"), "{call}");
+    assert!(call.contains("--fragment-retries 3"), "{call}");
+}
+
+#[test]
+fn asking_for_no_retries_starts_nothing_afresh() {
+    let fx = Fixture::new(&flaky_download_body(99));
+    let out = fx.run(&["--max-retries", "0"]);
+    assert_eq!(out.status.code(), Some(7));
+    assert_eq!(attempts(&fx), 1, "no retries means exactly one attempt");
+}
+
+/// How many times the stand-in was invoked for a download.
+fn attempts(fx: &Fixture) -> usize {
+    std::fs::read_to_string(fx.data_dir.join("attempts"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+#[test]
+fn a_settled_failure_is_not_retried() {
+    // An unsupported URL will be unsupported next time too; spending the
+    // user's backoff to learn that again helps nobody.
+    let fx = Fixture::new(
+        r#"
+COUNT_FILE="$OUT_DIR/../attempts"
+n=0
+if [ -f "$COUNT_FILE" ]; then n=$(cat "$COUNT_FILE"); fi
+echo "$((n+1))" > "$COUNT_FILE"
+echo "ERROR: Unsupported URL: https://fixture.example/watch" >&2
+exit 1
+"#,
+    );
+    let out = fx.run(&["--max-retries", "5", "--wait-between-retries", "10ms"]);
+    assert_eq!(out.status.code(), Some(7));
+    assert_eq!(attempts(&fx), 1, "a settled failure must be attempted once");
+}
+
+#[test]
+fn a_failed_extraction_is_retried_on_the_full_policy() {
+    // Extraction is the phase odl owns: the tool is told not to retry it, so
+    // the configured count has to be spent here or it is lost entirely.
+    let fx = Fixture::new(&successful_download_body());
+    std::fs::write(fx.tool_dir.path().join("extract_fails"), "2").unwrap();
+
+    let out = fx.run(&["--max-retries", "3", "--wait-between-retries", "10ms"]);
+    assert!(
+        out.status.success(),
+        "two extraction failures should be retried through: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let tries: usize = std::fs::read_to_string(fx.tool_dir.path().join("extract_attempts"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // Two failures, then the run that succeeded, then the download's own
+    // extraction — more than the single restart a transfer failure gets.
+    assert!(
+        tries >= 3,
+        "expected the failures to be retried, saw {tries}"
+    );
+
+    // The tool must not have been quietly retrying underneath us.
+    let call = fx
+        .calls()
+        .lines()
+        .find(|c| c.contains(" -J "))
+        .expect("an extraction invocation")
+        .to_owned();
+    assert!(call.contains("--extractor-retries 0"), "{call}");
+}
+
+#[test]
+fn extraction_failures_stop_at_the_configured_limit() {
+    let fx = Fixture::new(&successful_download_body());
+    std::fs::write(fx.tool_dir.path().join("extract_fails"), "99").unwrap();
+
+    let out = fx.run(&["--max-retries", "2", "--wait-between-retries", "10ms"]);
+    assert_eq!(out.status.code(), Some(7), "it should give up, not loop");
+
+    let tries: usize = std::fs::read_to_string(fx.tool_dir.path().join("extract_attempts"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(tries, 3, "one attempt plus the two configured retries");
 }

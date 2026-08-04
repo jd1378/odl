@@ -51,6 +51,11 @@ pub struct DownloadPlan<'a> {
     /// Maps to fragment-level parallelism; ignored for formats that are a
     /// single HTTP stream.
     pub concurrent_fragments: u64,
+    /// How many times the tool itself should retry a stalled or failed
+    /// transfer before giving up and letting odl decide what to do.
+    pub max_retries: u32,
+    /// How long the tool waits between its own retries.
+    pub wait_between_retries: std::time::Duration,
 }
 
 /// One templated status line.
@@ -196,6 +201,20 @@ pub fn download_args(plan: &DownloadPlan<'_>, opts: &YtdlpOptions, tools: &Tools
         args.push("--concurrent-fragments".into());
         args.push(plan.concurrent_fragments.to_string());
     }
+
+    // The tool retries in several domains of its own, each with a different
+    // default. Setting them all from one configured number is what makes
+    // `max_retries` mean the same thing here as it does for the built-in
+    // engine, instead of yt-dlp's assorted defaults quietly winning.
+    let retries = plan.max_retries.to_string();
+    for flag in ["--retries", "--fragment-retries", "--extractor-retries"] {
+        args.push(flag.into());
+        args.push(retries.clone());
+    }
+    // Seconds, as the tool expects. Sub-second waits round to zero, which is
+    // still an honest reading of "retry almost immediately".
+    args.push("--retry-sleep".into());
+    args.push(plan.wait_between_retries.as_secs().to_string());
 
     if let Some(headers) = plan.headers {
         for (name, value) in headers.iter() {
@@ -545,6 +564,8 @@ mod tests {
             speed_limit: None,
             headers: None,
             concurrent_fragments: 1,
+            max_retries: 3,
+            wait_between_retries: std::time::Duration::from_secs(1),
         }
     }
 
@@ -598,6 +619,12 @@ mod tests {
         assert_eq!(arg_after(&args, "--proxy"), Some("http://127.0.0.1:8080"));
         assert_eq!(arg_after(&args, "--concurrent-fragments"), Some("4"));
         assert!(args.contains(&"--mtime".to_owned()));
+        // Every retry domain the tool has is set from the one configured
+        // number, so its assorted defaults cannot quietly win.
+        assert_eq!(arg_after(&args, "--retries"), Some("3"));
+        assert_eq!(arg_after(&args, "--fragment-retries"), Some("3"));
+        assert_eq!(arg_after(&args, "--extractor-retries"), Some("3"));
+        assert_eq!(arg_after(&args, "--retry-sleep"), Some("1"));
     }
 
     #[test]

@@ -455,6 +455,11 @@ pub async fn extract(
 
     let mut cmd = binary::command(&tools.ytdlp);
     cmd.args(base_args(opts, tools, proxy));
+    // Extraction is retried by odl, not by the tool: a failure here has to
+    // reach the caller so it can be counted against the configured policy,
+    // reported, and interrupted. Retries hidden inside the process are none
+    // of those things.
+    cmd.arg("--extractor-retries").arg("0");
     cmd.arg("-J");
     cmd.arg("-f").arg(selector);
     // `--` and then the URL: a URL is data, and must never be read as a flag
@@ -677,6 +682,22 @@ mod tests {
         };
         let args = base_args(&opts, &tools, None);
         assert_eq!(&args[args.len() - 2..], ["--retries", "9"]);
+    }
+
+    #[test]
+    fn extraction_tells_the_tool_not_to_retry_by_itself() {
+        // Whoever owns the retry sets the flag. Extraction is retried by odl,
+        // so a hidden retry inside the process would be uncounted,
+        // unreported, and impossible to interrupt.
+        let opts = YtdlpOptions::default();
+        let tools = Tools {
+            ytdlp: std::path::PathBuf::from("/usr/bin/yt-dlp"),
+            ffmpeg: None,
+        };
+        // `base_args` carries no retry policy of its own; the phase adds it.
+        let args = base_args(&opts, &tools, None);
+        assert!(!args.iter().any(|a| a.starts_with("--extractor-retries")));
+        assert!(!args.iter().any(|a| a.starts_with("--retries")));
     }
 
     #[test]
