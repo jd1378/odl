@@ -769,7 +769,7 @@ impl Downloader {
             })?;
             let new_part_offset = part_entry.offset + split.new_left_size;
             part_entry.size = split.new_left_size;
-            let new_ulid = Ulid::new().to_string();
+            let new_ulid = Ulid::generate().to_string();
             let new_part = PartDetails {
                 offset: new_part_offset,
                 size: split.new_right_size,

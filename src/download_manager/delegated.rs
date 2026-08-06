@@ -412,7 +412,7 @@ mod imp {
             .cloned()
             // Metadata always carries one synthetic part, but a hand-edited
             // file might not; a fresh name is better than failing.
-            .unwrap_or_else(|| ulid::Ulid::new().to_string());
+            .unwrap_or_else(|| ulid::Ulid::generate().to_string());
 
         let final_path = instruction.final_file_path();
         if metadata.finished && tokio::fs::try_exists(&final_path).await.unwrap_or(false) {

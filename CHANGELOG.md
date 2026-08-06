@@ -49,9 +49,15 @@ headers are no longer forwarded, and a server that relied on them will answer
 401. That is the safer behaviour — the previous one leaked credentials over
 plaintext — but it can look like a regression.
 
-`base64` and `ulid` were deliberately held at their current majors: neither
-upgrade fixes anything odl is affected by, and upgrading `base64` would compile
-two copies of it into the binary, since `reqwest` still requires 0.22.
+`ulid` moved to 3.0. Part files are named by ULID and those names live in
+persisted metadata, so the on-disk format is a compatibility contract — it is
+unchanged across the versions, and a download interrupted by 1.x resumes
+correctly under 3.0. A test now pins that shape so a future dependency change
+cannot alter it quietly.
+
+`base64` was deliberately held at 0.22: the upgrade fixes nothing odl is
+affected by, and would compile two copies into the binary since `reqwest`
+still requires 0.22.
 
 ### Breaking changes
 

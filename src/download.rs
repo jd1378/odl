@@ -850,7 +850,7 @@ impl Download {
         // the body, and rewrites part.size to the actual byte count when
         // it completes.
         if size.is_none() {
-            let ulid = Ulid::new().to_string();
+            let ulid = Ulid::generate().to_string();
             parts.insert(
                 ulid.clone(),
                 PartDetails {
@@ -869,7 +869,7 @@ impl Download {
         // If the size is small (<= MIN_PART_SIZE) we keep a single part to
         // avoid fragmenting the download into many very small requests.
         if size <= Self::MIN_PART_SIZE {
-            let ulid = Ulid::new().to_string();
+            let ulid = Ulid::generate().to_string();
             parts.insert(
                 ulid.clone(),
                 PartDetails {
@@ -903,7 +903,7 @@ impl Download {
             } else {
                 base_size
             };
-            let ulid = Ulid::new().to_string();
+            let ulid = Ulid::generate().to_string();
             parts.insert(
                 ulid.clone(),
                 PartDetails {
@@ -1304,7 +1304,7 @@ mod tests {
                 p.size = split.new_left_size;
             }
             // Insert right
-            let new_ulid = ulid::Ulid::new().to_string();
+            let new_ulid = ulid::Ulid::generate().to_string();
             parts.insert(
                 new_ulid.clone(),
                 crate::download_metadata::PartDetails {
@@ -1356,6 +1356,36 @@ mod tests {
             "boundary must move past already-consumed prefix"
         );
         assert_eq!(split.new_left_size + split.new_right_size, size);
+    }
+
+    /// Part filenames are generated identifiers that end up on disk and in
+    /// persisted metadata, so their shape is a compatibility contract: a
+    /// download interrupted by one version has to be resumable by the next.
+    /// This pins it against the identifier crate changing underneath us.
+    #[test]
+    fn part_names_keep_the_shape_already_written_to_disk() {
+        const CROCKFORD: &str = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+        let parts = Download::determine_parts(Some(Download::MIN_PART_SIZE * 8), 4);
+        assert!(!parts.is_empty());
+        for name in parts.keys() {
+            assert_eq!(name.len(), 26, "part name {name} is not 26 characters");
+            assert!(
+                name.chars().all(|c| CROCKFORD.contains(c)),
+                "part name {name} leaves Crockford base32"
+            );
+        }
+
+        // And a name written by an older version still addresses its file, so
+        // an in-flight download survives the upgrade.
+        let download = test_download(vec![]);
+        let legacy = "01D39ZY06FGSCTVN4T2V9PKHFZ";
+        assert!(
+            download
+                .part_path(legacy)
+                .to_string_lossy()
+                .ends_with("01D39ZY06FGSCTVN4T2V9PKHFZ.part")
+        );
     }
 
     /// Metadata written before the engine field existed must keep loading as

@@ -954,7 +954,7 @@ async fn grow_parts(
         if let Some(p) = metadata.parts.get_mut(&ulid) {
             p.size = split.new_left_size;
         }
-        let new_ulid = ulid::Ulid::new().to_string();
+        let new_ulid = ulid::Ulid::generate().to_string();
         metadata.parts.insert(
             new_ulid.clone(),
             crate::download_metadata::PartDetails {
