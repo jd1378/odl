@@ -4,6 +4,12 @@ use std::{io, path::Path, path::PathBuf};
 
 use tokio::{fs::OpenOptions, io::AsyncWriteExt};
 
+/// Longest filename component the common filesystems accept, in bytes.
+const MAX_FILENAME_BYTES: usize = 255;
+
+/// Stand-in for a name that sanitising emptied out.
+const FALLBACK_FILENAME: &str = "unnamed";
+
 static FORBIDDEN_WINDOWS_NAMES: &[&str] = &[
     "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
     "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
@@ -40,21 +46,43 @@ pub fn cleanup_filename(input: &str) -> String {
         .trim_matches(|c: char| c.is_whitespace() || c == '.')
         .to_string();
 
-    // avoid forbidden windows names by adding an underscore at the end if found
-    let upper_result = result.to_ascii_uppercase();
+    // Trimming can consume the whole name: `"..."` and `"   "` are legal
+    // titles that sanitise to nothing. An empty component is not a filename —
+    // joining one onto a directory yields the directory itself, so the
+    // download would target its own parent.
+    if result.is_empty() {
+        return FALLBACK_FILENAME.to_owned();
+    }
+
+    // Avoid the reserved Windows device names by appending an underscore.
+    // The comparison is against the stem, not the whole name: `NUL.mkv` is
+    // just as reserved as `NUL`, and a media file always has an extension.
+    let stem = result.split('.').next().unwrap_or(&result);
     if FORBIDDEN_WINDOWS_NAMES
         .iter()
-        .any(|&name| name == upper_result)
+        .any(|&name| name.eq_ignore_ascii_case(stem))
     {
         result.push('_');
     }
 
-    if result.len() > 255 {
-        result.truncate(255);
+    // Limit by bytes, on a character boundary. `String::truncate` panics when
+    // the index lands mid-character, which any non-Latin title long enough to
+    // need truncating would do. Bytes rather than characters because that is
+    // what the filesystem limit counts; a UTF-8 string of 255 bytes is also
+    // at most 255 UTF-16 units, so this stays inside Windows' limit too.
+    if result.len() > MAX_FILENAME_BYTES {
+        let mut end = MAX_FILENAME_BYTES;
+        while end > 0 && !result.is_char_boundary(end) {
+            end -= 1;
+        }
+        result.truncate(end);
+        // Truncating can expose a trailing dot or space, which Windows will
+        // not accept, so trim again rather than before only.
+        result = result
+            .trim_end_matches(|c: char| c.is_whitespace() || c == '.')
+            .to_string();
     }
 
-    // remove non utf-8 chars
-    result = String::from_utf8_lossy(result.as_bytes()).to_string();
     result
 }
 
@@ -385,5 +413,62 @@ mod tests {
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, OWNER_ONLY_MODE, "overwrite must stay owner-only");
         assert_eq!(fs::read(&path).unwrap(), b"payload2");
+    }
+
+    #[test]
+    fn a_long_non_latin_name_is_truncated_not_crashed() {
+        // `String::truncate` panics off a character boundary, and any title
+        // long enough to need truncating in a non-Latin script lands there.
+        let title = "داستان کامل سامانه نان ".repeat(12);
+        assert!(title.len() > MAX_FILENAME_BYTES);
+
+        let out = cleanup_filename(&title);
+        assert!(out.len() <= MAX_FILENAME_BYTES);
+        assert!(!out.is_empty());
+        // Still valid text, and still the beginning of the title.
+        assert!(title.starts_with(&out));
+    }
+
+    #[test]
+    fn truncation_does_not_leave_a_trailing_dot_or_space() {
+        // Windows rejects both, and cutting a long name can expose either.
+        let title = format!("{}. more", "a".repeat(MAX_FILENAME_BYTES - 1));
+        let out = cleanup_filename(&title);
+        assert!(!out.ends_with('.') && !out.ends_with(' '), "got {out:?}");
+    }
+
+    #[test]
+    fn reserved_windows_names_are_escaped_even_with_an_extension() {
+        // `NUL.mkv` is as reserved as `NUL`, and a media file always has an
+        // extension — checking only the whole string missed every real case.
+        assert_eq!(cleanup_filename("NUL.mkv"), "NUL.mkv_");
+        assert_eq!(cleanup_filename("con.txt"), "con.txt_");
+        assert_eq!(cleanup_filename("COM1.mp4"), "COM1.mp4_");
+        // Names that merely start with those letters are fine.
+        assert_eq!(cleanup_filename("console.log"), "console.log");
+        assert_eq!(cleanup_filename("NULL.mkv"), "NULL.mkv");
+    }
+
+    #[test]
+    fn a_name_that_sanitises_to_nothing_falls_back() {
+        // Joining an empty component onto a directory yields the directory
+        // itself, so this must never return "".
+        for input in ["...", "   ", ".", " . . ", ""] {
+            assert_eq!(
+                cleanup_filename(input),
+                FALLBACK_FILENAME,
+                "{input:?} must not sanitise to an empty name"
+            );
+        }
+        // A name made only of forbidden characters still has content.
+        assert_eq!(cleanup_filename("///"), "___");
+    }
+
+    #[test]
+    fn truncation_cannot_empty_a_name() {
+        // The leading trim guarantees a non-dot first character, so cutting
+        // and re-trimming always leaves at least that one.
+        let input = format!("a{}b", ".".repeat(300));
+        assert_eq!(cleanup_filename(&input), "a");
     }
 }

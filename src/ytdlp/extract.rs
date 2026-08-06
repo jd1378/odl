@@ -27,6 +27,12 @@ pub struct ExtractedInfo {
     pub source_url: Url,
     pub title: String,
     pub extractor: String,
+    /// The extractor's own id for this item, when it reports one.
+    ///
+    /// Together with [`Self::extractor`] this identifies the media itself,
+    /// which the URL does not: one video has many spellings. Never used to
+    /// build a path — extractors are free to put anything in here.
+    pub id: Option<String>,
     /// Format id yt-dlp resolved for the selector we passed.
     pub default_format_id: Option<String>,
     /// Container of the resolved selection, after any muxing.
@@ -234,6 +240,11 @@ struct RawInfo {
     #[serde(rename = "_type", default)]
     kind: Option<String>,
     #[serde(default)]
+    id: Option<String>,
+    /// Canonical page URL, which is rarely the one the user pasted.
+    #[serde(default)]
+    webpage_url: Option<String>,
+    #[serde(default)]
     title: Option<String>,
     #[serde(default)]
     extractor: Option<String>,
@@ -378,8 +389,19 @@ pub fn parse_info(source_url: &Url, json: &[u8]) -> Result<ExtractedInfo, YtdlpE
         (None, None) => (None, false),
     };
 
+    // Prefer yt-dlp's canonical page URL over whatever the user pasted, so a
+    // share link and a watch link resolve to the same stored download. Only
+    // http(s) is accepted: this value ends up persisted and re-extracted from,
+    // and an extractor returning `file://` must not redirect that.
+    let canonical = raw
+        .webpage_url
+        .as_deref()
+        .and_then(|u| Url::parse(u).ok())
+        .filter(|u| matches!(u.scheme(), "http" | "https"));
+
     Ok(ExtractedInfo {
-        source_url: source_url.clone(),
+        source_url: canonical.unwrap_or_else(|| source_url.clone()),
+        id: raw.id.filter(|i| !i.trim().is_empty()),
         title: raw
             .title
             .filter(|t| !t.trim().is_empty())

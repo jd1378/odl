@@ -19,6 +19,10 @@ absence simply means the link is downloaded over HTTP.
   request, through odl's own downloader — resumable, retrying, and verified
   against the checksums published with them.
 - `--engine auto|http|ytdlp` forces the choice.
+- A download is identified by the extractor's id, not by the URL that was
+  pasted, so `youtu.be/X`, `watch?v=X` and a timestamped link all resume the
+  same partial file instead of reporting a conflict. The canonical page URL is
+  what gets stored and re-extracted from.
 
 ### Checksums are usable on their own
 
@@ -58,6 +62,18 @@ cannot alter it quietly.
 `base64` was deliberately held at 0.22: the upgrade fixes nothing odl is
 affected by, and would compile two copies into the binary since `reqwest`
 still requires 0.22.
+
+### Filename safety
+
+The sanitiser behind every download directory and output name had three holes,
+all reachable from a title odl does not control:
+
+- It panicked when a name longer than 255 bytes had to be cut at a byte that
+  was mid-character — which any long non-Latin title is.
+- Reserved Windows device names were only escaped without an extension, so
+  `NUL` became `NUL_` but `NUL.mkv` went through unchanged.
+- Names made only of dots or spaces sanitised to nothing, and an empty
+  component resolves to its own parent directory.
 
 ### Breaking changes
 

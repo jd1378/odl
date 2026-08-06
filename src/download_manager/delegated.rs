@@ -47,8 +47,8 @@ mod imp {
     use crate::download::YtdlpSpec;
     use crate::download_manager::io::persist_metadata;
     use crate::download_manager::save_conflict::resolve_save_conflicts;
-    use crate::download_metadata::DownloadMetadata;
     use crate::download_metadata::EngineDetails;
+    use crate::download_metadata::{DownloadMetadata, YtdlpDetails};
     use crate::error::{ConflictError, YtdlpError};
     use crate::format::DefaultFormatSelector;
     use crate::fs_utils::read_delimited_message_from_path;
@@ -232,7 +232,12 @@ mod imp {
         if !reselect
             && let Some(metadata) = existing_metadata(&dir).await
             && let Some(stored) = stored_ytdlp(&metadata)
-            && stored.source_url == info.source_url.as_str()
+            && same_media(
+                stored,
+                &info.extractor,
+                info.id.as_deref().unwrap_or_default(),
+                info.source_url.as_str(),
+            )
             && !stored.format_id.is_empty()
         {
             tracing::debug!(
@@ -314,6 +319,7 @@ mod imp {
                 source_url: info.source_url.clone(),
                 title: info.title.clone(),
                 extractor: info.extractor.clone(),
+                video_id: info.id.clone(),
                 ext: info.ext_for(&format_id),
                 format_id,
                 size,
@@ -339,6 +345,26 @@ mod imp {
         Ok(Some(instruction))
     }
 
+    /// Whether two sets of engine details describe the same media item.
+    ///
+    /// Prefers the extractor's own id, because the same video has many URL
+    /// spellings — `youtu.be/X`, `watch?v=X`, `&t=30` — and comparing those as
+    /// strings reports a conflict where the partial data is perfectly valid.
+    /// Falls back to the URL when either side carries no id: downloads stored
+    /// before the field existed have none, and neither do extractors that
+    /// report none, so an empty id means "unknown", never "matches".
+    fn same_media(
+        stored: &YtdlpDetails,
+        extractor: &str,
+        video_id: &str,
+        source_url: &str,
+    ) -> bool {
+        if stored.video_id.is_empty() || video_id.is_empty() {
+            return stored.source_url == source_url;
+        }
+        stored.video_id == video_id && stored.extractor == extractor
+    }
+
     /// Why a stored download cannot simply be continued.
     pub(crate) fn continuation_blocker(
         metadata: &DownloadMetadata,
@@ -351,7 +377,12 @@ mod imp {
         else {
             return Some("the stored download is missing its engine details");
         };
-        if stored.source_url != wanted.source_url {
+        if !same_media(
+            stored,
+            &wanted.extractor,
+            &wanted.video_id,
+            &wanted.source_url,
+        ) {
             // Two different pages that happen to share a title land in the
             // same directory; continuing would splice one into the other.
             return Some("the stored download came from a different URL");
@@ -597,6 +628,10 @@ mod tests {
     use crate::format::Quality;
 
     fn instruction(source: &str, format: &str) -> Download {
+        instruction_with_id(source, format, None)
+    }
+
+    fn instruction_with_id(source: &str, format: &str, video_id: Option<&str>) -> Download {
         Download::from_ytdlp(
             Path::new("/tmp/dl"),
             PathBuf::from("/tmp/save"),
@@ -604,6 +639,7 @@ mod tests {
                 source_url: Url::parse(source).unwrap(),
                 title: "Title".to_owned(),
                 extractor: "youtube".to_owned(),
+                video_id: video_id.map(str::to_owned),
                 format_id: format.to_owned(),
                 ext: "mp4".to_owned(),
                 size: Some(100),
@@ -632,6 +668,7 @@ mod tests {
                     source_url: Url::parse("https://youtu.be/x").unwrap(),
                     title: "Title".to_owned(),
                     extractor: "youtube".to_owned(),
+                    video_id: None,
                     format_id: String::new(),
                     ext: String::new(),
                     size: None,
@@ -656,9 +693,15 @@ mod tests {
         use super::*;
 
         fn metadata_for(source: &str, format: &str) -> DownloadMetadata {
+            metadata_with_id(source, format, "")
+        }
+
+        /// Metadata as an older odl wrote it, or a newer one with an id.
+        fn metadata_with_id(source: &str, format: &str, video_id: &str) -> DownloadMetadata {
             let mut m = instruction(source, format).as_metadata();
             m.engine_details = Some(EngineDetails::YtdlpDetails(YtdlpDetails {
                 source_url: source.to_owned(),
+                video_id: video_id.to_owned(),
                 format_id: format.to_owned(),
                 extractor: "youtube".to_owned(),
                 title: "Title".to_owned(),
@@ -685,6 +728,50 @@ mod tests {
             let m = metadata_for("https://youtu.be/x", "137+251");
             let i = instruction("https://youtu.be/y", "137+251");
             assert!(super::super::imp::continuation_blocker(&m, &i).is_some());
+        }
+
+        #[test]
+        fn the_same_video_under_a_different_url_still_continues() {
+            // A share link, a watch link and a timestamped link are one
+            // video. Comparing the URL as a string reported a conflict and
+            // made the user start over on data that was perfectly valid.
+            let m = metadata_with_id("https://youtu.be/x", "137+251", "x");
+            let i = instruction_with_id(
+                "https://www.youtube.com/watch?v=x&t=30",
+                "137+251",
+                Some("x"),
+            );
+            assert!(super::super::imp::continuation_blocker(&m, &i).is_none());
+        }
+
+        #[test]
+        fn a_different_video_id_blocks_continuation() {
+            let m = metadata_with_id("https://youtu.be/x", "137+251", "x");
+            let i = instruction_with_id("https://youtu.be/x", "137+251", Some("y"));
+            assert!(super::super::imp::continuation_blocker(&m, &i).is_some());
+        }
+
+        #[test]
+        fn the_same_id_from_another_extractor_blocks_continuation() {
+            // Ids are namespaced per extractor, so `x` on one site says
+            // nothing about `x` on another.
+            let mut m = metadata_with_id("https://youtu.be/x", "137+251", "x");
+            if let Some(EngineDetails::YtdlpDetails(d)) = m.engine_details.as_mut() {
+                d.extractor = "vimeo".to_owned();
+            }
+            let i = instruction_with_id("https://youtu.be/x", "137+251", Some("x"));
+            assert!(super::super::imp::continuation_blocker(&m, &i).is_some());
+        }
+
+        #[test]
+        fn metadata_without_an_id_falls_back_to_the_url() {
+            // Written by an odl that predates `video_id`. An absent id means
+            // unknown, so the old URL comparison has to still apply.
+            let m = metadata_for("https://youtu.be/x", "137+251");
+            let same = instruction_with_id("https://youtu.be/x", "137+251", Some("x"));
+            assert!(super::super::imp::continuation_blocker(&m, &same).is_none());
+            let other = instruction_with_id("https://youtu.be/y", "137+251", Some("x"));
+            assert!(super::super::imp::continuation_blocker(&m, &other).is_some());
         }
 
         #[test]

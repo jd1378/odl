@@ -12,14 +12,19 @@ use std::process::{Command, Stdio};
 
 const VIDEO_BYTES: usize = 4096;
 
-/// Info document the stand-in reports for any URL.
+/// Info document the stand-in reports for the URL it was given.
+///
+/// `$VIDEO_ID` and `$CANONICAL` are shell variables the fake derives from that
+/// URL, mirroring how a real extractor identifies an item by id and reports a
+/// canonical page URL rather than echoing whatever spelling was pasted.
 ///
 /// Two video tiers and one audio tier, so format selection has something to
 /// decide and the default (`137+251`) is a compound id.
 fn info_json() -> String {
     format!(
         r#"{{
-  "id": "abc",
+  "id": "$VIDEO_ID",
+  "webpage_url": "$CANONICAL",
   "title": "Fixture Video",
   "extractor": "fixture",
   "ext": "mkv",
@@ -58,6 +63,7 @@ case " $* " in
 esac
 
 # Parse only the flags the fake needs to behave correctly.
+URL=""
 OUT_DIR=""
 STEM=""
 PRINT_FILE=""
@@ -71,9 +77,18 @@ while [ $# -gt 0 ]; do
     -o) STEM="${{2%%.*}}"; shift ;;
     --skip-download) : ;;
     --print-to-file) PRINT_FILE="$3"; shift 2 ;;
+    https://fixture.example*) URL="$1" ;;
   esac
   shift
 done
+
+# Identify the item the way an extractor does: by id, not by URL spelling.
+case "$URL" in
+  *v=*) VIDEO_ID="${{URL##*v=}}" ;;
+  *) VIDEO_ID="${{URL##*/}}" ;;
+esac
+VIDEO_ID="${{VIDEO_ID%%&*}}"
+CANONICAL="https://fixture.example/watch?v=$VIDEO_ID"
 
 if [ "$DUMP_JSON" = "1" ]; then
   EXTRACT_FAILS="$(dirname "$0")/extract_fails"
@@ -88,7 +103,7 @@ if [ "$DUMP_JSON" = "1" ]; then
       exit 1
     fi
   fi
-  cat <<'JSON'
+  cat <<JSON
 {info}
 JSON
   exit 0
@@ -386,6 +401,41 @@ exit 1
     for call in fx.calls().lines().filter(|c| c.contains("--paths")) {
         assert!(call.contains("-f 137+251"), "unpinned resume: {call}");
     }
+}
+
+#[test]
+fn the_same_video_under_another_url_spelling_resumes() {
+    // `youtu.be/X`, `watch?v=X` and a timestamped link are one video. Keying
+    // continuation on the pasted URL made this a conflict and threw away a
+    // partial file that was perfectly good.
+    // Fails once, then succeeds; `--max-retries 0` keeps that failure from
+    // being absorbed by a respawn inside the first run.
+    let fx = Fixture::new(&flaky_download_body(1));
+    assert!(!fx.run(&["--max-retries", "0"]).status.success());
+
+    let out = Command::new(env!("CARGO_BIN_EXE_odl"))
+        .current_dir(&fx.save_dir)
+        .arg("https://fixture.example/watch?v=abc&t=30")
+        .arg("--download-dir")
+        .arg(&fx.data_dir)
+        .arg("--config-file")
+        .arg(&fx.config)
+        .arg("--choose-format")
+        .arg("never")
+        .arg("--on-same-download-exists")
+        .arg("resume")
+        .arg("--on-file-changed")
+        .arg("abort")
+        .arg("--format")
+        .arg("json")
+        .output()
+        .expect("failed to spawn odl");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "one video under two URLs must resume, got: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]

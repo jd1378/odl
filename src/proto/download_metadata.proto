@@ -87,6 +87,12 @@ message YtdlpDetails {
   optional double bitrate_kbps = 8;
   // The chosen format carries sound but no picture.
   bool audio_only = 9;
+  // the extractor's own id for the media. `source_url` cannot identify it:
+  // one video has many URL spellings, and comparing them as strings turns a
+  // resume into a conflict. empty for downloads stored before this field
+  // existed, and for extractors that report no id, so readers must fall back
+  // to `source_url` rather than treat empty as "no match".
+  string video_id = 10;
 }
 
 message ResponseHeader {

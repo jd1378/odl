@@ -183,6 +183,9 @@ pub struct YtdlpSpec {
     pub source_url: Url,
     pub title: String,
     pub extractor: String,
+    /// Extractor's id for the media, when it reports one. Identifies the item
+    /// across the different URLs that point at it.
+    pub video_id: Option<String>,
     /// Concrete format the engine must request on every run, including
     /// resumes.
     pub format_id: String,
@@ -635,6 +638,7 @@ impl Download {
             source_url,
             title,
             extractor,
+            video_id,
             format_id,
             ext,
             size,
@@ -689,6 +693,7 @@ impl Download {
                 source_url: source_url.to_string(),
                 format_id,
                 extractor,
+                video_id: video_id.unwrap_or_default(),
                 title,
                 size_is_approx,
                 height,
@@ -1419,6 +1424,7 @@ mod tests {
             source_url: "https://www.youtube.com/watch?v=x".to_owned(),
             format_id: "137+251".to_owned(),
             extractor: "youtube".to_owned(),
+            video_id: "x".to_owned(),
             title: "A Title".to_owned(),
             size_is_approx: true,
             height: Some(1080),
@@ -1436,6 +1442,7 @@ mod tests {
         // round-trip would let a resume append bytes of a different format.
         assert_eq!(details.format_id, "137+251");
         assert_eq!(details.source_url, "https://www.youtube.com/watch?v=x");
+        assert_eq!(details.video_id, "x");
         assert!(restored.size_is_approx());
     }
 
