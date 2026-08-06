@@ -33,6 +33,26 @@ is still checked, but hashing its contents becomes the caller's business.
 Hashing now reads 256 KiB at a time instead of 8 KiB: about four times faster
 on large files, at unchanged memory.
 
+### Dependencies
+
+Updated across the tree, chiefly for security: the vendored OpenSSL moves to
+3.6.3, which matters because `native-tls-vendored` links it *into* the shipped
+binary, so users get odl's copy rather than their system's. Also picked up
+HTTP/1 and HTTP/2 fixes on the streaming path, several `futures` soundness
+fixes, and a clean `cargo audit`. Verified to still compile on the declared
+1.88 minimum.
+
+One of those fixes is user-visible: `reqwest` now strips `Authorization` and
+`Cookie` headers when a redirect changes scheme. If you supply credentials via
+`--header` or config and your URL redirects from `https` to `http`, those
+headers are no longer forwarded, and a server that relied on them will answer
+401. That is the safer behaviour — the previous one leaked credentials over
+plaintext — but it can look like a regression.
+
+`base64` and `ulid` were deliberately held at their current majors: neither
+upgrade fixes anything odl is affected by, and upgrading `base64` would compile
+two copies of it into the binary, since `reqwest` still requires 0.22.
+
 ### Breaking changes
 
 Metadata written by 1.x still loads — the engine discriminant defaults to
