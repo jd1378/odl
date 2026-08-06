@@ -10,8 +10,8 @@ use tokio_util::sync::CancellationToken;
 
 use bytes::Bytes;
 use reqwest::{
-    Client,
-    header::{ACCEPT_ENCODING, HeaderValue, RANGE, USER_AGENT},
+    Client, StatusCode,
+    header::{ACCEPT_ENCODING, CONTENT_RANGE, HeaderValue, RANGE, USER_AGENT},
 };
 use tokio::{
     fs,
@@ -30,10 +30,11 @@ use crate::progress::{
 };
 use crate::retry_policies::{FixedThenExponentialRetry, wait_for_retry};
 use crate::{
+    conflict::ServerConflict,
     download::Download,
     download_manager::io::persist_encoded_metadata,
     download_metadata::{DownloadMetadata, PartDetails},
-    error::{MetadataError, OdlError},
+    error::{ConflictError, MetadataError, OdlError},
     user_agents::random_user_agent,
 };
 
@@ -1188,8 +1189,11 @@ async fn download_part(
         // build request — when total length is unknown we cannot construct
         // a meaningful Range, so issue a plain GET and stream until EOF.
         let mut req = client.get(url.clone());
+        // Start of the window this attempt asks for; a resumed part picks up
+        // after what is already on disk. Kept for validating the response.
+        let part_window = offset + current_size;
         if !unknown_size {
-            let range_header = format!("bytes={}-{}", offset + current_size, offset + size - 1,);
+            let range_header = format!("bytes={}-{}", part_window, offset + size - 1,);
             let range_value = match HeaderValue::from_str(&range_header) {
                 Ok(v) => v,
                 Err(e) => {
@@ -1247,6 +1251,36 @@ async fn download_part(
                 }
             }
         };
+
+        // Nothing below this point looks at the response again, so it is
+        // validated here, before a single byte of the body reaches the part
+        // file. Without this an error page is written as if it were data and
+        // a whole-file body is spliced in at a part's offset — both of which
+        // produce a corrupt file that completes with a zero exit code.
+        if !resp.status().is_success() {
+            tracing::warn!(
+                status = %resp.status(),
+                ulid = %ulid,
+                "part request answered with an error status"
+            );
+            file.finish().await?;
+            match retry_sleep_or_fail_part(&policy, attempts, attempts + 1, &ctx, &ulid).await {
+                Ok(()) => {
+                    attempts = attempts.saturating_add(1);
+                    continue;
+                }
+                Err(failed) => return Ok(failed),
+            }
+        }
+        if !unknown_size && let Some(conflict) = range_mismatch(&resp, &instruction, part_window) {
+            file.finish().await?;
+            tracing::warn!(
+                status = %resp.status(),
+                ulid = %ulid,
+                "server stopped honouring Range; refusing to write the response as part data"
+            );
+            return Err(OdlError::Conflict(ConflictError::Server { conflict }));
+        }
 
         let mut started_notified = false;
         let mut saw_eof = false;
@@ -1393,6 +1427,54 @@ async fn download_part(
 // Apply the retry policy: if it says `Retry` this sleeps until the retry
 // time then returns `Ok(())`. If the policy says `DoNotRetry` it returns
 // a `PartEvent::Failed` for the caller to surface/handle.
+/// First byte covered by a `Content-Range: bytes START-END/TOTAL` header.
+///
+/// A malformed or absent header yields `None`, which the caller treats as
+/// "unverifiable" rather than "wrong": the status code already established
+/// that this is a range response, and some servers omit the header.
+fn content_range_start(resp: &reqwest::Response) -> Option<u64> {
+    let value = resp.headers().get(CONTENT_RANGE)?.to_str().ok()?;
+    let (unit, spec) = value.split_once(' ')?;
+    if !unit.eq_ignore_ascii_case("bytes") {
+        return None;
+    }
+    spec.split_once('-')?.0.trim().parse().ok()
+}
+
+/// Why a successful response to a ranged request cannot be used as part data.
+///
+/// `200` means the server ignored `Range` and is sending the file from byte
+/// zero. That body is usable only when the part *is* the whole file and
+/// nothing has been written yet — the single-connection first attempt, where
+/// what arrives is exactly what was asked for. In every other case the bytes
+/// belong at offset zero and would be written somewhere else.
+///
+/// A `206` whose window starts anywhere but where we asked is the same
+/// problem wearing a correct status code.
+fn range_mismatch(
+    resp: &reqwest::Response,
+    instruction: &Download,
+    want_start: u64,
+) -> Option<ServerConflict> {
+    match resp.status() {
+        StatusCode::PARTIAL_CONTENT => match content_range_start(resp) {
+            Some(start) if start != want_start => Some(ServerConflict::FileChanged),
+            _ => None,
+        },
+        StatusCode::OK => {
+            let whole_file_from_the_start =
+                want_start == 0 && instruction.size() == resp.content_length();
+            if whole_file_from_the_start {
+                None
+            } else {
+                Some(ServerConflict::NotResumable)
+            }
+        }
+        // Any other 2xx answers a question we did not ask.
+        _ => Some(ServerConflict::NotResumable),
+    }
+}
+
 async fn retry_sleep_or_fail_part(
     policy: &FixedThenExponentialRetry,
     _attempts_for_policy: u32,
