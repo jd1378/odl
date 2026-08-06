@@ -25,13 +25,122 @@ pub enum HashDigest {
     MD5(String, HashEncoding),
 }
 
+/// Bytes read per call while hashing.
+///
+/// Sized against syscall overhead rather than memory: at 8 KiB a gigabyte
+/// costs some 131,000 reads, which dominated the hashing itself. Nothing is
+/// held beyond one buffer, so a file of any size is hashed in a few megabytes
+/// of resident memory either way.
+const HASH_READ_BUFFER: usize = 256 * 1024;
+
 impl HashDigest {
+    /// The digest itself, in whatever encoding this value carries.
+    pub fn digest(&self) -> &str {
+        match self {
+            HashDigest::MD5(s, _)
+            | HashDigest::SHA1(s, _)
+            | HashDigest::SHA256(s, _)
+            | HashDigest::SHA384(s, _)
+            | HashDigest::SHA512(s, _) => s,
+        }
+    }
+
+    /// Which algorithm produced this digest.
+    pub fn algorithm(&self) -> HashAlgorithm {
+        HashAlgorithm::from(self)
+    }
+
+    /// How [`Self::digest`] is written.
+    pub fn encoding(&self) -> HashEncoding {
+        HashEncoding::from(self)
+    }
+
+    /// The digest as raw bytes, whatever encoding it is written in.
+    ///
+    /// `None` when the text is not valid for its stated encoding, which is
+    /// possible for a value parsed from a server header or a config file.
+    pub fn raw_bytes(&self) -> Option<Vec<u8>> {
+        match self.encoding() {
+            HashEncoding::Hex => {
+                let s = self.digest();
+                if !s.len().is_multiple_of(2) {
+                    return None;
+                }
+                (0..s.len())
+                    .step_by(2)
+                    .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
+                    .collect()
+            }
+            HashEncoding::Base64 => general_purpose::STANDARD.decode(self.digest()).ok(),
+        }
+    }
+
+    /// Whether two digests assert the same thing.
+    ///
+    /// Unlike `==`, this ignores how each is written: the same SHA-256 in hex
+    /// and in base64 are equal here and not under `PartialEq`, which compares
+    /// the text. Servers and config files disagree about encoding often
+    /// enough that comparing them literally is a trap.
+    pub fn matches(&self, other: &HashDigest) -> bool {
+        if self.algorithm() != other.algorithm() {
+            return false;
+        }
+        if self.encoding() == other.encoding() {
+            // Hex casing is not significant, and everything else is exact.
+            return self.digest().eq_ignore_ascii_case(other.digest());
+        }
+        match (self.raw_bytes(), other.raw_bytes()) {
+            (Some(a), Some(b)) => a == b,
+            // An undecodable digest asserts nothing; treating it as a match
+            // would turn a malformed value into a passing check.
+            _ => false,
+        }
+    }
+
+    /// Hash a file, reading it in chunks rather than loading it.
+    pub async fn from_path(
+        path: impl AsRef<std::path::Path>,
+        algo: HashAlgorithm,
+        encoding: HashEncoding,
+    ) -> async_io::Result<HashDigest> {
+        // No `BufReader`: the hashing loop reads in large blocks already, and
+        // layering a smaller buffer under it would only add a copy.
+        let file = tokio::fs::File::open(path.as_ref()).await?;
+        Self::from_reader_with_algorithm(file, algo, encoding).await
+    }
+
+    /// Whether the file at `path` has the digest `expected` claims.
+    ///
+    /// The file is hashed with `expected`'s own algorithm, so a caller only
+    /// needs the value they were given — from a release listing, a header, or
+    /// a user — and never has to restate the algorithm separately.
+    ///
+    /// ```no_run
+    /// # async fn example() -> std::io::Result<()> {
+    /// use odl::hash::HashDigest;
+    /// let expected = HashDigest::parse_cli("sha256:abc…").expect("a valid digest");
+    /// if !HashDigest::verify_file("/tmp/thing.bin", &expected).await? {
+    ///     eprintln!("that is not the file it claims to be");
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn verify_file(
+        path: impl AsRef<std::path::Path>,
+        expected: &HashDigest,
+    ) -> async_io::Result<bool> {
+        let actual = Self::from_path(path, expected.algorithm(), expected.encoding()).await?;
+        Ok(actual.matches(expected))
+    }
+
     /// Hashes the contents of an async reader using the specified Digest type (async).
     async fn hash_reader<D: Digest + Default + Unpin>(
         mut reader: impl AsyncRead + Unpin,
     ) -> async_io::Result<D> {
         let mut hasher = D::default();
-        let mut buf = [0u8; 8192];
+        // Heap rather than the stack: this buffer lives inside the returned
+        // future, and a large array there would be copied around with it.
+        let mut buf = vec![0u8; HASH_READ_BUFFER];
         loop {
             let n = reader.read(&mut buf).await?;
             if n == 0 {
@@ -280,20 +389,11 @@ mod tests {
     use tokio::io::BufReader as AsyncBufReader;
 
     async fn hash_hex_async(algo: HashAlgorithm, data: &[u8]) -> String {
-        let digest = HashDigest::from_reader_with_algorithm(
-            AsyncBufReader::new(data),
-            algo,
-            HashEncoding::Hex,
-        )
-        .await
-        .unwrap();
-        match digest {
-            HashDigest::MD5(s, _)
-            | HashDigest::SHA1(s, _)
-            | HashDigest::SHA256(s, _)
-            | HashDigest::SHA384(s, _)
-            | HashDigest::SHA512(s, _) => s,
-        }
+        HashDigest::from_reader_with_algorithm(AsyncBufReader::new(data), algo, HashEncoding::Hex)
+            .await
+            .unwrap()
+            .digest()
+            .to_owned()
     }
 
     #[tokio::test]
@@ -407,5 +507,79 @@ mod tests {
             }
             _ => panic!("Unexpected digest variant"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_file_can_be_hashed_by_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("payload");
+        tokio::fs::write(&path, b"hello world").await.unwrap();
+
+        let digest = HashDigest::from_path(&path, HashAlgorithm::SHA256, HashEncoding::Hex)
+            .await
+            .unwrap();
+        assert_eq!(
+            digest.digest(),
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
+        assert_eq!(digest.algorithm(), HashAlgorithm::SHA256);
+        assert_eq!(digest.encoding(), HashEncoding::Hex);
+    }
+
+    #[tokio::test]
+    async fn verifying_a_file_uses_the_expectation_s_own_algorithm() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("payload");
+        tokio::fs::write(&path, b"hello world").await.unwrap();
+
+        let expected = HashDigest::parse_cli(
+            "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
+        )
+        .unwrap();
+        assert!(HashDigest::verify_file(&path, &expected).await.unwrap());
+
+        let wrong = HashDigest::parse_cli(&format!("sha256:{}", "00".repeat(32))).unwrap();
+        assert!(!HashDigest::verify_file(&path, &wrong).await.unwrap());
+    }
+
+    #[test]
+    fn the_same_hash_written_two_ways_still_matches() {
+        // A server may send base64 where a config file holds hex. Comparing
+        // the text would call those different and fail a good download.
+        let hex = HashDigest::SHA256(
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9".to_owned(),
+            HashEncoding::Hex,
+        );
+        let b64 = HashDigest::SHA256(
+            "uU0nuZNNPgilLlLX2n2r+sSE7+N6U4DukIj3rOLvzek=".to_owned(),
+            HashEncoding::Base64,
+        );
+        assert!(hex.matches(&b64));
+        assert!(b64.matches(&hex));
+        assert_ne!(hex, b64, "`==` still compares the written form");
+
+        // Hex casing is not meaningful.
+        let upper = HashDigest::SHA256(hex.digest().to_uppercase(), HashEncoding::Hex);
+        assert!(hex.matches(&upper));
+    }
+
+    #[test]
+    fn a_different_algorithm_never_matches() {
+        let a = HashDigest::SHA256("aa".repeat(32), HashEncoding::Hex);
+        let b = HashDigest::SHA512("aa".repeat(32), HashEncoding::Hex);
+        assert!(!a.matches(&b));
+    }
+
+    #[test]
+    fn an_undecodable_digest_asserts_nothing() {
+        // Treating garbage as a match would turn a malformed value into a
+        // passing check, which is the opposite of what a checksum is for.
+        let broken = HashDigest::SHA256("not-hex!!".to_owned(), HashEncoding::Hex);
+        let real = HashDigest::SHA256(
+            "uU0nuZNNPgilLlLX2n2r+sSE7+N6U4DukIj3rOLvzek=".to_owned(),
+            HashEncoding::Base64,
+        );
+        assert!(!broken.matches(&real));
+        assert!(broken.raw_bytes().is_none());
     }
 }

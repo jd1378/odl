@@ -323,6 +323,31 @@ with:
 The canonical skill lives at `plugins/odl/skills/odl/`;
 `.claude/skills/odl` is a symlink to it for in-repo dogfooding.
 
+## Checksums
+
+The hashing used to verify downloads is part of the public API, so a program
+that already depends on odl need not pull in a second crate to check a file:
+
+```rust
+use odl::hash::{HashAlgorithm, HashDigest, HashEncoding};
+
+// Hash a file, reading it in chunks rather than loading it.
+let digest = HashDigest::from_path("big.iso", HashAlgorithm::SHA256, HashEncoding::Hex).await?;
+println!("{}", digest.digest());
+
+// Or check one against a value you were given, in whatever form it came.
+let expected = HashDigest::parse_cli("sha256:b94d27b9…")?;   // also `sha256:base64:uU0nuZ…`
+if !HashDigest::verify_file("big.iso", &expected).await? {
+    eprintln!("that is not the file it claims to be");
+}
+```
+
+`verify_file` hashes with the expectation's own algorithm, so you only need the
+value you were handed. Compare digests with `matches` rather than `==`: the
+same hash written as hex and as base64 is equal under the former and not the
+latter, and servers and config files disagree about encoding often enough for
+that to matter.
+
 ## Library Usage
 
 ```no_run

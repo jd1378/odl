@@ -5,8 +5,6 @@ use crate::{
     hash::HashDigest,
 };
 
-use tokio::io::BufReader;
-
 /// can return OdlError::StdIoError of file not found kind
 pub async fn check_final_file_checksum(
     metadata: &DownloadMetadata,
@@ -49,8 +47,7 @@ pub async fn check_final_file_checksum(
                 })
             })?;
             let file = tokio::fs::File::open(&final_path).await?;
-            let reader = BufReader::new(file);
-            let actual = HashDigest::from_reader(reader, &expected)
+            let actual = HashDigest::from_reader(file, &expected)
                 .await
                 .map_err(|e| OdlError::StdIoError {
                     e,
@@ -60,7 +57,10 @@ pub async fn check_final_file_checksum(
                     )),
                 })?;
 
-            if actual != expected {
+            // Compared by value rather than by text: the two are computed in
+            // the same encoding here, but saying so explicitly means a future
+            // change of source cannot turn a good file into a mismatch.
+            if !actual.matches(&expected) {
                 return Err(OdlError::Conflict(ConflictError::ChecksumMismatch {
                     expected: format!("{:?}", expected),
                     actual: format!("{:?}", actual),
