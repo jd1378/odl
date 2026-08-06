@@ -1273,6 +1273,11 @@ async fn build_download_manager(args: &Args) -> Result<DownloadManager, OdlError
     if args.no_verify_checksums {
         dl_b.verify_checksums(false);
     }
+    // Same shape: a flag that is only ever turned *on* from the command line,
+    // so its absence leaves a config that asked for it alone.
+    if args.ascii_filenames {
+        dl_b.ascii_filenames(true);
+    }
     if let Some(v) = connect_timeout {
         dl_b.connect_timeout(Some(v));
     }

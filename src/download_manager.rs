@@ -450,11 +450,8 @@ impl DownloadManager {
             self.config.download_dir(),
             save_dir,
             info,
-            opts.max_connections(),
-            opts.use_server_time(),
             credentials,
-            Option::<Proxy>::from(opts),
-            Some(HeaderMap::from(opts)),
+            opts,
         );
 
         ctx.emit(ProgressEvent::PhaseChanged(Phase::ResolvingConflicts));
@@ -536,11 +533,8 @@ impl DownloadManager {
             self.config.download_dir(),
             save_dir,
             info,
-            opts.max_connections(),
-            opts.use_server_time(),
             credentials,
-            Option::<Proxy>::from(opts),
-            Some(HeaderMap::from(opts)),
+            opts,
         );
 
         ctx.emit(ProgressEvent::PhaseChanged(Phase::ResolvingConflicts));

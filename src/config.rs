@@ -43,6 +43,7 @@ mod defaults {
     pub fn default_rampup_delay_min() -> Duration { Duration::from_millis(300) }
     pub fn default_rampup_delay_max() -> Duration { Duration::from_millis(1000) }
     pub fn default_verify_checksums() -> bool { true }
+    pub fn default_ascii_filenames() -> bool { false }
     pub fn default_ytdlp_enabled() -> bool { true }
     pub fn default_ytdlp_binary_path() -> Option<PathBuf> { None }
     pub fn default_ytdlp_ffmpeg_path() -> Option<PathBuf> { None }
@@ -169,6 +170,13 @@ pub struct DownloadOptions {
     /// and catches a truncated download.
     #[serde(default = "default_verify_checksums")]
     verify_checksums: bool,
+
+    /// Transliterate filenames to ASCII, so `Café` is saved as `Cafe`.
+    ///
+    /// Off by default: it is lossy, and it renames the per-download directory,
+    /// which strands the partial data of anything already in flight.
+    #[serde(default = "default_ascii_filenames")]
+    ascii_filenames: bool,
 }
 
 impl From<DownloadOptions> for DownloadOptionsBuilder {
@@ -192,7 +200,8 @@ impl From<DownloadOptions> for DownloadOptionsBuilder {
             .rampup_batch_size(o.rampup_batch_size)
             .rampup_delay_min(o.rampup_delay_min)
             .rampup_delay_max(o.rampup_delay_max)
-            .verify_checksums(o.verify_checksums);
+            .verify_checksums(o.verify_checksums)
+            .ascii_filenames(o.ascii_filenames);
         b
     }
 }
@@ -219,6 +228,7 @@ impl Default for DownloadOptions {
             rampup_delay_min: default_rampup_delay_min(),
             rampup_delay_max: default_rampup_delay_max(),
             verify_checksums: default_verify_checksums(),
+            ascii_filenames: default_ascii_filenames(),
         }
     }
 }
@@ -285,6 +295,9 @@ impl DownloadOptions {
     }
     pub fn verify_checksums(&self) -> bool {
         self.verify_checksums
+    }
+    pub fn ascii_filenames(&self) -> bool {
+        self.ascii_filenames
     }
 
     /// Convert into a [`DownloadOptionsBuilder`] pre-populated with this
@@ -841,6 +854,7 @@ M-Header = "m"
                 Some(m)
             })
             .http2(true)
+            .ascii_filenames(true)
             .build()
             .unwrap()
     }
@@ -863,6 +877,7 @@ M-Header = "m"
         );
         assert_eq!(round.proxy(), original.proxy());
         assert_eq!(round.use_server_time(), original.use_server_time());
+        assert_eq!(round.ascii_filenames(), original.ascii_filenames());
         assert_eq!(
             round.accept_invalid_certs(),
             original.accept_invalid_certs()

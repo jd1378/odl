@@ -75,6 +75,31 @@ all reachable from a title odl does not control:
 - Names made only of dots or spaces sanitised to nothing, and an empty
   component resolves to its own parent directory.
 
+### ASCII filenames, on request
+
+`ascii_filenames = true` / `--ascii-filenames` transliterates a name to ASCII
+before sanitising it: `Café Münster` saves as `Cafe Munster`, `Приветствие` as
+`Privetstvie`, `中文标题` as `Zhong Wen Biao Ti`. Every script, not just
+accented Latin, via `deunicode`.
+
+Off by default, and deliberately so: it is lossy, and it renames the
+per-download directory, so switching it makes a download already in progress
+start over instead of resuming.
+
+### Part responses are validated
+
+A part's `GET` used to be streamed to disk without anyone looking at its
+status. A server that stopped honouring `Range` and answered `200` with the
+whole file had that body written at each part's offset — a file of the right
+length, the wrong contents, and exit code 0. A `5xx` error page was written as
+part data, and multi-part it looped forever, counting the error page as
+progress and ignoring `--max-retries 0`.
+
+Now a ranged request must be answered `206` from the offset it asked for.
+Anything else is a conflict rather than data. The one exception is the case
+that has to keep working: a single connection, nothing downloaded yet, where
+`200` returns exactly the bytes requested.
+
 ### Breaking changes
 
 Metadata written by 1.x still loads — the engine discriminant defaults to
@@ -91,4 +116,11 @@ Metadata written by 1.x still loads — the engine discriminant defaults to
 - `quick_evaluate` returns an instruction marked `Engine::Unresolved`, which
   `download` refuses. It never could produce a correct media download; now it
   says so instead of quietly fetching the web page.
+- `Download::from_response_info` takes `&DownloadOptions` in place of
+  `max_connections`, `use_server_time`, `proxy` and `headers`. Those all came
+  off the same options value at every call site, and a positional run of
+  same-typed arguments is a swap waiting to happen.
+- `fs_utils::cleanup_filename` takes a second argument selecting
+  transliteration. Pass `false` for the previous behaviour.
+- `YtdlpSpec` gained `video_id` and `ascii_filenames`.
 - Minimum supported Rust version is declared: 1.88.

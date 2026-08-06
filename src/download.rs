@@ -1,4 +1,5 @@
 use crate::{
+    config::DownloadOptions,
     credentials::Credentials,
     download_metadata::{
         DownloadEngine, DownloadMetadata, EngineDetails, FileChecksum, PartDetails, ResponseHeader,
@@ -197,6 +198,8 @@ pub struct YtdlpSpec {
     /// described to a person once the format list is gone.
     pub quality: Quality,
     pub use_server_time: bool,
+    /// Transliterate the title to ASCII before it becomes a path component.
+    pub ascii_filenames: bool,
     pub proxy: Option<Proxy>,
     pub headers: Option<HeaderMap>,
 }
@@ -645,6 +648,7 @@ impl Download {
             size_is_approx,
             quality,
             use_server_time,
+            ascii_filenames,
             proxy,
             headers,
         } = spec;
@@ -658,8 +662,8 @@ impl Download {
             Quality::Subtitles { .. } | Quality::Unknown { .. } => (None, None, None, false),
         };
 
-        let dir_name = fs_utils::cleanup_filename(&title);
-        let filename = fs_utils::cleanup_filename(&format!("{title}.{ext}"));
+        let dir_name = fs_utils::cleanup_filename(&title, ascii_filenames);
+        let filename = fs_utils::cleanup_filename(&format!("{title}.{ext}"), ascii_filenames);
 
         Self {
             download_dir: download_root.join(&dir_name),
@@ -715,18 +719,24 @@ impl Download {
         self.engine_details = None;
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Everything the transfer needs beyond the probe result is taken from
+    /// `opts` rather than passed alongside it: the settings travel together,
+    /// and a positional list of same-typed knobs is a swap waiting to happen.
     pub fn from_response_info(
         download_dir: &std::path::Path,
         save_dir: path::PathBuf,
         response_info: ResponseInfo,
-        max_connections: u64,
-        use_server_time: bool,
         credentials: Option<Credentials>,
-        proxy: Option<Proxy>,
-        headers: Option<HeaderMap>,
+        opts: &DownloadOptions,
     ) -> Download {
-        let filename = fs_utils::cleanup_filename(response_info.extract_filename().as_str());
+        let max_connections = opts.max_connections();
+        let use_server_time = opts.use_server_time();
+        let proxy = Option::<Proxy>::from(opts);
+        let headers = Some(HeaderMap::from(opts));
+        let filename = fs_utils::cleanup_filename(
+            response_info.extract_filename().as_str(),
+            opts.ascii_filenames(),
+        );
         // Empty means no probe was made (`quick_evaluate`), not "server sent
         // nothing" — keep that distinguishable for downstream consumers.
         let response_headers = {

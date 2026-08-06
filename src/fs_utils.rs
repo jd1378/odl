@@ -29,8 +29,24 @@ static FORBIDDEN_WINDOWS_NAMES: &[&str] = &[
 ///
 /// This function replaces all forbidden characters with '_', and trims leading/trailing whitespace and dots,
 /// which can cause issues on Windows (e.g., filenames ending with a dot or space are not allowed).
-pub fn cleanup_filename(input: &str) -> String {
-    let mut result = String::from(input);
+/// Transliteration to ASCII, when `to_ascii` is set, happens before anything
+/// else — it can itself introduce characters this must then sanitise.
+///
+/// Transliteration is opt-in and off by default, because it is lossy in a way
+/// sanitising is not: `Café` and `Cafe` become the same name, and so do two
+/// titles that differ only in a script this collapses. It is also the key the
+/// per-download directory is named after, so turning it on renames the
+/// directory of anything already in flight and strands its partial data.
+///
+/// What it buys is a name that is byte-identical everywhere — no locale, no
+/// filesystem normalisation, no console that cannot render it — which is why
+/// it exists as a choice rather than not at all.
+pub fn cleanup_filename(input: &str, to_ascii: bool) -> String {
+    let mut result = if to_ascii {
+        deunicode::deunicode(input)
+    } else {
+        String::from(input)
+    };
     result = result
         .chars()
         .map(|c| match c {
@@ -209,58 +225,73 @@ mod tests {
     #[test]
     fn test_cleanup_filename_basic() {
         assert_eq!(
-            cleanup_filename("normal_filename.txt"),
+            cleanup_filename("normal_filename.txt", false),
             "normal_filename.txt"
         );
         assert_eq!(
-            cleanup_filename("file/with/slash.txt"),
+            cleanup_filename("file/with/slash.txt", false),
             "file_with_slash.txt"
         );
         assert_eq!(
-            cleanup_filename("file\\with\\backslash.txt"),
+            cleanup_filename("file\\with\\backslash.txt", false),
             "file_with_backslash.txt"
         );
         assert_eq!(
-            cleanup_filename("file:with:colon.txt"),
+            cleanup_filename("file:with:colon.txt", false),
             "file_with_colon.txt"
         );
         assert_eq!(
-            cleanup_filename("file*with*asterisk.txt"),
+            cleanup_filename("file*with*asterisk.txt", false),
             "file_with_asterisk.txt"
         );
         assert_eq!(
-            cleanup_filename("file?with?question.txt"),
+            cleanup_filename("file?with?question.txt", false),
             "file_with_question.txt"
         );
         assert_eq!(
-            cleanup_filename("file\"with\"quote.txt"),
+            cleanup_filename("file\"with\"quote.txt", false),
             "file_with_quote.txt"
         );
-        assert_eq!(cleanup_filename("file<with<less.txt"), "file_with_less.txt");
         assert_eq!(
-            cleanup_filename("file>with>greater.txt"),
+            cleanup_filename("file<with<less.txt", false),
+            "file_with_less.txt"
+        );
+        assert_eq!(
+            cleanup_filename("file>with>greater.txt", false),
             "file_with_greater.txt"
         );
-        assert_eq!(cleanup_filename("file|with|pipe.txt"), "file_with_pipe.txt");
         assert_eq!(
-            cleanup_filename("file^with^caret.txt"),
+            cleanup_filename("file|with|pipe.txt", false),
+            "file_with_pipe.txt"
+        );
+        assert_eq!(
+            cleanup_filename("file^with^caret.txt", false),
             "file_with_caret.txt"
         );
     }
 
     #[test]
     fn test_cleanup_filename_trim() {
-        assert_eq!(cleanup_filename("   filename.txt   "), "filename.txt");
-        assert_eq!(cleanup_filename("...filename.txt..."), "filename.txt");
-        assert_eq!(cleanup_filename("   ...filename.txt...   "), "filename.txt");
+        assert_eq!(
+            cleanup_filename("   filename.txt   ", false),
+            "filename.txt"
+        );
+        assert_eq!(
+            cleanup_filename("...filename.txt...", false),
+            "filename.txt"
+        );
+        assert_eq!(
+            cleanup_filename("   ...filename.txt...   ", false),
+            "filename.txt"
+        );
     }
 
     #[test]
     fn test_cleanup_filename_forbidden_windows_names() {
         for &name in FORBIDDEN_WINDOWS_NAMES {
-            assert_eq!(cleanup_filename(name), format!("{name}_"));
+            assert_eq!(cleanup_filename(name, false), format!("{name}_"));
             assert_eq!(
-                cleanup_filename(&name.to_ascii_lowercase()),
+                cleanup_filename(&name.to_ascii_lowercase(), false),
                 format!("{}_", name.to_ascii_lowercase())
             );
         }
@@ -269,13 +300,13 @@ mod tests {
     #[test]
     fn test_cleanup_filename_control_chars() {
         let input = "file\u{0000}name.txt";
-        assert_eq!(cleanup_filename(input), "file_name.txt");
+        assert_eq!(cleanup_filename(input, false), "file_name.txt");
     }
 
     #[test]
     fn test_cleanup_filename_truncate() {
         let long_name = "a".repeat(300);
-        let cleaned = cleanup_filename(&long_name);
+        let cleaned = cleanup_filename(&long_name, false);
         assert_eq!(cleaned.len(), 255);
     }
 
@@ -422,7 +453,7 @@ mod tests {
         let title = "داستان کامل سامانه نان ".repeat(12);
         assert!(title.len() > MAX_FILENAME_BYTES);
 
-        let out = cleanup_filename(&title);
+        let out = cleanup_filename(&title, false);
         assert!(out.len() <= MAX_FILENAME_BYTES);
         assert!(!out.is_empty());
         // Still valid text, and still the beginning of the title.
@@ -433,7 +464,7 @@ mod tests {
     fn truncation_does_not_leave_a_trailing_dot_or_space() {
         // Windows rejects both, and cutting a long name can expose either.
         let title = format!("{}. more", "a".repeat(MAX_FILENAME_BYTES - 1));
-        let out = cleanup_filename(&title);
+        let out = cleanup_filename(&title, false);
         assert!(!out.ends_with('.') && !out.ends_with(' '), "got {out:?}");
     }
 
@@ -441,12 +472,12 @@ mod tests {
     fn reserved_windows_names_are_escaped_even_with_an_extension() {
         // `NUL.mkv` is as reserved as `NUL`, and a media file always has an
         // extension — checking only the whole string missed every real case.
-        assert_eq!(cleanup_filename("NUL.mkv"), "NUL.mkv_");
-        assert_eq!(cleanup_filename("con.txt"), "con.txt_");
-        assert_eq!(cleanup_filename("COM1.mp4"), "COM1.mp4_");
+        assert_eq!(cleanup_filename("NUL.mkv", false), "NUL.mkv_");
+        assert_eq!(cleanup_filename("con.txt", false), "con.txt_");
+        assert_eq!(cleanup_filename("COM1.mp4", false), "COM1.mp4_");
         // Names that merely start with those letters are fine.
-        assert_eq!(cleanup_filename("console.log"), "console.log");
-        assert_eq!(cleanup_filename("NULL.mkv"), "NULL.mkv");
+        assert_eq!(cleanup_filename("console.log", false), "console.log");
+        assert_eq!(cleanup_filename("NULL.mkv", false), "NULL.mkv");
     }
 
     #[test]
@@ -455,13 +486,42 @@ mod tests {
         // itself, so this must never return "".
         for input in ["...", "   ", ".", " . . ", ""] {
             assert_eq!(
-                cleanup_filename(input),
+                cleanup_filename(input, false),
                 FALLBACK_FILENAME,
                 "{input:?} must not sanitise to an empty name"
             );
         }
         // A name made only of forbidden characters still has content.
-        assert_eq!(cleanup_filename("///"), "___");
+        assert_eq!(cleanup_filename("///", false), "___");
+    }
+
+    #[test]
+    fn transliteration_is_off_unless_asked_for() {
+        // The default must stay byte-identical: the sanitised title is the
+        // per-download directory name, so changing it strands partial data.
+        assert_eq!(cleanup_filename("Café Münster", false), "Café Münster");
+        assert_eq!(cleanup_filename("日本語", false), "日本語");
+    }
+
+    #[test]
+    fn transliteration_reaches_every_script() {
+        assert_eq!(cleanup_filename("Café Münster", true), "Cafe Munster");
+        assert_eq!(cleanup_filename("Приветствие", true), "Privetstvie");
+        assert_eq!(cleanup_filename("Tiếng Việt", true), "Tieng Viet");
+        for name in ["日本語", "한국어", "Ελληνικά", "داستان"] {
+            let out = cleanup_filename(name, true);
+            assert!(out.is_ascii(), "{name} transliterated to {out:?}");
+            assert_ne!(out, FALLBACK_FILENAME, "{name} produced nothing");
+        }
+    }
+
+    #[test]
+    fn transliteration_output_is_still_sanitised() {
+        // Transliteration runs first precisely because it can emit characters
+        // the sanitiser then has to deal with — a colon is illegal on Windows,
+        // and a name that transliterates to nothing must still get a name.
+        assert!(!cleanup_filename("🎬 ⁄ 🎵", true).contains([':', '/', '\\']));
+        assert_eq!(cleanup_filename("。。。", true), FALLBACK_FILENAME);
     }
 
     #[test]
@@ -469,6 +529,6 @@ mod tests {
         // The leading trim guarantees a non-dot first character, so cutting
         // and re-trimming always leaves at least that one.
         let input = format!("a{}b", ".".repeat(300));
-        assert_eq!(cleanup_filename(&input), "a");
+        assert_eq!(cleanup_filename(&input, false), "a");
     }
 }

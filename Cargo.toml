@@ -51,6 +51,7 @@ toml = "1"
 indexmap = { version = "2", features = ["serde"] }
 humantime = "2"
 reflink-copy = { version = "0.1.29", features = ["tracing"] }
+deunicode = "1.6.2"
 
 [target.'cfg(windows)'.dependencies]
 # Job Objects are the only reliable way to tear down a spawned yt-dlp together

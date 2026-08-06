@@ -352,6 +352,22 @@ file to act on them, leaving that to `verify_file` whenever it suits. Use
 checked either way, since that costs one `stat` and catches a truncated
 download.
 
+### ASCII filenames
+
+`ascii_filenames = true` (or `--ascii-filenames`) transliterates a filename to
+ASCII before it is sanitised: `Café Münster` is saved as `Cafe Munster`,
+`Приветствие` as `Privetstvie`, and `中文标题` as `Zhong Wen Biao Ti`. Every
+script is covered, not just accented Latin.
+
+It is off by default, and worth understanding before turning it on. It is
+lossy — `Café` and `Cafe` collapse to one name, as do titles that differ only
+in something the transliteration flattens. It is also the name of the
+per-download directory, so switching it renames that directory and a download
+already in progress under the other setting starts over rather than resuming.
+
+What it buys is a name that is byte-identical everywhere: no locale, no
+filesystem normalisation, and no terminal that cannot render it.
+
 `verify_file` hashes with the expectation's own algorithm, so you only need the
 value you were handed. Compare digests with `matches` rather than `==`: the
 same hash written as hex and as base64 is equal under the former and not the

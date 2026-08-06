@@ -261,6 +261,15 @@ pub struct Args {
     #[arg(long)]
     pub no_verify_checksums: bool,
 
+    /// Transliterate filenames to ASCII: `Café` is saved as `Cafe`, and a
+    /// title in any script becomes something every terminal and filesystem
+    /// renders the same way.
+    ///
+    /// Lossy, and it renames the per-download directory — a download already
+    /// in progress under the other setting starts over.
+    #[arg(long)]
+    pub ascii_filenames: bool,
+
     /// Download this exact media format instead of asking or picking the best.
     /// Naming a different format than a download already started discards what
     /// was downloaded and starts over, since encodings cannot be joined.

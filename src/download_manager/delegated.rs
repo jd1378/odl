@@ -227,8 +227,12 @@ mod imp {
         can_merge: bool,
         selector: Option<&dyn FormatSelector>,
         reselect: bool,
+        opts: &DownloadOptions,
     ) -> Result<String, OdlError> {
-        let dir = download_root.join(crate::fs_utils::cleanup_filename(&info.title));
+        let dir = download_root.join(crate::fs_utils::cleanup_filename(
+            &info.title,
+            opts.ascii_filenames(),
+        ));
         if !reselect
             && let Some(metadata) = existing_metadata(&dir).await
             && let Some(stored) = stored_ytdlp(&metadata)
@@ -307,6 +311,7 @@ mod imp {
             can_merge,
             selector,
             reselect_format,
+            opts,
         )
         .await?;
         let (size, size_is_approx) = info.size_for(&format_id);
@@ -326,6 +331,7 @@ mod imp {
                 size_is_approx,
                 quality,
                 use_server_time: opts.use_server_time(),
+                ascii_filenames: opts.ascii_filenames(),
                 proxy: Option::<Proxy>::from(opts),
                 headers: Some(HeaderMap::from(opts)),
             },
@@ -649,6 +655,7 @@ mod tests {
                     fps: None,
                 },
                 use_server_time: false,
+                ascii_filenames: false,
                 proxy: None,
                 headers: None,
             },
@@ -678,6 +685,7 @@ mod tests {
                         fps: None,
                     },
                     use_server_time: false,
+                    ascii_filenames: false,
                     proxy: None,
                     headers: None,
                 }
