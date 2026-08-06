@@ -34,17 +34,55 @@ pub struct EngineCapabilities {
     pub multi_file: bool,
 }
 
-/// Extension methods on the persisted engine discriminant.
-pub trait DownloadEngineExt {
-    fn capabilities(&self) -> EngineCapabilities;
-    /// Stable lowercase identifier, matching the proto enum value names.
-    fn as_str(&self) -> &'static str;
+/// Which engine moves a download's bytes.
+///
+/// Deliberately distinct from the persisted discriminant in
+/// [`crate::download_metadata::DownloadEngine`], which is generated code and
+/// therefore cannot be `non_exhaustive`. Exposing that type directly would
+/// make every future engine a breaking change for anyone matching on it —
+/// including exactly the consumers this enum exists to serve. Metadata still
+/// stores the generated value; the conversion happens at that boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Engine {
+    /// odl's own multipart HTTP downloader.
+    HttpMultipart,
+    /// The whole transfer delegated to an external `yt-dlp`.
+    Ytdlp,
+    /// Not evaluated yet, so which engine applies is still unknown.
+    Unresolved,
 }
 
-impl DownloadEngineExt for DownloadEngine {
-    fn capabilities(&self) -> EngineCapabilities {
+impl From<Engine> for DownloadEngine {
+    fn from(engine: Engine) -> Self {
+        match engine {
+            Engine::HttpMultipart => DownloadEngine::HttpMultipart,
+            Engine::Ytdlp => DownloadEngine::Ytdlp,
+            Engine::Unresolved => DownloadEngine::Unresolved,
+        }
+    }
+}
+
+impl From<DownloadEngine> for Engine {
+    fn from(engine: DownloadEngine) -> Self {
+        match engine {
+            DownloadEngine::HttpMultipart => Engine::HttpMultipart,
+            DownloadEngine::Ytdlp => Engine::Ytdlp,
+            DownloadEngine::Unresolved => Engine::Unresolved,
+        }
+    }
+}
+
+impl fmt::Display for Engine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Engine {
+    fn capabilities_of(&self) -> EngineCapabilities {
         match self {
-            DownloadEngine::HttpMultipart => EngineCapabilities {
+            Engine::HttpMultipart => EngineCapabilities {
                 multipart: true,
                 server_checksums: true,
                 response_headers: true,
@@ -54,7 +92,7 @@ impl DownloadEngineExt for DownloadEngine {
             // yt-dlp owns the transfer end to end: it uses one connection per
             // format, never surfaces the underlying HTTP exchange, and reports
             // an estimated size for adaptive formats.
-            DownloadEngine::Ytdlp => EngineCapabilities {
+            Engine::Ytdlp => EngineCapabilities {
                 multipart: false,
                 server_checksums: false,
                 response_headers: false,
@@ -64,7 +102,7 @@ impl DownloadEngineExt for DownloadEngine {
             // Nothing is known until the URL is evaluated, so nothing can be
             // promised. A UI should render such a row as pending rather than
             // as a download missing its details.
-            DownloadEngine::Unresolved => EngineCapabilities {
+            Engine::Unresolved => EngineCapabilities {
                 multipart: false,
                 server_checksums: false,
                 response_headers: false,
@@ -74,11 +112,17 @@ impl DownloadEngineExt for DownloadEngine {
         }
     }
 
-    fn as_str(&self) -> &'static str {
+    /// What this engine is able to report about a download.
+    pub fn capabilities(&self) -> EngineCapabilities {
+        self.capabilities_of()
+    }
+
+    /// Stable lowercase identifier, matching the persisted enum's value names.
+    pub fn as_str(&self) -> &'static str {
         match self {
-            DownloadEngine::HttpMultipart => "http_multipart",
-            DownloadEngine::Ytdlp => "ytdlp",
-            DownloadEngine::Unresolved => "unresolved",
+            Engine::HttpMultipart => "http_multipart",
+            Engine::Ytdlp => "ytdlp",
+            Engine::Unresolved => "unresolved",
         }
     }
 }
@@ -90,15 +134,16 @@ impl DownloadEngineExt for DownloadEngine {
 /// let a caller force an engine and get a hard error instead of a silent
 /// fallback when it is unusable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum EnginePreference {
     #[default]
     Auto,
-    Engine(DownloadEngine),
+    Engine(Engine),
 }
 
 impl EnginePreference {
     /// Engine explicitly requested by the caller, if any.
-    pub fn forced(&self) -> Option<DownloadEngine> {
+    pub fn forced(&self) -> Option<Engine> {
         match self {
             EnginePreference::Auto => None,
             EnginePreference::Engine(e) => Some(*e),
@@ -123,10 +168,8 @@ impl FromStr for EnginePreference {
             "auto" => Ok(EnginePreference::Auto),
             // `http` is accepted as the obvious short spelling of the default
             // engine; the canonical name stays `http_multipart`.
-            "http" | "http_multipart" => {
-                Ok(EnginePreference::Engine(DownloadEngine::HttpMultipart))
-            }
-            "ytdlp" | "yt-dlp" => Ok(EnginePreference::Engine(DownloadEngine::Ytdlp)),
+            "http" | "http_multipart" => Ok(EnginePreference::Engine(Engine::HttpMultipart)),
+            "ytdlp" | "yt-dlp" => Ok(EnginePreference::Engine(Engine::Ytdlp)),
             other => Err(format!(
                 "unknown engine {other:?} (expected one of: auto, http, ytdlp)"
             )),
@@ -156,11 +199,11 @@ mod tests {
         );
         assert_eq!(
             " HTTP ".parse::<EnginePreference>().unwrap(),
-            EnginePreference::Engine(DownloadEngine::HttpMultipart)
+            EnginePreference::Engine(Engine::HttpMultipart)
         );
         assert_eq!(
             "yt-dlp".parse::<EnginePreference>().unwrap(),
-            EnginePreference::Engine(DownloadEngine::Ytdlp)
+            EnginePreference::Engine(Engine::Ytdlp)
         );
         assert!("bittorrent".parse::<EnginePreference>().is_err());
     }
@@ -175,10 +218,21 @@ mod tests {
 
     #[test]
     fn delegated_engine_cannot_report_server_metadata() {
-        let caps = DownloadEngine::Ytdlp.capabilities();
+        let caps = Engine::Ytdlp.capabilities();
         assert!(!caps.server_checksums);
         assert!(!caps.response_headers);
         assert!(!caps.multipart);
-        assert!(DownloadEngine::HttpMultipart.capabilities().multipart);
+        assert!(Engine::HttpMultipart.capabilities().multipart);
+    }
+
+    #[test]
+    fn the_public_engine_round_trips_through_the_persisted_one() {
+        // Storage keeps the generated discriminant; the API keeps an enum we
+        // can extend. Neither is useful if they disagree.
+        for engine in [Engine::HttpMultipart, Engine::Ytdlp, Engine::Unresolved] {
+            let stored: DownloadEngine = engine.into();
+            assert_eq!(Engine::from(stored), engine);
+            assert_eq!(stored.as_str_name(), engine.as_str());
+        }
     }
 }

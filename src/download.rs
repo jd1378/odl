@@ -4,6 +4,7 @@ use crate::{
         DownloadEngine, DownloadMetadata, EngineDetails, FileChecksum, PartDetails, ResponseHeader,
         YtdlpDetails,
     },
+    engine::Engine,
     error::MetadataError,
     format::Quality,
     fs_utils,
@@ -117,8 +118,8 @@ pub struct Download {
     #[builder(default = false)]
     finished: bool,
     /// Which engine moves the bytes for this download.
-    #[builder(default = DownloadEngine::HttpMultipart)]
-    engine: DownloadEngine,
+    #[builder(default = Engine::HttpMultipart)]
+    engine: Engine,
     /// Engine-specific state. `HttpMultipart` keeps none — the fields above
     /// already are its state.
     #[builder(default = None)]
@@ -302,6 +303,29 @@ impl Download {
         self.filename = filename;
     }
 
+    /// Checksums this download will be verified against.
+    ///
+    /// Populated from whatever the server advertised during evaluation, plus
+    /// anything [`Self::add_checksums`] contributed.
+    pub fn checksums(&self) -> &[HashDigest] {
+        &self.checksums
+    }
+
+    /// Stop odl from verifying this download's contents.
+    ///
+    /// Hashing a large file costs real time, and a caller that wants to do it
+    /// on its own schedule — after the download returns, off the critical
+    /// path, with its own progress — should not pay for it twice. Read
+    /// [`Self::checksums`] first to keep what the server advertised, then
+    /// verify with [`crate::hash::HashDigest::verify_file`] when it suits.
+    ///
+    /// The final file's *size* is still checked: that costs one `stat` and
+    /// catches a truncated download, which is worth keeping whatever the
+    /// caller intends to do about contents.
+    pub fn clear_checksums(&mut self) {
+        self.checksums.clear();
+    }
+
     /// Merge additional expected checksums (e.g. user-supplied via CLI)
     /// into the instruction, skipping any already present. These are
     /// persisted to metadata and verified against the assembled file
@@ -396,7 +420,7 @@ impl Download {
     }
 
     /// Which engine moves the bytes for this download.
-    pub fn engine(&self) -> DownloadEngine {
+    pub fn engine(&self) -> Engine {
         self.engine
     }
 
@@ -548,7 +572,7 @@ impl Download {
             // An unrecognised discriminant means the file was written by a
             // newer odl. Falling back to the default engine would hand a
             // foreign download to the HTTP downloader, so refuse instead.
-            engine: DownloadEngine::try_from(metadata.engine).map_err(|_| {
+            engine: DownloadEngine::try_from(metadata.engine).map(Engine::from).map_err(|_| {
                 MetadataError::Other {
                     message: format!(
                         "unknown download engine {} in metadata; it was likely written by a newer version of odl",
@@ -591,7 +615,7 @@ impl Download {
             max_connections: self.max_connections,
             parts: self.parts.clone(),
             finished: self.finished,
-            engine: self.engine.into(),
+            engine: DownloadEngine::from(self.engine).into(),
             engine_details: self.engine_details.clone(),
         }
     }
@@ -660,7 +684,7 @@ impl Download {
             max_connections: 1,
             parts: Download::determine_parts(size, 1),
             finished: false,
-            engine: DownloadEngine::Ytdlp,
+            engine: Engine::Ytdlp,
             engine_details: Some(EngineDetails::YtdlpDetails(YtdlpDetails {
                 source_url: source_url.to_string(),
                 format_id,
@@ -682,7 +706,7 @@ impl Download {
     /// placeholder good enough to show in a queue, not something that can be
     /// downloaded. Evaluating the URL later produces a real instruction.
     pub(crate) fn mark_unresolved(&mut self) {
-        self.engine = DownloadEngine::Unresolved;
+        self.engine = Engine::Unresolved;
         self.engine_details = None;
     }
 
@@ -732,7 +756,7 @@ impl Download {
                 },
             ),
             finished: false,
-            engine: DownloadEngine::HttpMultipart,
+            engine: Engine::HttpMultipart,
             engine_details: None,
         }
     }
@@ -1352,7 +1376,7 @@ mod tests {
         let decoded = DownloadMetadata::decode(encoded.as_slice()).expect("decode");
         let download = Download::from_metadata(PathBuf::from("/tmp/dl"), decoded).expect("load");
 
-        assert_eq!(download.engine(), DownloadEngine::HttpMultipart);
+        assert_eq!(download.engine(), Engine::HttpMultipart);
         assert!(download.engine_details().is_none());
         assert!(!download.size_is_approx());
     }
@@ -1360,7 +1384,7 @@ mod tests {
     #[test]
     fn engine_details_round_trip_through_metadata() {
         let mut download = test_download(vec![]);
-        download.engine = DownloadEngine::Ytdlp;
+        download.engine = Engine::Ytdlp;
         download.engine_details = Some(EngineDetails::YtdlpDetails(YtdlpDetails {
             source_url: "https://www.youtube.com/watch?v=x".to_owned(),
             format_id: "137+251".to_owned(),
@@ -1376,7 +1400,7 @@ mod tests {
         let restored = Download::from_metadata(PathBuf::from("/tmp/dl"), download.as_metadata())
             .expect("load");
 
-        assert_eq!(restored.engine(), DownloadEngine::Ytdlp);
+        assert_eq!(restored.engine(), Engine::Ytdlp);
         let details = restored.ytdlp_details().expect("ytdlp details");
         // The pinned format is what makes a resume safe; losing it in a
         // round-trip would let a resume append bytes of a different format.
@@ -1393,5 +1417,23 @@ mod tests {
         let mut metadata = test_download(vec![]).as_metadata();
         metadata.engine = 9999;
         assert!(Download::from_metadata(PathBuf::from("/tmp/dl"), metadata).is_err());
+    }
+
+    #[tokio::test]
+    async fn checksums_can_be_taken_over_by_the_caller() {
+        use crate::hash::HashDigest;
+
+        let mut download = test_download(vec![
+            HashDigest::parse_cli(&format!("sha256:{}", "ab".repeat(32))).unwrap(),
+        ]);
+        // Readable, so a caller can keep what the server advertised before
+        // taking responsibility for checking it.
+        assert_eq!(download.checksums().len(), 1);
+
+        download.clear_checksums();
+        assert!(download.checksums().is_empty());
+        // And gone from what gets persisted, so a resume does not reinstate
+        // verification the caller opted out of.
+        assert!(download.as_metadata().checksums.is_empty());
     }
 }

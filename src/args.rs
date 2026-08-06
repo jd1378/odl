@@ -253,6 +253,14 @@ pub struct Args {
     #[arg(long, value_enum, default_value_t = ChooseFormat::Auto)]
     pub choose_format: ChooseFormat,
 
+    /// Skip verifying the finished file against known checksums.
+    ///
+    /// The checksums are still recorded and reported; odl just stops hashing
+    /// the file to act on them, which a caller may prefer to do itself. The
+    /// file's size is still checked.
+    #[arg(long)]
+    pub no_verify_checksums: bool,
+
     /// Download this exact media format instead of asking or picking the best.
     /// Naming a different format than a download already started discards what
     /// was downloaded and starts over, since encodings cannot be joined.

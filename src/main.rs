@@ -39,8 +39,7 @@ mod json;
 use args::{Args, LogLevel, OutputFormat};
 use json::JsonReporter;
 use odl::download_manager::DownloadStatus;
-use odl::download_metadata::DownloadEngine;
-use odl::engine::DownloadEngineExt;
+use odl::engine::Engine;
 use tracing::instrument;
 
 fn init_tracing(level: LogLevel) {
@@ -664,6 +663,9 @@ impl ProgressReporter for CliReporter {
                     format!("{}: {message}", self.describe_target()),
                 );
             }
+            // An engine may report something this build has no rendering for.
+            // Ignoring it keeps the display honest rather than guessing.
+            _ => {}
         }
     }
 }
@@ -1036,8 +1038,8 @@ async fn run(args: Args) -> Result<(), OdlError> {
 
     let engine_preference = match args.engine {
         args::EngineChoice::Auto => EnginePreference::Auto,
-        args::EngineChoice::Http => EnginePreference::Engine(DownloadEngine::HttpMultipart),
-        args::EngineChoice::Ytdlp => EnginePreference::Engine(DownloadEngine::Ytdlp),
+        args::EngineChoice::Http => EnginePreference::Engine(Engine::HttpMultipart),
+        args::EngineChoice::Ytdlp => EnginePreference::Engine(Engine::Ytdlp),
     };
 
     // Before anything is downloaded: if one of these links needs a helper that
@@ -1129,22 +1131,17 @@ async fn run(args: Args) -> Result<(), OdlError> {
                 // both would give one download two endings — the transcript
                 // showed "Cancelled" and "Failed: download cancelled" for a
                 // single Ctrl-C.
-                let mut instruction = match dlm
-                    .evaluate(EvaluateRequest {
-                        url,
-                        save_dir,
-                        conflict_resolver: &resolver,
-                        credentials,
-                        ctx: Some(&ctx),
-                        options: None,
-                        engine: engine_preference,
-                        format_selector: Some(&*format_selector),
-                        // Asking explicitly is also how a user changes the
-                        // quality of a download they already started.
-                        reselect_format,
-                    })
-                    .await
-                {
+                let mut request = EvaluateRequest::new(url, save_dir, &resolver)
+                    .ctx(&ctx)
+                    .engine(engine_preference)
+                    .format_selector(&*format_selector)
+                    // Asking explicitly is also how a user changes the quality
+                    // of a download already started.
+                    .reselect_format(reselect_format);
+                if let Some(c) = credentials {
+                    request = request.credentials(c);
+                }
+                let mut instruction = match dlm.evaluate(request).await {
                     Ok(instruction) => instruction,
                     Err(OdlError::Cancelled) => {
                         ctx.emit(ProgressEvent::Cancelled);
@@ -1161,13 +1158,8 @@ async fn run(args: Args) -> Result<(), OdlError> {
                     instruction.set_filename(filename);
                 }
                 instruction.add_checksums(expected_checksums);
-                dlm.download(DownloadRequest {
-                    instruction,
-                    conflict_resolver: &resolver,
-                    ctx: Some(&ctx),
-                    options: None,
-                })
-                .await
+                dlm.download(DownloadRequest::new(instruction, &resolver).ctx(&ctx))
+                    .await
             }
             .await;
             result
@@ -1276,6 +1268,11 @@ async fn build_download_manager(args: &Args) -> Result<DownloadManager, OdlError
     if let Some(v) = args.speed_limit {
         dl_b.speed_limit(Some(v));
     }
+    // Only ever turned off from the command line: leaving it out must not
+    // override a config that asked for verification.
+    if args.no_verify_checksums {
+        dl_b.verify_checksums(false);
+    }
     if let Some(v) = connect_timeout {
         dl_b.connect_timeout(Some(v));
     }
@@ -1379,7 +1376,7 @@ async fn download_remote_file(dlm: &DownloadManager, url: Url) -> Result<PathBuf
             // A list of links is a plain text file, never a media page: an
             // engine that resolves media would be the wrong tool entirely.
             EvaluateRequest::new(url, save_dir, &resolver)
-                .engine(EnginePreference::Engine(DownloadEngine::HttpMultipart)),
+                .engine(EnginePreference::Engine(Engine::HttpMultipart)),
         )
         .await?;
 
@@ -1696,7 +1693,7 @@ async fn download_asset(
     let mut instruction = dlm
         .evaluate(
             EvaluateRequest::new(url, staging, &resolver)
-                .engine(EnginePreference::Engine(DownloadEngine::HttpMultipart)),
+                .engine(EnginePreference::Engine(Engine::HttpMultipart)),
         )
         .await?;
     // Name it after the asset rather than whatever the URL's last segment
@@ -1885,7 +1882,7 @@ async fn run_probe(args: &Args, url_str: &str, format: OutputFormat) -> Result<(
         OutputFormat::Text => {
             println!("url:           {}", instruction.url());
             println!("filename:      {}", instruction.filename());
-            if engine != DownloadEngine::HttpMultipart {
+            if engine != Engine::HttpMultipart {
                 println!("engine:        {}", engine.as_str());
             }
             if let Some(quality) = instruction.quality() {
@@ -2007,7 +2004,7 @@ async fn run_status(
                     println!("{}", d.filename);
                     println!("  url:        {}", d.url);
                     println!("  state:      {}", state);
-                    if d.engine != DownloadEngine::HttpMultipart {
+                    if d.engine != Engine::HttpMultipart {
                         println!("  engine:     {}", d.engine.as_str());
                     }
                     if let Some(quality) = &d.quality {

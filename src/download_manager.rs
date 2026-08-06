@@ -30,8 +30,7 @@ use crate::download_manager::{
 };
 use crate::download_manager::{io::assemble_final_file, server_conflict::resolve_server_conflicts};
 use crate::download_manager::{io::remove_all_parts, save_conflict::resolve_save_conflicts};
-use crate::download_metadata::DownloadEngine;
-use crate::engine::EnginePreference;
+use crate::engine::{Engine, EnginePreference};
 use crate::error::MetadataError;
 use crate::format::{FormatSelector, Quality};
 use crate::progress::{DownloadContext, Phase, ProgressEvent};
@@ -81,6 +80,10 @@ pub struct DownloadManager {
 
 /// Inputs to [`DownloadManager::evaluate`]. Required fields are positional
 /// in [`Self::new`]; optional fields are set via chainable builders.
+// Construct with [`Self::new`] and the chainable setters: fields are added
+// here whenever an engine needs something new, and a struct literal would
+// break every time.
+#[non_exhaustive]
 pub struct EvaluateRequest<'a, CR: SaveConflictResolver> {
     pub url: Url,
     pub save_dir: PathBuf,
@@ -156,6 +159,7 @@ impl<CR: SaveConflictResolver> std::fmt::Debug for EvaluateRequest<'_, CR> {
 /// Inputs to [`DownloadManager::download`]. Required fields are positional
 /// in [`Self::new`]; optional fields are set via chainable builders.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct DownloadRequest<'a, CR: ServerConflictResolver> {
     pub instruction: Download,
     pub conflict_resolver: &'a CR,
@@ -210,7 +214,7 @@ pub struct DownloadStatus {
     pub download_dir: PathBuf,
     /// Which engine moves the bytes. Determines which of the fields above are
     /// meaningful — see [`crate::engine::EngineCapabilities`].
-    pub engine: DownloadEngine,
+    pub engine: Engine,
     /// Whether `size` is an estimate rather than an exact figure.
     pub size_is_approx: bool,
     /// What the chosen format offers, for engines that pick between formats.
@@ -294,7 +298,7 @@ impl DownloadManager {
             let parts_finished = parts.values().filter(|p| p.finished).count();
             // A delegating engine writes files of its own choosing rather than
             // the part table's, so its bytes are counted from the directory.
-            let downloaded: u64 = if download.engine() == DownloadEngine::HttpMultipart {
+            let downloaded: u64 = if download.engine() == Engine::HttpMultipart {
                 let mut sum = 0u64;
                 for ulid in parts.keys() {
                     if let Ok(meta) = tokio::fs::metadata(download.part_path(ulid)).await {
@@ -344,7 +348,7 @@ impl DownloadManager {
     /// Cheap to call repeatedly: the host check is a string comparison, and
     /// the tool's version check is memoized for the life of the process. Still
     /// `async` because deciding whether a tool is usable means running it once.
-    pub async fn engine_for(&self, url: &Url, preference: EnginePreference) -> DownloadEngine {
+    pub async fn engine_for(&self, url: &Url, preference: EnginePreference) -> Engine {
         delegated::planned_engine(&self.config, url, preference).await
     }
 
@@ -705,19 +709,21 @@ impl DownloadManager {
 
         recover_metadata(&instruction).await?;
 
-        if instruction.engine() == DownloadEngine::Unresolved {
+        if instruction.engine() == Engine::Unresolved {
             return Err(OdlError::NotEvaluated {
                 url: instruction.url().to_string(),
             });
         }
 
-        if instruction.engine() != DownloadEngine::HttpMultipart {
+        if instruction.engine() != Engine::HttpMultipart {
             return delegated::process(&self.config, instruction, conflict_resolver, ctx, opts)
                 .await;
         }
 
         ctx.emit(ProgressEvent::PhaseChanged(Phase::ResolvingConflicts));
-        let mut metadata = resolve_server_conflicts(&instruction, conflict_resolver).await?;
+        let mut metadata =
+            resolve_server_conflicts(&instruction, conflict_resolver, opts.verify_checksums())
+                .await?;
 
         // Best-effort early progress notice. The downloader's per-part
         // scheduler will re-emit a precise tracker-backed Progress as
@@ -753,7 +759,8 @@ impl DownloadManager {
                 && tokio::fs::try_exists(&final_path_recovery)
                     .await
                     .unwrap_or(false)
-                && check_final_file_checksum(&metadata, &instruction, false)
+                && opts.verify_checksums()
+                && check_final_file_checksum(&metadata, &instruction, false, true)
                     .await
                     .is_ok()
             {
@@ -842,7 +849,8 @@ impl DownloadManager {
             }
 
             ctx.emit(ProgressEvent::PhaseChanged(Phase::Assembling));
-            let final_path = assemble_final_file(&metadata, &instruction, ctx).await?;
+            let final_path =
+                assemble_final_file(&metadata, &instruction, ctx, opts.verify_checksums()).await?;
 
             // Mark metadata fully finished BEFORE removing parts. If
             // the process dies between these two steps, parts simply

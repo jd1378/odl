@@ -35,6 +35,7 @@ async fn apply_restart_state_to_metadata(
 pub async fn resolve_server_conflicts<CR>(
     instruction: &Download,
     conflict_resolver: &CR,
+    verify_contents: bool,
 ) -> Result<DownloadMetadata, OdlError>
 where
     CR: ServerConflictResolver,
@@ -80,7 +81,7 @@ where
     let mut should_reset_state = false;
     if metadata.finished {
         let checksum_result: Result<(), OdlError> =
-            check_final_file_checksum(&metadata, instruction, true).await;
+            check_final_file_checksum(&metadata, instruction, true, verify_contents).await;
 
         match checksum_result {
             Ok(_) => {
@@ -250,7 +251,7 @@ mod tests {
         on_disk.response_headers_probed_at = Some(1_600_000_000);
         persist_metadata(&on_disk, &instruction).await?;
 
-        resolve_server_conflicts(&instruction, &RestartResolver).await?;
+        resolve_server_conflicts(&instruction, &RestartResolver, true).await?;
 
         let written: DownloadMetadata =
             read_delimited_message_from_path(&instruction.metadata_path()).await?;

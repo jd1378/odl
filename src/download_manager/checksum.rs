@@ -10,6 +10,7 @@ pub async fn check_final_file_checksum(
     metadata: &DownloadMetadata,
     instruction: &Download,
     remove_if_empty_and_size_unknown: bool,
+    verify_contents: bool,
 ) -> Result<(), OdlError> {
     let final_path = instruction.final_file_path();
     // do a simple size check first anyway, if we know that
@@ -39,7 +40,10 @@ pub async fn check_final_file_checksum(
             actual: "size=0".to_string(),
         }));
     }
-    if !metadata.checksums.is_empty() {
+    // The size check above always runs: it is one `stat`, and a truncated
+    // file is worth catching whoever owns verification. Hashing the contents
+    // is what a caller can opt out of.
+    if verify_contents && !metadata.checksums.is_empty() {
         for checksum in &metadata.checksums {
             let expected = HashDigest::try_from(checksum).map_err(|e| {
                 OdlError::MetadataError(MetadataError::Other {

@@ -21,6 +21,7 @@ use reqwest::Url;
 /// rendering for callers that just need text; only `Unknown`'s wording and
 /// the word "audio" are translatable — resolutions and frame rates are not.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum Quality {
     /// Carries picture. `fps` is only meaningful above the usual 24–30, which
     /// is why it is optional rather than always rendered.

@@ -12,6 +12,10 @@ const FILE_CONTENT: &[u8] = b"checksum end-to-end test payload";
 /// `odl` binary with the given `--checksum` argument, and return its exit
 /// code. The downloaded file is written into an isolated temp dir.
 fn run_with_checksum(checksum_arg: &str) -> i32 {
+    run_with_checksum_args(checksum_arg, &[])
+}
+
+fn run_with_checksum_args(checksum_arg: &str, extra: &[&str]) -> i32 {
     let mut server = mockito::Server::new();
     let url = format!("{}/file", server.url());
 
@@ -48,6 +52,7 @@ fn run_with_checksum(checksum_arg: &str) -> i32 {
         .arg(checksum_arg)
         .arg("--format")
         .arg("json")
+        .args(extra)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -100,5 +105,19 @@ fn cli_checksum_malformed_exits_usage() {
         status.code(),
         Some(2),
         "malformed checksum should exit 2 (usage)"
+    );
+}
+
+#[test]
+fn cli_checksum_is_not_enforced_when_verification_is_off() {
+    // The caller takes verification over: odl records what it was told and
+    // downloads, rather than hashing the file to act on it.
+    let code = run_with_checksum_args(
+        &("sha256:".to_string() + &"00".repeat(32)),
+        &["--no-verify-checksums"],
+    );
+    assert_eq!(
+        code, 0,
+        "a mismatch must not fail a download that opted out"
     );
 }

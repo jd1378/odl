@@ -342,6 +342,16 @@ if !HashDigest::verify_file("big.iso", &expected).await? {
 }
 ```
 
+A download verifies itself against whatever the server advertised. A caller
+that would rather do that on its own schedule — after the download returns,
+off the critical path, with its own progress — sets `verify_checksums = false`
+(or passes `--no-verify-checksums`). The checksums are still recorded and
+still readable through `Download::checksums`; odl simply stops hashing the
+file to act on them, leaving that to `verify_file` whenever it suits. Use
+`clear_checksums` instead to discard them outright. The final file's size is
+checked either way, since that costs one `stat` and catches a truncated
+download.
+
 `verify_file` hashes with the expectation's own algorithm, so you only need the
 value you were handed. Compare digests with `matches` rather than `==`: the
 same hash written as hex and as base64 is equal under the former and not the

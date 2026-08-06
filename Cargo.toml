@@ -2,12 +2,14 @@
 name = "odl"
 version = "2.0.0"
 edition = "2024"
+# let-chains are used throughout, which is what sets the floor.
+rust-version = "1.88"
 description = "flexible download library and CLI intended to be fast, reliable, and easy to use."
 repository = "https://github.com/jd1378/odl"
 homepage = "https://github.com/jd1378/odl"
 license = "MIT"
 authors = ["jd1378 <javad.mnjd@hotmail.com>"]
-categories = ["command-line-utilities"]
+categories = ["command-line-utilities", "network-programming"]
 keywords = ["download", "manager", "idm", "dl", "download-manager"]
 
 [dependencies]

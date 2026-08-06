@@ -10,8 +10,7 @@ use std::path::{Path, PathBuf};
 use crate::config::{Config, DownloadOptions};
 use crate::conflict::{SaveConflictResolver, ServerConflictResolver};
 use crate::download::Download;
-use crate::download_metadata::DownloadEngine;
-use crate::engine::EnginePreference;
+use crate::engine::{Engine, EnginePreference};
 use crate::error::OdlError;
 use crate::format::FormatSelector;
 use crate::progress::DownloadContext;
@@ -168,11 +167,11 @@ mod imp {
         config: &Config,
         url: &Url,
         preference: EnginePreference,
-    ) -> DownloadEngine {
+    ) -> Engine {
         match resolve_tools(url, preference, config).await {
-            Ok(Some(_)) => DownloadEngine::Ytdlp,
-            Ok(None) => DownloadEngine::HttpMultipart,
-            Err(_) => preference.forced().unwrap_or(DownloadEngine::HttpMultipart),
+            Ok(Some(_)) => Engine::Ytdlp,
+            Ok(None) => Engine::HttpMultipart,
+            Err(_) => preference.forced().unwrap_or(Engine::HttpMultipart),
         }
     }
 
@@ -189,8 +188,8 @@ mod imp {
     ) -> Result<Option<ytdlp::Tools>, OdlError> {
         let opts = config.ytdlp();
         match preference.forced() {
-            Some(DownloadEngine::Ytdlp) => return Ok(Some(ytdlp::tools(opts).await?)),
-            Some(DownloadEngine::HttpMultipart) => return Ok(None),
+            Some(Engine::Ytdlp) => return Ok(Some(ytdlp::tools(opts).await?)),
+            Some(Engine::HttpMultipart) => return Ok(None),
             // Asking to download with the engine that means "not yet decided"
             // is a contradiction. Quietly substituting HTTP would download
             // something, which is worse than saying the request makes no sense.
@@ -198,7 +197,7 @@ mod imp {
                 return Err(OdlError::InvalidRequest {
                     message: format!(
                         "`{}` is not an engine a download can be performed with",
-                        crate::engine::DownloadEngineExt::as_str(&other)
+                        other.as_str()
                     ),
                 });
             }
@@ -345,7 +344,7 @@ mod imp {
         metadata: &DownloadMetadata,
         instruction: &Download,
     ) -> Option<&'static str> {
-        if metadata.engine() != DownloadEngine::Ytdlp {
+        if Engine::from(metadata.engine()) != Engine::Ytdlp {
             return Some("the stored download used a different engine");
         }
         let (Some(stored), Some(wanted)) = (stored_ytdlp(metadata), instruction.ytdlp_details())
@@ -550,8 +549,8 @@ mod imp {
         _config: &Config,
         _url: &Url,
         _preference: EnginePreference,
-    ) -> DownloadEngine {
-        DownloadEngine::HttpMultipart
+    ) -> Engine {
+        Engine::HttpMultipart
     }
 
     pub async fn try_evaluate<CR>(
@@ -561,7 +560,7 @@ mod imp {
         CR: SaveConflictResolver,
     {
         let _ = input.reselect_format;
-        if input.preference.forced() == Some(DownloadEngine::Ytdlp) {
+        if input.preference.forced() == Some(Engine::Ytdlp) {
             return Err(OdlError::CliError {
                 message: "this build of odl was compiled without yt-dlp support".to_owned(),
             });
@@ -698,7 +697,7 @@ mod tests {
         #[test]
         fn metadata_from_the_http_engine_blocks_continuation() {
             let mut m = metadata_for("https://youtu.be/x", "137+251");
-            m.engine = DownloadEngine::HttpMultipart.into();
+            m.engine = crate::download_metadata::DownloadEngine::HttpMultipart.into();
             m.engine_details = None;
             let i = instruction("https://youtu.be/x", "137+251");
             assert!(super::super::imp::continuation_blocker(&m, &i).is_some());

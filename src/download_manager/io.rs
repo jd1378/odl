@@ -52,6 +52,7 @@ pub async fn assemble_final_file(
     metadata: &DownloadMetadata,
     instruction: &Download,
     ctx: &DownloadContext,
+    verify_contents: bool,
 ) -> Result<PathBuf, OdlError> {
     let final_path = instruction.final_file_path();
     let mut sorted_parts: Vec<&PartDetails> = metadata.parts.values().collect();
@@ -127,8 +128,10 @@ pub async fn assemble_final_file(
         );
     }
 
-    ctx.emit(ProgressEvent::PhaseChanged(Phase::Verifying));
-    check_final_file_checksum(metadata, instruction, false).await?;
+    if verify_contents {
+        ctx.emit(ProgressEvent::PhaseChanged(Phase::Verifying));
+    }
+    check_final_file_checksum(metadata, instruction, false, verify_contents).await?;
     Ok(final_path)
 }
 

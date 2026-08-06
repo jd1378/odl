@@ -62,6 +62,10 @@ pub enum Phase {
 /// The `total` field on [`ProgressEvent::Progress`] is `None` when the server
 /// did not advertise content length.
 #[derive(Debug, Clone)]
+// Engines report things their predecessors had no notion of — a torrent has
+// peers and pieces where an HTTP download has neither. Leaving this open means
+// adding one does not break every consumer's `match`.
+#[non_exhaustive]
 pub enum ProgressEvent {
     /// Lifecycle phase changed.
     PhaseChanged(Phase),

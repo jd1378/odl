@@ -42,6 +42,7 @@ mod defaults {
     pub fn default_rampup_batch_size() -> u64 { 2 }
     pub fn default_rampup_delay_min() -> Duration { Duration::from_millis(300) }
     pub fn default_rampup_delay_max() -> Duration { Duration::from_millis(1000) }
+    pub fn default_verify_checksums() -> bool { true }
     pub fn default_ytdlp_enabled() -> bool { true }
     pub fn default_ytdlp_binary_path() -> Option<PathBuf> { None }
     pub fn default_ytdlp_ffmpeg_path() -> Option<PathBuf> { None }
@@ -158,6 +159,16 @@ pub struct DownloadOptions {
     /// be >= `rampup_delay_min`.
     #[serde(default = "default_rampup_delay_max")]
     rampup_delay_max: Duration,
+
+    /// Verify the assembled file against any checksums that are known.
+    ///
+    /// On by default. Turning it off keeps the checksums — they stay in the
+    /// metadata and are still reported — but odl stops hashing the file to
+    /// act on them, which a caller may prefer to do on its own schedule.
+    /// The file's size is still checked either way: that costs one `stat`
+    /// and catches a truncated download.
+    #[serde(default = "default_verify_checksums")]
+    verify_checksums: bool,
 }
 
 impl From<DownloadOptions> for DownloadOptionsBuilder {
@@ -180,7 +191,8 @@ impl From<DownloadOptions> for DownloadOptionsBuilder {
             .rampup(o.rampup)
             .rampup_batch_size(o.rampup_batch_size)
             .rampup_delay_min(o.rampup_delay_min)
-            .rampup_delay_max(o.rampup_delay_max);
+            .rampup_delay_max(o.rampup_delay_max)
+            .verify_checksums(o.verify_checksums);
         b
     }
 }
@@ -206,6 +218,7 @@ impl Default for DownloadOptions {
             rampup_batch_size: default_rampup_batch_size(),
             rampup_delay_min: default_rampup_delay_min(),
             rampup_delay_max: default_rampup_delay_max(),
+            verify_checksums: default_verify_checksums(),
         }
     }
 }
@@ -269,6 +282,9 @@ impl DownloadOptions {
     }
     pub fn rampup_delay_max(&self) -> Duration {
         self.rampup_delay_max
+    }
+    pub fn verify_checksums(&self) -> bool {
+        self.verify_checksums
     }
 
     /// Convert into a [`DownloadOptionsBuilder`] pre-populated with this

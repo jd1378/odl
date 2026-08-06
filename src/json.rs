@@ -88,13 +88,17 @@ impl ProgressReporter for JsonReporter {
                 emit_line(json!({"type": "failed", "url": url, "message": message}));
             }
             // Speed samples and per-part events are too noisy for the
-            // line-oriented stream; aggregate progress is sufficient.
+            // line-oriented stream; aggregate progress is sufficient. The
+            // wildcard also absorbs whatever a future engine reports: this
+            // stream is a documented contract, and inventing a shape for an
+            // event nobody has specified would be worse than staying silent.
             ProgressEvent::Speed { .. }
             | ProgressEvent::PartAdded { .. }
             | ProgressEvent::PartProgress { .. }
             | ProgressEvent::PartFinished { .. }
             | ProgressEvent::PartSpeed { .. }
-            | ProgressEvent::PartRetrying { .. } => {}
+            | ProgressEvent::PartRetrying { .. }
+            | _ => {}
         }
     }
 }
