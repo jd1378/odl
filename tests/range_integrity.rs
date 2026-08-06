@@ -101,6 +101,77 @@ fn an_error_page_is_not_written_as_part_data() {
 }
 
 #[test]
+fn a_chunked_answer_without_a_length_is_accepted() {
+    // A 200 with `Transfer-Encoding: chunked` carries no `Content-Length`.
+    // Reading that absence as "the length disagrees" refuses a download that
+    // is perfectly good — a server may answer HEAD with a length and stream
+    // the GET.
+    let (code, file) = run_against(
+        |s| {
+            s.mock("GET", "/file")
+                .expect_at_least(1)
+                .with_status(200)
+                .with_chunked_body(|w| w.write_all(&body()))
+                .create()
+        },
+        "1",
+    );
+    assert_eq!(code, Some(0), "a chunked whole-file answer is valid");
+    assert_eq!(file.as_deref(), Some(body().as_slice()));
+}
+
+#[test]
+fn a_200_may_carry_content_range_and_is_judged_on_it() {
+    // RFC 9110 14.4 gives `Content-Range` no meaning outside 206 and 416, so
+    // it is never used to place the body. It is still worth distrusting: a
+    // 200 announcing a window that does not start at zero is not the whole
+    // file, whatever the status line says.
+    let starting_at_zero = run_against(
+        |s| {
+            s.mock("GET", "/file")
+                .expect_at_least(1)
+                .with_status(200)
+                .with_header("content-range", &format!("bytes 0-{}/{}", SIZE - 1, SIZE))
+                .with_header("content-length", &SIZE.to_string())
+                .with_body(body())
+                .create()
+        },
+        "1",
+    );
+    assert_eq!(
+        starting_at_zero.0,
+        Some(0),
+        "the whole file, plainly stated"
+    );
+    assert_eq!(starting_at_zero.1.as_deref(), Some(body().as_slice()));
+
+    let starting_elsewhere = run_against(
+        |s| {
+            s.mock("GET", "/file")
+                .expect_at_least(1)
+                .with_status(200)
+                .with_header(
+                    "content-range",
+                    &format!("bytes 1024-{}/{}", SIZE - 1, SIZE),
+                )
+                .with_chunked_body(|w| w.write_all(&body()[1024..]))
+                .create()
+        },
+        "1",
+    );
+    assert_eq!(
+        starting_elsewhere.0,
+        Some(4),
+        "a slice is not the whole file"
+    );
+    assert!(
+        starting_elsewhere
+            .1
+            .is_none_or(|f| f.iter().all(|b| *b == 0))
+    );
+}
+
+#[test]
 fn a_single_connection_download_still_works_without_range_support() {
     // The one case where a 200 is usable: the part *is* the whole file and
     // nothing has been written, so the body is exactly what was asked for.

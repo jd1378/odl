@@ -1462,9 +1462,20 @@ fn range_mismatch(
             _ => None,
         },
         StatusCode::OK => {
-            let whole_file_from_the_start =
-                want_start == 0 && instruction.size() == resp.content_length();
-            if whole_file_from_the_start {
+            // RFC 9110 14.4: `Content-Range` has no defined meaning on a 200,
+            // and 14.2 lets any server ignore `Range` and answer one. So it is
+            // never used to *place* the body — only, when it is present and
+            // points somewhere other than the start, as a reason to distrust
+            // a response that claims to begin at byte zero.
+            let body_starts_at_zero = content_range_start(resp).is_none_or(|start| start == 0);
+            // An absent length is ordinary: a chunked 200 carries none, and
+            // reading that as disagreement would refuse a perfectly good
+            // download. Only a length that is present *and* disagrees with
+            // what the probe reported means this is not the whole file.
+            let length_agrees = resp
+                .content_length()
+                .is_none_or(|len| Some(len) == instruction.size());
+            if want_start == 0 && body_starts_at_zero && length_agrees {
                 None
             } else {
                 Some(ServerConflict::NotResumable)

@@ -96,9 +96,10 @@ part data, and multi-part it looped forever, counting the error page as
 progress and ignoring `--max-retries 0`.
 
 Now a ranged request must be answered `206` from the offset it asked for.
-Anything else is a conflict rather than data. The one exception is the case
-that has to keep working: a single connection, nothing downloaded yet, where
-`200` returns exactly the bytes requested.
+Anything else is a conflict rather than data — except the case that has to
+keep working: a single connection with nothing downloaded yet, where a `200`
+returns exactly the bytes requested. That stays accepted whether the body
+arrives with a `Content-Length` or chunked without one.
 
 ### Breaking changes
 
