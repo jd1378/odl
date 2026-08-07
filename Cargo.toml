@@ -63,6 +63,8 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_
 reqwest = { version = "0.13", default-features = false, features = ["http2", "gzip", "brotli", "native-tls", "socks", "stream", "blocking"] }
 mockito = "1.7.0"
 libc = "0.2.189"
+async-trait = "0.1.88"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [build-dependencies]
 prost-build = "0.14"

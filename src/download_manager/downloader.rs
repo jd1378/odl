@@ -832,6 +832,14 @@ impl Downloader {
                 None => return Ok(None),
             };
         candidate.controller.set_limit(split.new_left_size);
+        // The left part just got smaller. Without this the previous total
+        // stands until the next sampler tick, and if the part finishes or the
+        // download pauses inside that window it never gets corrected.
+        self.ctx.emit(ProgressEvent::PartProgress {
+            ulid: candidate.ulid.clone(),
+            downloaded: candidate.controller.downloaded().min(split.new_left_size),
+            total: split.new_left_size,
+        });
 
         let (new_part, encoded_metadata) = {
             let mut metadata = self.metadata.lock().await;
@@ -1202,6 +1210,29 @@ impl Drop for PartFileWriter {
     }
 }
 
+/// Announce a part's final byte count, then that it is finished.
+///
+/// [`ProgressEvent::PartFinished`] carries no size, so a consumer rendering
+/// "downloaded / total" has only the sampler's last word to go on — which is
+/// up to one 125 ms tick stale, and for a part that was already complete on
+/// disk when the download resumed, never spoken at all. Such a part is
+/// announced finished having reported zero bytes, so a UI shows it complete
+/// and empty at the same time.
+///
+/// Stating the totals here makes "finished" and "full" agree at the source,
+/// without changing the published shape of `PartFinished` — a field cannot be
+/// added to it now that 2.0 is released.
+fn emit_part_complete(ctx: &DownloadContext, ulid: &str, total: u64) {
+    ctx.emit(ProgressEvent::PartProgress {
+        ulid: ulid.to_owned(),
+        downloaded: total,
+        total,
+    });
+    ctx.emit(ProgressEvent::PartFinished {
+        ulid: ulid.to_owned(),
+    });
+}
+
 /// Whether a refusal is worth trying again.
 ///
 /// The retry policy exists for transfers that fail *in transit*. A server that
@@ -1307,8 +1338,18 @@ async fn download_part(
         };
 
         if !unknown_size && current_size >= target_size {
+            // Nothing to transfer: the bytes were already on disk. Tell the
+            // scheduler anyway. It waits for each part in a ramp batch to
+            // report a first chunk before opening the next, and a part that
+            // finishes without transferring never sends one — so the batch
+            // wait drains the task set and returns, leaving the rest of the
+            // queue unscheduled and the download reported as failed with
+            // every byte of it present.
+            if let Some(n) = probe_notify.as_ref() {
+                n.notify_one();
+            }
             file.finish().await?;
-            ctx.emit(ProgressEvent::PartFinished { ulid: ulid.clone() });
+            emit_part_complete(&ctx, &ulid, target_size);
             return Ok(PartEvent::Completed(PartOutcome {
                 ulid,
                 final_size: target_size,
@@ -1592,12 +1633,12 @@ async fn download_part(
         // received, which `mark_part_finished` persists to PartDetails.
         if unknown_size && saw_eof {
             let final_size = controller.downloaded();
-            ctx.emit(ProgressEvent::PartFinished { ulid: ulid.clone() });
+            emit_part_complete(&ctx, &ulid, final_size);
             return Ok(PartEvent::Completed(PartOutcome { ulid, final_size }));
         }
 
         if controller.downloaded() >= controller.limit() {
-            ctx.emit(ProgressEvent::PartFinished { ulid: ulid.clone() });
+            emit_part_complete(&ctx, &ulid, controller.limit());
             return Ok(PartEvent::Completed(PartOutcome {
                 ulid,
                 final_size: controller.limit(),

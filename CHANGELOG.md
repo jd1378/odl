@@ -2,6 +2,29 @@
 
 ## 2.0.2
 
+### A resumed download could fail with all its bytes present
+
+A part whose bytes were already complete on disk finished without transferring
+anything — and so never sent the first-chunk signal the scheduler waits for
+before opening the next part in a ramp batch. The batch wait drained the task
+set and returned with the rest of the queue unopened, and the run ended
+reporting parts that "could not be downloaded" while every byte of them sat on
+disk. Reachable after a crash between writing a part's bytes and recording it
+as finished.
+
+### A finished part now reports its size
+
+`PartFinished` carries no byte count, so a UI rendering "downloaded / total"
+had only the progress sampler's last word — up to one 125 ms tick stale, and
+for a part already complete on disk, never spoken at all. Such a part showed
+as complete and empty at the same time; an ordinary part could show 98% while
+finishing. A final `PartProgress` with `downloaded == total` is now emitted
+immediately before every `PartFinished`, so the two agree at the source.
+
+A dynamic split also says so: shrinking a part's size used to leave the old
+total standing until the next sample, and if the part finished or the download
+paused inside that window it was never corrected.
+
 ### Stopping a waiting download
 
 A download interrupted *while sitting in a retry backoff* reported the error
