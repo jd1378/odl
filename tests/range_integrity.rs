@@ -83,14 +83,16 @@ fn a_transfer_failure_is_reported_as_one() {
         },
         "4",
     );
-    assert_ne!(code, Some(0), "a failed transfer must not report success");
     assert!(
         !reported.contains("shorter than recorded size"),
         "the assembler should not be the one to notice: {reported}"
     );
+    // The cause survives all the way out: a caller that retries on network
+    // errors must see the 500, not a generic failure it would give up on.
+    assert_eq!(code, Some(3), "a 500 is a network failure: {reported}");
     assert!(
-        reported.contains("could not be downloaded"),
-        "expected a transfer failure, got: {reported}"
+        reported.contains("HTTP 500"),
+        "expected the status in the error, got: {reported}"
     );
     assert!(
         file.is_none(),

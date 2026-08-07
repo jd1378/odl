@@ -103,9 +103,10 @@ arrives with a `Content-Length` or chunked without one.
 
 A transfer that fails now reports itself as one. `fill_capacity` returns early
 after a failed batch without rescheduling, so the requeued parts could still be
-queued when the last connection drained — the run then ended as success and the
-assembler was left to notice, reporting "part file shorter than recorded size".
-An I/O error for what was plainly a failed transfer.
+queued when the last connection drained — the failure is now carried
+out of the scheduler, so a refused download exits 3 with `HTTP 503` rather than
+1 with "something failed" — or, before that, 5 with "part file shorter than
+recorded size", an I/O error for what was plainly a failed transfer.
 
 A failed download no longer leaves an output file behind. Assembly sizes the
 destination up front, so a failure part-way through left a full-length file of

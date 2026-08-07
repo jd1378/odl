@@ -294,6 +294,9 @@ impl Downloader {
         let mut pending = self.pending_parts().await;
         let mut active: HashMap<String, ActiveTask> = HashMap::new();
         let mut join_set: JoinSet<Result<PartEvent, OdlError>> = JoinSet::new();
+        // Cause of the most recent exhausted part, so a download that ends
+        // with work still queued reports what actually went wrong.
+        let mut last_failure: Option<OdlError> = None;
 
         // Schedule a single probe connection first. Once it begins receiving data
         // we'll expand to fill the full concurrency capacity.
@@ -319,7 +322,7 @@ impl Downloader {
                     // situation with parallel opens.
                     self.ramp_armed.store(false, std::sync::atomic::Ordering::Relaxed);
                     if let Some(res) = maybe_res {
-                        self.handle_join_result_item(res, &mut pending, &mut active, &mut join_set).await?;
+                        self.handle_join_result_item(res, &mut pending, &mut active, &mut join_set, &mut last_failure).await?;
                     }
                 }
                 _ = self.ctx.cancel.cancelled() => {
@@ -330,7 +333,7 @@ impl Downloader {
         }
 
         // Now fill remaining capacity up to configured concurrency.
-        self.fill_capacity(&mut pending, &mut active, &mut join_set)
+        self.fill_capacity(&mut pending, &mut active, &mut join_set, &mut last_failure)
             .await?;
 
         loop {
@@ -343,24 +346,37 @@ impl Downloader {
                 }
                 _ = &mut live_changed => {
                     self.apply_live_cap(&mut active);
-                    self.fill_capacity(&mut pending, &mut active, &mut join_set).await?;
+                    self.fill_capacity(&mut pending, &mut active, &mut join_set, &mut last_failure)
+                        .await?;
                 }
                 next = join_set.join_next() => {
                     let Some(result) = next else { break };
-                    self.handle_join_result_item(result, &mut pending, &mut active, &mut join_set)
-                        .await?;
-                    self.fill_capacity(&mut pending, &mut active, &mut join_set)
-                        .await?;
+                    self.handle_join_result_item(
+                        result,
+                        &mut pending,
+                        &mut active,
+                        &mut join_set,
+                        &mut last_failure,
+                    )
+                    .await?;
+                    self.fill_capacity(
+                        &mut pending,
+                        &mut active,
+                        &mut join_set,
+                        &mut last_failure,
+                    )
+                    .await?;
                 }
             }
         }
 
         // Nothing is in flight. That is only success if there is also nothing
-        // left to do: `fill_capacity` returns early after a failed batch
-        // without rescheduling, so the requeued parts can still be sitting in
-        // `pending` when the last task drains the set. Reporting Ok there left
-        // the assembler to notice, which it did — as "part file shorter than
-        // recorded size", an I/O error for what was really a failed transfer.
+        // left to do: when every running part exhausts its retries at once,
+        // the requeued parts are still sitting in `pending` as the last task
+        // drains the set. Ending there is right — the retry budget is the
+        // caller's stated tolerance and it is spent — but reporting Ok was
+        // not: it left the assembler to notice, which it did, as "part file
+        // shorter than recorded size", an I/O error for a failed transfer.
         //
         // Cancellation is checked first rather than assumed away. The loop's
         // `select!` has no `biased`, so when the token fires with nothing left
@@ -373,13 +389,16 @@ impl Downloader {
             return Err(OdlError::Cancelled);
         }
         if !pending.is_empty() {
+            // Report the transfer failure that got us here. It is the only
+            // description with anything actionable in it — a caller routing on
+            // the error kind needs to see the 503 or the timeout, not that odl
+            // ran out of parts to schedule.
             let unfinished = pending.len();
-            return Err(OdlError::Other {
-                message: format!(
-                    "{unfinished} part(s) could not be downloaded and no connection is left to retry them"
-                ),
+            debug_assert!(last_failure.is_some(), "parts left over without a cause");
+            return Err(last_failure.unwrap_or_else(|| OdlError::Other {
+                message: format!("{unfinished} part(s) could not be downloaded"),
                 origin: Box::new(std::io::Error::other("parts left unfinished")),
-            });
+            }));
         }
 
         let metadata_mutex = Arc::try_unwrap(self.metadata).map_err(|_| {
@@ -405,6 +424,7 @@ impl Downloader {
         pending: &mut VecDeque<PartDetails>,
         active: &mut HashMap<String, ActiveTask>,
         join_set: &mut JoinSet<Result<PartEvent, OdlError>>,
+        last_failure: &mut Option<OdlError>,
     ) -> Result<(), OdlError> {
         if self.ctx.live.max_connections() == 0 {
             return Ok(());
@@ -486,7 +506,14 @@ impl Downloader {
                             return Ok(());
                         };
                         let is_failure = matches!(&result, Ok(Ok(PartEvent::Failed { .. })));
-                        self.handle_join_result_item(result, pending, active, join_set).await?;
+                        self.handle_join_result_item(
+                            result,
+                            pending,
+                            active,
+                            join_set,
+                            last_failure,
+                        )
+                        .await?;
                         if is_failure {
                             break;
                         }
@@ -551,6 +578,7 @@ impl Downloader {
         pending: &mut VecDeque<PartDetails>,
         active: &mut HashMap<String, ActiveTask>,
         join_set: &mut JoinSet<Result<PartEvent, OdlError>>,
+        last_failure: &mut Option<OdlError>,
     ) -> Result<(), OdlError> {
         match res {
             Ok(Ok(event)) => match event {
@@ -565,7 +593,15 @@ impl Downloader {
                         pending.push_back(task.details);
                     }
                 }
-                PartEvent::Failed { ulid, attempts } => {
+                PartEvent::Failed {
+                    ulid,
+                    attempts,
+                    cause,
+                } => {
+                    // Kept so a download that ends with parts still queued can
+                    // report the transfer failure that got it there, rather
+                    // than a generic "some parts are unfinished".
+                    *last_failure = Some(cause);
                     // Remove from active and attempt to reschedule this part
                     // later if there are other unfinished parts. If this was
                     // the last unfinished part, fail the overall download.
@@ -910,8 +946,17 @@ struct PartOutcome {
 
 enum PartEvent {
     Completed(PartOutcome),
-    NeedsReschedule { ulid: String },
-    Failed { ulid: String, attempts: u32 },
+    NeedsReschedule {
+        ulid: String,
+    },
+    /// Retries for this part are exhausted. `cause` is the failure that ended
+    /// them, kept so the download can be reported as what actually went wrong
+    /// rather than as a generic one.
+    Failed {
+        ulid: String,
+        attempts: u32,
+        cause: OdlError,
+    },
 }
 
 struct BandwidthLimiter {
@@ -1255,9 +1300,12 @@ async fn download_part(
             // request completed and returned a response
             Ok(Ok(r)) => r,
             // request completed but returned an error (network error)
-            Ok(Err(_e)) => {
+            Ok(Err(e)) => {
                 file.finish().await?;
-                match retry_sleep_or_fail_part(&policy, attempts, attempts + 1, &ctx, &ulid).await {
+                let cause = OdlError::from(e);
+                match retry_sleep_or_fail_part(&policy, attempts, attempts + 1, &ctx, &ulid, cause)
+                    .await
+                {
                     Ok(()) => {
                         attempts = attempts.saturating_add(1);
                         continue;
@@ -1269,7 +1317,10 @@ async fn download_part(
             Err(_) => {
                 // flush any partial progress to disk before retrying
                 file.finish().await?;
-                match retry_sleep_or_fail_part(&policy, attempts, attempts + 1, &ctx, &ulid).await {
+                let cause = OdlError::Network(crate::error::NetworkError::Timeout);
+                match retry_sleep_or_fail_part(&policy, attempts, attempts + 1, &ctx, &ulid, cause)
+                    .await
+                {
                     Ok(()) => {
                         attempts = attempts.saturating_add(1);
                         continue;
@@ -1291,7 +1342,17 @@ async fn download_part(
                 "part request answered with an error status"
             );
             file.finish().await?;
-            match retry_sleep_or_fail_part(&policy, attempts, attempts + 1, &ctx, &ulid).await {
+            // Carry the status through: a 5xx or 429 is a transient network
+            // condition, and a caller that retries on those needs to be told
+            // that is what happened rather than "something failed".
+            let cause = OdlError::Network(crate::error::NetworkError::Status {
+                status_code: resp.status().as_u16(),
+                reason: resp.status().canonical_reason().map(str::to_owned),
+                url: Some(url.to_string()),
+            });
+            match retry_sleep_or_fail_part(&policy, attempts, attempts + 1, &ctx, &ulid, cause)
+                .await
+            {
                 Ok(()) => {
                     attempts = attempts.saturating_add(1);
                     continue;
@@ -1332,11 +1393,18 @@ async fn download_part(
             let maybe_chunk = match chunk_result {
                 Ok(chunk_res) => match chunk_res.map_err(OdlError::from) {
                     Ok(opt) => opt,
-                    Err(_e) => {
+                    Err(e) => {
                         // network/body error -> consider retrying
                         file.finish().await?;
-                        match retry_sleep_or_fail_part(&policy, attempts, attempts + 1, &ctx, &ulid)
-                            .await
+                        match retry_sleep_or_fail_part(
+                            &policy,
+                            attempts,
+                            attempts + 1,
+                            &ctx,
+                            &ulid,
+                            e,
+                        )
+                        .await
                         {
                             Ok(()) => {
                                 attempts = attempts.saturating_add(1);
@@ -1349,8 +1417,16 @@ async fn download_part(
                 Err(_) => {
                     // timeout reading chunk -> retry according to policy
                     file.finish().await?;
-                    match retry_sleep_or_fail_part(&policy, attempts, attempts + 1, &ctx, &ulid)
-                        .await
+                    let cause = OdlError::Network(crate::error::NetworkError::Timeout);
+                    match retry_sleep_or_fail_part(
+                        &policy,
+                        attempts,
+                        attempts + 1,
+                        &ctx,
+                        &ulid,
+                        cause,
+                    )
+                    .await
                     {
                         Ok(()) => {
                             attempts = attempts.saturating_add(1);
@@ -1444,7 +1520,10 @@ async fn download_part(
         // The attempts counter may have been incremented in the branches above.
         // If no retry happened (shouldn't happen), increment to avoid infinite loop.
         attempts = attempts.saturating_add(1);
-        match retry_sleep_or_fail_part(&policy, attempts, attempts, &ctx, &ulid).await {
+        let cause = OdlError::Network(crate::error::NetworkError::Other {
+            message: "the transfer ended before the part was complete".to_owned(),
+        });
+        match retry_sleep_or_fail_part(&policy, attempts, attempts, &ctx, &ulid, cause).await {
             Ok(()) => continue,
             Err(failed) => return Ok(failed),
         }
@@ -1519,6 +1598,7 @@ async fn retry_sleep_or_fail_part(
     attempts_display: u32,
     ctx: &DownloadContext,
     ulid: &str,
+    cause: OdlError,
 ) -> Result<(), PartEvent> {
     ctx.emit(ProgressEvent::PartRetrying {
         ulid: ulid.to_string(),
@@ -1530,6 +1610,7 @@ async fn retry_sleep_or_fail_part(
         Err(PartEvent::Failed {
             ulid: ulid.to_string(),
             attempts: attempts_display,
+            cause,
         })
     }
 }
@@ -1950,10 +2031,11 @@ mod tests {
         match event {
             PartEvent::NeedsReschedule { ulid } => assert_eq!(ulid, "part"),
             PartEvent::Completed(_) => panic!("expected reschedule"),
-            PartEvent::Failed { ulid, attempts } => panic!(
-                "unexpected failed part {} after {} attempts",
-                ulid, attempts
-            ),
+            PartEvent::Failed {
+                ulid,
+                attempts,
+                cause,
+            } => panic!("unexpected failed part {ulid} after {attempts} attempts: {cause}"),
         }
         get_mock.assert_async().await;
         Ok(())
