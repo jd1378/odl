@@ -1,6 +1,6 @@
 # Changelog
 
-## 2.0.2
+## 2.0.3
 
 ### A resumed download could fail with all its bytes present
 
@@ -24,6 +24,8 @@ immediately before every `PartFinished`, so the two agree at the source.
 A dynamic split also says so: shrinking a part's size used to leave the old
 total standing until the next sample, and if the part finished or the download
 paused inside that window it was never corrected.
+
+## 2.0.2
 
 ### Stopping a waiting download
 
