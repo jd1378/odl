@@ -436,7 +436,7 @@ impl DownloadManager {
                 Ok(r) => break r,
                 Err(e) => {
                     attempts = attempts.saturating_add(1);
-                    if !wait_for_retry(&retry_policy, attempts, ctx).await {
+                    if !wait_for_retry(&retry_policy, attempts, ctx, None, None).await {
                         return Err(OdlError::from(e));
                     }
                     if ctx.is_cancelled() {

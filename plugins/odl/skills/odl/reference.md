@@ -39,12 +39,15 @@ One JSON object per line. Every object has `"type"` and `"url"`.
 | `filename` | `filename` | resolved final filename |
 | `progress` | `downloaded`, `total` | `total` is `null` when the size is unknown; up to ~8 events/sec. With the `ytdlp` engine these are data-driven, so a stalled transfer emits nothing at all — use your own clock to detect a stall |
 | `message` | `message` | free-form status (e.g. retry countdown) |
+| `retry_scheduled` | `part`, `attempt`, `max_attempts`, `delay_ms`, `server_requested` | the transfer is paused and will resume after `delay_ms`; use it to tell a pause from a hang. `part` is a ulid, or `null` for a whole-download step. `server_requested: true` means the delay is the server's `Retry-After` (honoured up to 5 minutes) rather than odl's backoff |
 | `completed` | `path`, `already_complete` | terminal; `already_complete: true` ⇒ nothing was downloaded |
 | `failed` | `message` | terminal; this URL failed |
 | `cancelled` | — | terminal; cancelled |
 
-Speed samples and per-part events are intentionally **not** emitted in
+Speed samples and per-part progress are intentionally **not** emitted in
 JSON mode — derive throughput from successive `progress` events.
+`retry_scheduled` is the exception: it is rare, and without it a retry wait
+is indistinguishable from a stalled download.
 
 In a batch, every URL produces exactly one terminal event
 (`completed`/`failed`/`cancelled`). Match by `url`.

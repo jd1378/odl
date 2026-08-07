@@ -101,6 +101,17 @@ keep working: a single connection with nothing downloaded yet, where a `200`
 returns exactly the bytes requested. That stays accepted whether the body
 arrives with a `Content-Length` or chunked without one.
 
+Retry waits are reported. A download that pauses to retry looked identical to
+one that had hung: the only sign was a free-form `message` string nothing could
+parse. The new `retry_scheduled` event carries `delay_ms`, `attempt`,
+`max_attempts`, the part it belongs to, and whether the delay is the server's
+own — so a UI can say "resuming in 30s" and mean it.
+
+`Retry-After` is honoured on the statuses that carry it (`408`, `425`, `429`,
+5xx), capped at five minutes since the header is server-supplied. The attempt
+budget stays the caller's; the header only moves *when* the next attempt
+happens, not whether there is one.
+
 A refusal the server means permanently is no longer retried. A `404`, `410`,
 `403`, `401` or `416` on a part used to spend the full retry budget with
 backoff — seconds, to reach the answer the first response already gave — and
@@ -144,4 +155,9 @@ Metadata written by 1.x still loads — the engine discriminant defaults to
 - `fs_utils::cleanup_filename` takes a second argument selecting
   transliteration. Pass `false` for the previous behaviour.
 - `YtdlpSpec` gained `video_id` and `ascii_filenames`.
+- `retry_policies::wait_for_retry` takes the retrying part's id and an
+  optional server-supplied delay. Pass `None, None` for the previous
+  behaviour.
+- `ProgressEvent` gained `RetryScheduled`. It is `non_exhaustive`, so a
+  reporter with a wildcard arm needs no change.
 - Minimum supported Rust version is declared: 1.88.

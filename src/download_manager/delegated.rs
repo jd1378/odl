@@ -120,7 +120,9 @@ mod imp {
                     attempts = attempts.saturating_add(1);
                     // Also the cancellation check: a user who stopped the
                     // download should not wait out a backoff first.
-                    if !crate::retry_policies::wait_for_retry(&policy, attempts, ctx).await {
+                    if !crate::retry_policies::wait_for_retry(&policy, attempts, ctx, None, None)
+                        .await
+                    {
                         return Err(e);
                     }
                     tracing::info!(attempt = attempts, error = %e, "retrying yt-dlp");

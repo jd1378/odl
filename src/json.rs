@@ -87,6 +87,26 @@ impl ProgressReporter for JsonReporter {
             ProgressEvent::Failed { message } => {
                 emit_line(json!({"type": "failed", "url": url, "message": message}));
             }
+            // Rare, and exactly what a caller needs to render "resuming in
+            // 30s" instead of an unexplained pause — so unlike the per-part
+            // chatter below, this one is worth a line.
+            ProgressEvent::RetryScheduled {
+                ulid,
+                attempt,
+                max_attempts,
+                delay,
+                server_requested,
+            } => {
+                emit_line(json!({
+                    "type": "retry_scheduled",
+                    "url": url,
+                    "part": ulid,
+                    "attempt": attempt,
+                    "max_attempts": max_attempts,
+                    "delay_ms": delay.as_millis() as u64,
+                    "server_requested": server_requested,
+                }));
+            }
             // Speed samples and per-part events are too noisy for the
             // line-oriented stream; aggregate progress is sufficient. The
             // wildcard also absorbs whatever a future engine reports: this

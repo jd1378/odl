@@ -98,6 +98,23 @@ pub enum ProgressEvent {
     PartSpeed { ulid: String, bytes_per_second: f64 },
     /// A part is being retried.
     PartRetrying { ulid: String, attempt: u32 },
+    /// A retry is scheduled: the next attempt begins after `delay`.
+    ///
+    /// Emitted once, when the wait starts, so a UI can show *when* the
+    /// download resumes rather than only that it is waiting. The wait is
+    /// interruptible, so treat this as the current plan rather than a promise.
+    RetryScheduled {
+        /// The part this retry belongs to, when it belongs to one. `None` for
+        /// retries of a whole-download step such as the initial probe.
+        ulid: Option<String>,
+        attempt: u32,
+        max_attempts: u32,
+        delay: Duration,
+        /// The delay is the server's own `Retry-After`, not odl's backoff.
+        /// Worth distinguishing: a UI can say the server asked for the wait,
+        /// and a caller knows shortening it will not help.
+        server_requested: bool,
+    },
     /// Free-form status message (e.g. "Warming up", "Waiting for retry…").
     Message(String),
     /// Download finished successfully and final file is at `path`.

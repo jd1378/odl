@@ -66,6 +66,28 @@ impl RetryPolicy for FixedThenExponentialRetry {
     }
 }
 
+/// Longest `Retry-After` odl will actually sit out.
+///
+/// The header is the server's instruction, but it is also attacker- or
+/// bug-supplied: an unbounded value parks a download for as long as the
+/// sender likes. Waiting is still interruptible, so this caps the damage
+/// rather than second-guessing a reasonable value.
+pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(300);
+
+/// Parse a `Retry-After` value: either delta-seconds or an HTTP-date.
+///
+/// A date already in the past yields `Duration::ZERO` — retry now — rather
+/// than being discarded, which is what the server asked for.
+pub fn parse_retry_after(value: &str) -> Option<Duration> {
+    let value = value.trim();
+    if let Ok(secs) = value.parse::<u64>() {
+        return Some(Duration::from_secs(secs));
+    }
+    let when = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    let delta = when.timestamp() - chrono::Utc::now().timestamp();
+    Some(Duration::from_secs(delta.max(0) as u64))
+}
+
 /// Consult the retry policy after a failed attempt. If retry is allowed,
 /// sleeps until the scheduled retry time while emitting countdown
 /// [`ProgressEvent::Message`] events on `ctx`. Returns `true` if caller
@@ -79,13 +101,30 @@ pub async fn wait_for_retry(
     policy: &FixedThenExponentialRetry,
     attempts_so_far: u32,
     ctx: &DownloadContext,
+    ulid: Option<&str>,
+    retry_after: Option<Duration>,
 ) -> bool {
     let n_past = attempts_so_far.saturating_sub(1);
     match policy.should_retry(SystemTime::now(), n_past) {
         RetryDecision::Retry { execute_after } => {
-            let wait = execute_after
-                .duration_since(SystemTime::now())
-                .unwrap_or_default();
+            // The policy still decides *whether* to retry; `Retry-After` only
+            // decides when. A server that says to come back in a minute knows
+            // something odl's backoff curve does not, and racing it earns
+            // another refusal — but the attempt budget stays the caller's.
+            let server_requested = retry_after.is_some();
+            let wait = match retry_after {
+                Some(d) => d.min(MAX_RETRY_AFTER),
+                None => execute_after
+                    .duration_since(SystemTime::now())
+                    .unwrap_or_default(),
+            };
+            ctx.emit(ProgressEvent::RetryScheduled {
+                ulid: ulid.map(str::to_owned),
+                attempt: attempts_so_far,
+                max_attempts: policy.max_n_retries,
+                delay: wait,
+                server_requested,
+            });
 
             let sleep = time::sleep(wait);
             tokio::pin!(sleep);
@@ -95,10 +134,15 @@ pub async fn wait_for_retry(
             loop {
                 let remaining = wait.checked_sub(start.elapsed()).unwrap_or_default();
                 let msg = format!(
-                    " Retrying {}/{} in {}",
+                    " Retrying {}/{} in {}{}",
                     attempts_so_far,
                     policy.max_n_retries,
-                    format_wait(remaining)
+                    format_wait(remaining),
+                    if server_requested {
+                        " (server asked us to wait)"
+                    } else {
+                        ""
+                    }
                 );
                 // Only emit when the rendered countdown text actually
                 // changes; avoids flooding the reporter queue with
@@ -276,5 +320,52 @@ mod tests {
                 panic!("Expected Retry, got {:?}", decision);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod retry_after_tests {
+    use super::*;
+
+    #[test]
+    fn delta_seconds_is_taken_literally() {
+        assert_eq!(parse_retry_after("120"), Some(Duration::from_secs(120)));
+        assert_eq!(parse_retry_after("  30 "), Some(Duration::from_secs(30)));
+        assert_eq!(parse_retry_after("0"), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn an_http_date_becomes_the_time_until_it() {
+        let soon = chrono::Utc::now() + chrono::Duration::seconds(90);
+        let parsed = parse_retry_after(&soon.to_rfc2822()).expect("a date is a valid value");
+        // Bounded rather than exact: the clock moves between the two calls.
+        assert!(
+            parsed.as_secs() >= 85 && parsed.as_secs() <= 90,
+            "got {parsed:?}"
+        );
+    }
+
+    #[test]
+    fn a_date_already_past_means_now_rather_than_nothing() {
+        // Retrying immediately is what the server asked for; discarding the
+        // header would instead impose odl's own backoff.
+        let past = chrono::Utc::now() - chrono::Duration::seconds(60);
+        assert_eq!(parse_retry_after(&past.to_rfc2822()), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn nonsense_is_ignored_so_the_configured_backoff_applies() {
+        assert_eq!(parse_retry_after(""), None);
+        assert_eq!(parse_retry_after("soon"), None);
+        assert_eq!(parse_retry_after("-5"), None);
+    }
+
+    #[test]
+    fn an_absurd_value_is_capped_rather_than_obeyed() {
+        // The header is server-supplied, so an unbounded one parks the
+        // download for as long as the sender likes.
+        let huge = parse_retry_after("999999999").expect("parses");
+        assert!(huge > MAX_RETRY_AFTER);
+        assert_eq!(huge.min(MAX_RETRY_AFTER), MAX_RETRY_AFTER);
     }
 }

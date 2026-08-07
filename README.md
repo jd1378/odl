@@ -266,7 +266,15 @@ contract — the full specification is printed by `odl --help`.
 
 - **Downloads** stream newline-delimited JSON (NDJSON) on stdout, one
   object per line, each tagged with `type` and `url`: `phase`,
-  `filename`, `progress`, `message`, `completed`, `failed`, `cancelled`.
+  `filename`, `progress`, `message`, `retry_scheduled`, `completed`,
+  `failed`, `cancelled`.
+- **`retry_scheduled`** says a transfer is paused and when it resumes, so a
+  pause is distinguishable from a hang:
+  `{"type":"retry_scheduled","part":"<ulid|null>","attempt":1,`
+  `"max_attempts":3,"delay_ms":5000,"server_requested":false}`.
+  `server_requested` is true when the delay is the server's own
+  `Retry-After` rather than odl's backoff — that one is not worth
+  shortening, and odl honours it up to five minutes.
 - **`probe`, `status`/`list`, `config --show`** emit a single JSON
   document on stdout.
 - **Errors** print one JSON object on stderr:

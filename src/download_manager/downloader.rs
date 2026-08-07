@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use bytes::Bytes;
 use reqwest::{
     Client, StatusCode,
-    header::{ACCEPT_ENCODING, CONTENT_RANGE, HeaderValue, RANGE, USER_AGENT},
+    header::{ACCEPT_ENCODING, CONTENT_RANGE, HeaderValue, RANGE, RETRY_AFTER, USER_AGENT},
 };
 use tokio::{
     fs,
@@ -1351,8 +1351,16 @@ async fn download_part(
             Ok(Err(e)) => {
                 file.finish().await?;
                 let cause = OdlError::from(e);
-                match retry_sleep_or_fail_part(&policy, attempts, attempts + 1, &ctx, &ulid, cause)
-                    .await
+                match retry_sleep_or_fail_part(
+                    &policy,
+                    attempts,
+                    attempts + 1,
+                    &ctx,
+                    &ulid,
+                    cause,
+                    None,
+                )
+                .await
                 {
                     Ok(()) => {
                         attempts = attempts.saturating_add(1);
@@ -1366,8 +1374,16 @@ async fn download_part(
                 // flush any partial progress to disk before retrying
                 file.finish().await?;
                 let cause = OdlError::Network(crate::error::NetworkError::Timeout);
-                match retry_sleep_or_fail_part(&policy, attempts, attempts + 1, &ctx, &ulid, cause)
-                    .await
+                match retry_sleep_or_fail_part(
+                    &policy,
+                    attempts,
+                    attempts + 1,
+                    &ctx,
+                    &ulid,
+                    cause,
+                    None,
+                )
+                .await
                 {
                     Ok(()) => {
                         attempts = attempts.saturating_add(1);
@@ -1403,8 +1419,23 @@ async fn download_part(
                 }
                 StatusVerdict::Transient(cause) => cause,
             };
-            match retry_sleep_or_fail_part(&policy, attempts, attempts + 1, &ctx, &ulid, cause)
-                .await
+            // A server that says when to come back knows something odl's
+            // backoff curve does not; racing it just earns another refusal.
+            let retry_after = resp
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(crate::retry_policies::parse_retry_after);
+            match retry_sleep_or_fail_part(
+                &policy,
+                attempts,
+                attempts + 1,
+                &ctx,
+                &ulid,
+                cause,
+                retry_after,
+            )
+            .await
             {
                 Ok(()) => {
                     attempts = attempts.saturating_add(1);
@@ -1456,6 +1487,7 @@ async fn download_part(
                             &ctx,
                             &ulid,
                             e,
+                            None,
                         )
                         .await
                         {
@@ -1478,6 +1510,7 @@ async fn download_part(
                         &ctx,
                         &ulid,
                         cause,
+                        None,
                     )
                     .await
                     {
@@ -1576,7 +1609,8 @@ async fn download_part(
         let cause = OdlError::Network(crate::error::NetworkError::Other {
             message: "the transfer ended before the part was complete".to_owned(),
         });
-        match retry_sleep_or_fail_part(&policy, attempts, attempts, &ctx, &ulid, cause).await {
+        match retry_sleep_or_fail_part(&policy, attempts, attempts, &ctx, &ulid, cause, None).await
+        {
             Ok(()) => continue,
             Err(failed) => return Ok(failed),
         }
@@ -1652,12 +1686,13 @@ async fn retry_sleep_or_fail_part(
     ctx: &DownloadContext,
     ulid: &str,
     cause: OdlError,
+    retry_after: Option<Duration>,
 ) -> Result<(), PartEvent> {
     ctx.emit(ProgressEvent::PartRetrying {
         ulid: ulid.to_string(),
         attempt: attempts_display,
     });
-    if wait_for_retry(policy, attempts_display, ctx).await {
+    if wait_for_retry(policy, attempts_display, ctx, Some(ulid), retry_after).await {
         Ok(())
     } else {
         Err(PartEvent::Failed {
