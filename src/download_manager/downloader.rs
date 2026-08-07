@@ -355,6 +355,33 @@ impl Downloader {
             }
         }
 
+        // Nothing is in flight. That is only success if there is also nothing
+        // left to do: `fill_capacity` returns early after a failed batch
+        // without rescheduling, so the requeued parts can still be sitting in
+        // `pending` when the last task drains the set. Reporting Ok there left
+        // the assembler to notice, which it did — as "part file shorter than
+        // recorded size", an I/O error for what was really a failed transfer.
+        //
+        // Cancellation is checked first rather than assumed away. The loop's
+        // `select!` has no `biased`, so when the token fires with nothing left
+        // in flight both arms are ready and tokio picks one at random — half
+        // the time control arrives here instead of at the `Cancelled` arm.
+        // Reporting a stopped download as a failure would be wrong twice over:
+        // exit 1 instead of 130, and a caller that auto-retries failures would
+        // restart what the user just stopped.
+        if self.ctx.is_cancelled() {
+            return Err(OdlError::Cancelled);
+        }
+        if !pending.is_empty() {
+            let unfinished = pending.len();
+            return Err(OdlError::Other {
+                message: format!(
+                    "{unfinished} part(s) could not be downloaded and no connection is left to retry them"
+                ),
+                origin: Box::new(std::io::Error::other("parts left unfinished")),
+            });
+        }
+
         let metadata_mutex = Arc::try_unwrap(self.metadata).map_err(|_| {
             OdlError::MetadataError(MetadataError::Other {
                 message: "Failed to unwrap metadata Arc".to_string(),

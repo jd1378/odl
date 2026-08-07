@@ -19,6 +19,16 @@ fn run_against(
     get: impl FnOnce(&mut mockito::Server) -> mockito::Mock,
     connections: &str,
 ) -> (Option<i32>, Option<Vec<u8>>) {
+    let (code, file, _) = run_capturing(get, connections);
+    (code, file)
+}
+
+/// As [`run_against`], also returning odl's JSON output so a test can assert
+/// on which failure was reported, not merely that one was.
+fn run_capturing(
+    get: impl FnOnce(&mut mockito::Server) -> mockito::Mock,
+    connections: &str,
+) -> (Option<i32>, Option<Vec<u8>>, String) {
     let mut server = mockito::Server::new();
     let url = format!("{}/file", server.url());
 
@@ -47,12 +57,45 @@ fn run_against(
         .arg("0")
         .arg("--format")
         .arg("json")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
         .expect("failed to spawn odl binary");
 
-    (status.code(), std::fs::read(&out).ok())
+    let reported = String::from_utf8_lossy(&status.stderr).into_owned()
+        + &String::from_utf8_lossy(&status.stdout);
+    (status.status.code(), std::fs::read(&out).ok(), reported)
+}
+
+#[test]
+fn a_transfer_failure_is_reported_as_one() {
+    // Every part fails, so nothing is left in flight while parts are still
+    // queued. That used to end the run as `Ok`, leaving the assembler to
+    // notice — and it reported "part file shorter than recorded size", an I/O
+    // error for what was plainly a failed transfer.
+    let (code, file, reported) = run_capturing(
+        |s| {
+            s.mock("GET", "/file")
+                .expect_at_least(1)
+                .with_status(500)
+                .with_body("boom")
+                .create()
+        },
+        "4",
+    );
+    assert_ne!(code, Some(0), "a failed transfer must not report success");
+    assert!(
+        !reported.contains("shorter than recorded size"),
+        "the assembler should not be the one to notice: {reported}"
+    );
+    assert!(
+        reported.contains("could not be downloaded"),
+        "expected a transfer failure, got: {reported}"
+    );
+    assert!(
+        file.is_none(),
+        "a failed download must leave no output file"
+    );
 }
 
 #[test]
