@@ -437,10 +437,13 @@ impl DownloadManager {
                 Err(e) => {
                     attempts = attempts.saturating_add(1);
                     if !wait_for_retry(&retry_policy, attempts, ctx, None, None).await {
+                        // `false` also means the wait was cancelled, and a
+                        // stopped download must not report the network error
+                        // that happened to precede the stop.
+                        if ctx.is_cancelled() {
+                            return Err(OdlError::Cancelled);
+                        }
                         return Err(OdlError::from(e));
-                    }
-                    if ctx.is_cancelled() {
-                        return Err(OdlError::Cancelled);
                     }
                 }
             }

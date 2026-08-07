@@ -598,6 +598,15 @@ impl Downloader {
                     attempts,
                     cause,
                 } => {
+                    // A part whose retry wait was interrupted reports the same
+                    // `Failed` as one that spent its budget: `wait_for_retry`
+                    // returns false for both. Telling them apart matters — a
+                    // paused job reported as Failed is one a caller may
+                    // auto-restart, and the exit code flips 130 to 1.
+                    if self.ctx.is_cancelled() {
+                        join_set.shutdown().await;
+                        return Err(OdlError::Cancelled);
+                    }
                     // Kept so a download that ends with parts still queued can
                     // report the transfer failure that got it there, rather
                     // than a generic "some parts are unfinished".

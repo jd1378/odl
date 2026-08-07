@@ -132,10 +132,17 @@ shorter than recorded size": an I/O error for what was plainly a failed
 transfer. The cause is now carried out of the scheduler, so the same download
 exits 3 with `HTTP 503 Service Unavailable`.
 
-A download stopped by the caller reports as cancelled rather than as a failure.
-With nothing left in flight the run loop's `select!` could take either branch,
-so a stop had an even chance of surfacing as exit 1 instead of 130 — and of
-being retried by a caller that retries failures.
+A download stopped by the caller reports as cancelled rather than as a
+failure. Two separate paths got this wrong. With nothing left in flight the
+run loop's `select!` could take either branch, so a stop had an even chance of
+surfacing as exit 1 instead of 130. And a part interrupted *during a retry
+backoff* reported the same `Failed` as one that had spent its budget, because
+`wait_for_retry` returns `false` for both — so stopping a waiting download
+surfaced as "All parts failed", reproducibly about one run in ten. The same
+conflation is fixed for the probe and for yt-dlp respawns.
+
+This matters beyond the exit code: a caller that auto-retries failures would
+restart a job the user had just paused.
 
 A failed download no longer leaves an output file behind. Assembly sizes the
 destination up front, so a failure part-way through left a full-length file of

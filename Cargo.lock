@@ -1316,6 +1316,7 @@ dependencies = [
  "humantime",
  "indexmap",
  "indicatif",
+ "libc",
  "md-5",
  "mime_guess",
  "mockito",

@@ -93,6 +93,13 @@ pub fn parse_retry_after(value: &str) -> Option<Duration> {
 /// [`ProgressEvent::Message`] events on `ctx`. Returns `true` if caller
 /// should retry, `false` if no further retries are allowed.
 ///
+/// `false` conflates two different endings: the budget is spent, or the wait
+/// was interrupted by cancellation. They need different errors — a stopped
+/// download reported as a failure is one a caller may auto-restart — so every
+/// caller must check [`DownloadContext::is_cancelled`] before deciding what
+/// `false` meant. The return type cannot say so itself without breaking the
+/// published signature.
+///
 /// `attempts_so_far` is the number of attempts already made (>= 1 after a
 /// failure). The policy is queried with `attempts_so_far - 1` as
 /// `n_past_retries`. The wait is interrupted early if `ctx` is cancelled,
