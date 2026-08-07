@@ -94,9 +94,12 @@ fn an_error_page_is_not_written_as_part_data() {
         "2",
     );
     assert_ne!(code, Some(0), "a failed transfer must not report success");
+    // Not merely "not the error page": no file at all. Assembly sizes the
+    // destination up front, so failing part-way used to leave a full-length
+    // run of zeros looking like a finished download.
     assert!(
-        file.is_none_or(|f| f.iter().all(|b| *b == 0)),
-        "an error page must never reach the output file"
+        file.is_none(),
+        "a failed download must leave no output file"
     );
 }
 
@@ -164,11 +167,7 @@ fn a_200_may_carry_content_range_and_is_judged_on_it() {
         Some(4),
         "a slice is not the whole file"
     );
-    assert!(
-        starting_elsewhere
-            .1
-            .is_none_or(|f| f.iter().all(|b| *b == 0))
-    );
+    assert!(starting_elsewhere.1.is_none(), "no output from a refusal");
 }
 
 #[test]

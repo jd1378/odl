@@ -844,7 +844,21 @@ impl DownloadManager {
 
             ctx.emit(ProgressEvent::PhaseChanged(Phase::Assembling));
             let final_path =
-                assemble_final_file(&metadata, &instruction, ctx, opts.verify_checksums()).await?;
+                match assemble_final_file(&metadata, &instruction, ctx, opts.verify_checksums())
+                    .await
+                {
+                    Ok(p) => p,
+                    Err(e) => {
+                        // Assembly sizes the destination up front, so a failure
+                        // part-way leaves a full-length file of mostly zeros
+                        // sitting where the download was meant to land. Nothing
+                        // marks it as junk: a caller that lists the directory, or
+                        // a person who looks at it, sees a complete-looking file.
+                        // Take it away — this run produced no output.
+                        let _ = tokio::fs::remove_file(instruction.final_file_path()).await;
+                        return Err(e);
+                    }
+                };
 
             // Mark metadata fully finished BEFORE removing parts. If
             // the process dies between these two steps, parts simply

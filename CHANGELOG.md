@@ -101,6 +101,11 @@ keep working: a single connection with nothing downloaded yet, where a `200`
 returns exactly the bytes requested. That stays accepted whether the body
 arrives with a `Content-Length` or chunked without one.
 
+A failed download no longer leaves an output file behind. Assembly sizes the
+destination up front, so a failure part-way through left a full-length file of
+mostly zeros sitting where the download was meant to land, with nothing to
+mark it as junk.
+
 ### Breaking changes
 
 Metadata written by 1.x still loads — the engine discriminant defaults to
