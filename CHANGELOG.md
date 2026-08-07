@@ -1,6 +1,39 @@
 # Changelog
 
-## 2.0.0
+## 2.0.2
+
+### Stopping a waiting download
+
+A download interrupted *while sitting in a retry backoff* reported the error
+that preceded the stop instead of a cancellation: exit 1 with "All parts
+failed", where a stop should exit 130. `wait_for_retry` returns `false` both
+when the retry budget is spent and when the wait is interrupted, and every
+caller read that as exhaustion.
+
+It matters beyond the exit code — a download manager or CI wrapper that
+restarts failed jobs would restart one the user had just paused, repeatedly.
+
+Fixed at all three places that consult the retry policy: part transfers, the
+initial probe, and yt-dlp respawns. The probe already had a cancellation check
+sitting after its early return, where it could never run.
+
+Reproduced against an always-503 server with a 20s backoff, interrupted 3s in:
+1 run in 10 before, 0 in 20 after. The regression test repeats the interrupt
+six times, since a single pass would miss it.
+
+`wait_for_retry` keeps its `bool` return: an enum would let the compiler force
+each caller to handle cancellation — three of them independently forgetting the
+same check is the argument for it — but that is published API, so it waits for
+3.0. The ambiguity is documented on the function meanwhile.
+
+## 2.0.1
+
+The first complete 2.0 release: 2.0.0's binaries were never published for
+32-bit Linux or 32-bit ARM. A test asserted that every target odl ships for has
+a yt-dlp build to install, which was never true — yt-dlp publishes no
+standalone build for those platforms, and odl correctly declines to offer an
+install there. The assertion failed the release on four targets. Library
+behaviour is unchanged, so 2.0.0 from crates.io is unaffected.
 
 ### Media sites are delegated to yt-dlp
 
@@ -133,16 +166,9 @@ transfer. The cause is now carried out of the scheduler, so the same download
 exits 3 with `HTTP 503 Service Unavailable`.
 
 A download stopped by the caller reports as cancelled rather than as a
-failure. Two separate paths got this wrong. With nothing left in flight the
-run loop's `select!` could take either branch, so a stop had an even chance of
-surfacing as exit 1 instead of 130. And a part interrupted *during a retry
-backoff* reported the same `Failed` as one that had spent its budget, because
-`wait_for_retry` returns `false` for both — so stopping a waiting download
-surfaced as "All parts failed", reproducibly about one run in ten. The same
-conflation is fixed for the probe and for yt-dlp respawns.
-
-This matters beyond the exit code: a caller that auto-retries failures would
-restart a job the user had just paused.
+failure. With nothing left in flight the run loop's `select!` could take
+either branch, so a stop had an even chance of surfacing as exit 1 instead of
+130 — and of being restarted by a caller that auto-retries failures.
 
 A failed download no longer leaves an output file behind. Assembly sizes the
 destination up front, so a failure part-way through left a full-length file of
