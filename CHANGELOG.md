@@ -101,6 +101,14 @@ keep working: a single connection with nothing downloaded yet, where a `200`
 returns exactly the bytes requested. That stays accepted whether the body
 arrives with a `Content-Length` or chunked without one.
 
+A refusal the server means permanently is no longer retried. A `404`, `410`,
+`403`, `401` or `416` on a part used to spend the full retry budget with
+backoff — seconds, to reach the answer the first response already gave — and
+then exit 3, the class that tells a script or a GUI to try the whole thing
+again. Those now fail the part immediately and exit 4, the conflict class, so
+a dead link stops looking like a busy server. `408`, `425`, `429` and 5xx keep
+their retries and their retryable class.
+
 A transfer that fails now reports itself as one. `fill_capacity` returns early
 after a failed batch without rescheduling, so the requeued parts could still be
 queued when the last connection drained — the failure is now carried
