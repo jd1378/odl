@@ -101,7 +101,9 @@ keep working: a single connection with nothing downloaded yet, where a `200`
 returns exactly the bytes requested. That stays accepted whether the body
 arrives with a `Content-Length` or chunked without one.
 
-Retry waits are reported. A download that pauses to retry looked identical to
+### Retries say what they are waiting for
+
+A download that pauses to retry looked identical to
 one that had hung: the only sign was a free-form `message` string nothing could
 parse. The new `retry_scheduled` event carries `delay_ms`, `attempt`,
 `max_attempts`, the part it belongs to, and whether the delay is the server's
@@ -112,7 +114,7 @@ own — so a UI can say "resuming in 30s" and mean it.
 budget stays the caller's; the header only moves *when* the next attempt
 happens, not whether there is one.
 
-A refusal the server means permanently is no longer retried. A `404`, `410`,
+A refusal the server means permanently is no longer retried at all. A `404`, `410`,
 `403`, `401` or `416` on a part used to spend the full retry budget with
 backoff — seconds, to reach the answer the first response already gave — and
 then exit 3, the class that tells a script or a GUI to try the whole thing
@@ -120,12 +122,20 @@ again. Those now fail the part immediately and exit 4, the conflict class, so
 a dead link stops looking like a busy server. `408`, `425`, `429` and 5xx keep
 their retries and their retryable class.
 
-A transfer that fails now reports itself as one. `fill_capacity` returns early
-after a failed batch without rescheduling, so the requeued parts could still be
-queued when the last connection drained — the failure is now carried
-out of the scheduler, so a refused download exits 3 with `HTTP 503` rather than
-1 with "something failed" — or, before that, 5 with "part file shorter than
-recorded size", an I/O error for what was plainly a failed transfer.
+### Failures report their cause
+
+A transfer that fails now says what failed. When every part in flight exhausts
+its retries at once, the run ends with work still queued — correctly, since
+the retry budget is the caller's stated tolerance and it is spent. But it used
+to end as *success*, leaving the assembler to notice and report "part file
+shorter than recorded size": an I/O error for what was plainly a failed
+transfer. The cause is now carried out of the scheduler, so the same download
+exits 3 with `HTTP 503 Service Unavailable`.
+
+A download stopped by the caller reports as cancelled rather than as a failure.
+With nothing left in flight the run loop's `select!` could take either branch,
+so a stop had an even chance of surfacing as exit 1 instead of 130 — and of
+being retried by a caller that retries failures.
 
 A failed download no longer leaves an output file behind. Assembly sizes the
 destination up front, so a failure part-way through left a full-length file of
