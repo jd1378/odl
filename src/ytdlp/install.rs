@@ -481,10 +481,29 @@ cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc *yt-dlp.exe
     }
 
     #[test]
-    fn this_platform_has_a_yt_dlp_build() {
-        // Every target odl ships for is covered upstream; a gap here means the
-        // asset table needs updating rather than a silent fallback.
-        assert!(can_install(Tool::Ytdlp), "no yt-dlp asset mapped");
+    fn a_yt_dlp_build_is_offered_exactly_where_upstream_has_one() {
+        // Not every target odl ships for is covered upstream: yt-dlp
+        // publishes no standalone build for 32-bit Linux or 32-bit ARM, and
+        // odl ships binaries for both. `can_install` answering false there is
+        // correct — the install offer is simply not made, and the link still
+        // downloads over HTTP. Asserting a build exists everywhere failed the
+        // release on those targets over a premise that was never true.
+        let upstream_builds_for_this_platform = cfg!(target_os = "macos")
+            || cfg!(target_os = "windows")
+            || (cfg!(target_os = "linux")
+                && (cfg!(target_arch = "x86_64") || cfg!(target_arch = "aarch64")));
+
+        if upstream_builds_for_this_platform {
+            assert!(
+                can_install(Tool::Ytdlp),
+                "the asset table lost a platform upstream still builds for"
+            );
+        } else {
+            assert!(
+                !can_install(Tool::Ytdlp),
+                "an asset name was invented for a platform yt-dlp does not build for"
+            );
+        }
     }
 
     #[test]
