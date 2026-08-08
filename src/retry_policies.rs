@@ -145,8 +145,10 @@ pub async fn wait_for_retry(
                     attempts_so_far,
                     policy.max_n_retries,
                     format_wait(remaining),
+                    // The wait is the server's own `Retry-After`, so it is
+                    // not odl's backoff curve to shorten.
                     if server_requested {
-                        " (server asked us to wait)"
+                        " (Rate limited)"
                     } else {
                         ""
                     }

@@ -641,15 +641,15 @@ impl ProgressReporter for CliReporter {
                     } else {
                         delay
                     };
-                    // Whose idea the wait was, because a server's
-                    // `Retry-After` is not something a shorter backoff fixes.
-                    let who = if server_requested {
-                        "server asked"
+                    // Same wording as the parent countdown: the wait is the
+                    // server's own `Retry-After`, not a backoff to shorten.
+                    let why = if server_requested {
+                        " (Rate limited)"
                     } else {
-                        "retry"
+                        ""
                     };
                     p.bar.set_message(format!(
-                        "{who} #{attempt}/{max_attempts} in {}",
+                        "retry #{attempt}/{max_attempts} in {}{why}",
                         humantime::format_duration(rounded)
                     ));
                 }

@@ -39,10 +39,12 @@ ignores it keeps compiling — it will just show the stale rows.
 
 The parent line already counts a backoff down, but with several parts in
 flight it does not say which of them is waiting — the part's own row showed
-`retry #2` and nothing more. It now reads `retry #2/5 in 20s`, or
-`server asked #2/5 in 20s` when the delay is the server's own `Retry-After`,
+`retry #2` and nothing more. It now reads `retry #2/5 in 20s`, with
+`(Rate limited)` appended when the delay is the server's own `Retry-After`,
 which no shorter backoff can improve. The countdown keeps the parent line to
-itself, including for retries of whole-download steps such as the probe.
+itself, including for retries of whole-download steps such as the probe; it
+carries the same `(Rate limited)` note, replacing the wordier
+"(server asked us to wait)".
 
 ### Rampup is settable from the command line
 
