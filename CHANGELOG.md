@@ -1,5 +1,30 @@
 # Changelog
 
+## 2.2.0
+
+### Verification reports progress
+
+Hashing the finished file ran to completion silently, so the one stage where a
+consumer could show nothing was also the one that can take several seconds on a
+large file: the bar sat at 100% and hoped. Verification now reports on its own
+row through the same `Part*` events assembly uses, under
+`odl::progress::VERIFY_ULID`. `HashDigest::from_path_with_progress` and
+`from_reader_with_progress` expose the same thing to library callers — a
+per-block byte count, with no opinion about how it should be displayed.
+
+### Assembly no longer rewinds the download's progress
+
+Assembly reused the aggregate `Progress` event and counted its copy from zero,
+so every consumer that did not special-case the phase showed the download
+falling back toward 0% at the finish line. The transfer is complete by then.
+The aggregate now belongs to the transfer alone: assembly and verification
+report on their own rows, and the downloader emits one final `Progress` at the
+full size, because the 8 Hz sampler's last tick almost always lands short of
+the end and nothing follows it any more.
+
+If you were compensating for this by ignoring `Progress` during
+`Phase::Assembling`, that workaround is now unnecessary but harmless.
+
 ## 2.1.0
 
 ### `odl update`

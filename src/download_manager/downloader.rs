@@ -197,8 +197,20 @@ impl Downloader {
         // from per-chunk hot path so CPU stays low even with thousands of
         // tiny chunks per second.
         let sampler_handle = self.spawn_speed_sampler();
+        let tracker = Arc::clone(&self.tracker);
+        let ctx = self.ctx.clone();
         let result = self.run_inner().await;
         sampler_handle.abort();
+        // The sampler ticks at 125 ms, so its last word almost always lands
+        // short of the end — and nothing follows it, now that assembly reports
+        // on its own row instead of restarting the aggregate. Say the transfer
+        // is complete once, from the one place that knows it is.
+        if result.is_ok() {
+            ctx.emit(ProgressEvent::Progress {
+                downloaded: tracker.total().unwrap_or_else(|| tracker.downloaded()),
+                total: tracker.total(),
+            });
+        }
         result
     }
 

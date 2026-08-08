@@ -103,10 +103,21 @@ impl HashDigest {
         algo: HashAlgorithm,
         encoding: HashEncoding,
     ) -> async_io::Result<HashDigest> {
+        Self::from_path_with_progress(path, algo, encoding, |_| {}).await
+    }
+
+    /// As [`Self::from_path`], reporting progress as it goes. See
+    /// [`Self::from_reader_with_progress`] for what `on_bytes` receives.
+    pub async fn from_path_with_progress(
+        path: impl AsRef<std::path::Path>,
+        algo: HashAlgorithm,
+        encoding: HashEncoding,
+        on_bytes: impl FnMut(u64) + Send,
+    ) -> async_io::Result<HashDigest> {
         // No `BufReader`: the hashing loop reads in large blocks already, and
         // layering a smaller buffer under it would only add a copy.
         let file = tokio::fs::File::open(path.as_ref()).await?;
-        Self::from_reader_with_algorithm(file, algo, encoding).await
+        Self::from_reader_with_progress(file, algo, encoding, on_bytes).await
     }
 
     /// Whether the file at `path` has the digest `expected` claims.
@@ -134,8 +145,14 @@ impl HashDigest {
     }
 
     /// Hashes the contents of an async reader using the specified Digest type (async).
+    ///
+    /// `on_bytes` is called with the size of each block as it is hashed. It is
+    /// `&mut dyn` rather than a generic so the one closure can be handed to
+    /// whichever algorithm arm runs, and `Send` because the future holding it
+    /// is routinely spawned.
     async fn hash_reader<D: Digest + Default + Unpin>(
         mut reader: impl AsyncRead + Unpin,
+        on_bytes: &mut (dyn FnMut(u64) + Send),
     ) -> async_io::Result<D> {
         let mut hasher = D::default();
         // Heap rather than the stack: this buffer lives inside the returned
@@ -147,6 +164,7 @@ impl HashDigest {
                 break;
             }
             hasher.update(&buf[..n]);
+            on_bytes(n as u64);
         }
         Ok(hasher)
     }
@@ -157,9 +175,43 @@ impl HashDigest {
         algo: HashAlgorithm,
         encoding: HashEncoding,
     ) -> async_io::Result<HashDigest> {
+        Self::from_reader_with_progress(reader, algo, encoding, |_| {}).await
+    }
+
+    /// As [`Self::from_reader_with_algorithm`], reporting progress as it goes.
+    ///
+    /// `on_bytes` receives the size of each block as it is hashed — a running
+    /// delta, not a total. Hashing a large file takes long enough to look like
+    /// a hang, and this is the only way a caller can show otherwise; nothing
+    /// here knows about progress events, so the shape of the report stays the
+    /// caller's decision.
+    ///
+    /// ```no_run
+    /// # async fn example() -> std::io::Result<()> {
+    /// use odl::hash::{HashAlgorithm, HashDigest, HashEncoding};
+    /// let file = tokio::fs::File::open("/tmp/big.iso").await?;
+    /// let mut hashed = 0u64;
+    /// let digest = HashDigest::from_reader_with_progress(
+    ///     file,
+    ///     HashAlgorithm::SHA256,
+    ///     HashEncoding::Hex,
+    ///     |n| hashed += n,
+    /// )
+    /// .await?;
+    /// println!("{digest:?} over {hashed} bytes");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn from_reader_with_progress<R: AsyncRead + Unpin>(
+        reader: R,
+        algo: HashAlgorithm,
+        encoding: HashEncoding,
+        mut on_bytes: impl FnMut(u64) + Send,
+    ) -> async_io::Result<HashDigest> {
+        let on_bytes: &mut (dyn FnMut(u64) + Send) = &mut on_bytes;
         match algo {
             HashAlgorithm::MD5 => {
-                let hasher = Self::hash_reader::<Md5>(reader).await?;
+                let hasher = Self::hash_reader::<Md5>(reader, on_bytes).await?;
                 let bytes = hasher.finalize();
                 let s = match encoding {
                     HashEncoding::Hex => to_hex(&bytes),
@@ -168,7 +220,7 @@ impl HashDigest {
                 Ok(HashDigest::MD5(s, encoding))
             }
             HashAlgorithm::SHA1 => {
-                let hasher = Self::hash_reader::<Sha1>(reader).await?;
+                let hasher = Self::hash_reader::<Sha1>(reader, on_bytes).await?;
                 let bytes = hasher.finalize();
                 let s = match encoding {
                     HashEncoding::Hex => to_hex(&bytes),
@@ -177,7 +229,7 @@ impl HashDigest {
                 Ok(HashDigest::SHA1(s, encoding))
             }
             HashAlgorithm::SHA256 => {
-                let hasher = Self::hash_reader::<Sha256>(reader).await?;
+                let hasher = Self::hash_reader::<Sha256>(reader, on_bytes).await?;
                 let bytes = hasher.finalize();
                 let s = match encoding {
                     HashEncoding::Hex => to_hex(&bytes),
@@ -186,7 +238,7 @@ impl HashDigest {
                 Ok(HashDigest::SHA256(s, encoding))
             }
             HashAlgorithm::SHA384 => {
-                let hasher = Self::hash_reader::<Sha384>(reader).await?;
+                let hasher = Self::hash_reader::<Sha384>(reader, on_bytes).await?;
                 let bytes = hasher.finalize();
                 let s = match encoding {
                     HashEncoding::Hex => to_hex(&bytes),
@@ -195,7 +247,7 @@ impl HashDigest {
                 Ok(HashDigest::SHA384(s, encoding))
             }
             HashAlgorithm::SHA512 => {
-                let hasher = Self::hash_reader::<Sha512>(reader).await?;
+                let hasher = Self::hash_reader::<Sha512>(reader, on_bytes).await?;
                 let bytes = hasher.finalize();
                 let s = match encoding {
                     HashEncoding::Hex => to_hex(&bytes),

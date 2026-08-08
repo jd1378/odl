@@ -23,10 +23,10 @@ use crate::{
 
 const COPY_BUF_SIZE: usize = 1024 * 1024;
 
-/// Sliding window length for the assembly speed sampler. Same rationale
-/// as `SPEED_WINDOW` in the downloader: bridges per-part `fetch_add`
-/// jitter so the rendered rate stays stable.
-const ASSEMBLY_SPEED_WINDOW: Duration = Duration::from_millis(1500);
+/// Sliding window length for the post-transfer speed samplers. Same rationale
+/// as `SPEED_WINDOW` in the downloader: bridges per-block `fetch_add` jitter so
+/// the rendered rate stays stable.
+const STAGE_SPEED_WINDOW: Duration = Duration::from_millis(1500);
 
 /// removes all .part files on disk
 pub async fn remove_all_parts(download_dir: &Path) {
@@ -56,12 +56,14 @@ pub async fn assemble_final_file(
 
     let total: u64 = sorted_parts.iter().map(|p| p.size).sum();
     ctx.emit(ProgressEvent::PhaseChanged(Phase::Assembling));
-    ctx.emit(ProgressEvent::Progress {
-        downloaded: 0,
-        total: Some(total),
-    });
-    // Surface assembly as a child bar so consumers can show progress +
-    // speed + ETA for it the same way they show download parts.
+    // Assembly reports only on its own row. It used to restart the aggregate
+    // `Progress` from zero, which made every consumer that did not special-case
+    // the phase show the download falling back to 0% at the finish line — the
+    // transfer is complete by then, and saying otherwise is a lie about the
+    // one number a caller is most likely to render.
+    //
+    // Surfaced as a child bar so consumers can show progress + speed + ETA for
+    // it the same way they show download parts.
     ctx.emit(ProgressEvent::PartAdded {
         ulid: ASSEMBLY_ULID.to_string(),
         offset: 0,
@@ -84,7 +86,8 @@ pub async fn assemble_final_file(
     // events at a fixed cadence — same model as the download sampler.
     let done_counter = Arc::new(AtomicU64::new(0));
     let done_for_blocking = Arc::clone(&done_counter);
-    let sampler_handle = spawn_assembly_sampler(ctx.clone(), Arc::clone(&done_counter), total);
+    let sampler_handle =
+        spawn_stage_sampler(ctx.clone(), ASSEMBLY_ULID, Arc::clone(&done_counter), total);
 
     let blocking_result = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
         assemble_blocking(
@@ -127,18 +130,25 @@ pub async fn assemble_final_file(
     if verify_contents {
         ctx.emit(ProgressEvent::PhaseChanged(Phase::Verifying));
     }
-    check_final_file_checksum(metadata, instruction, false, verify_contents).await?;
+    check_final_file_checksum(metadata, instruction, false, verify_contents, Some(ctx)).await?;
     Ok(final_path)
 }
 
-fn spawn_assembly_sampler(
+/// Emit progress + speed for a post-transfer stage on its own pseudo-part row,
+/// at the same cadence as the download sampler.
+///
+/// Nothing here touches the aggregate `Progress` / `Speed` events: those
+/// belong to the transfer, which has already finished by the time any of these
+/// stages run.
+pub(crate) fn spawn_stage_sampler(
     ctx: DownloadContext,
+    ulid: &'static str,
     done: Arc<AtomicU64>,
     total: u64,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        // Sliding window keeps the displayed assembly speed stable
-        // across the bursty per-part `done.fetch_add` cadence.
+        // Sliding window keeps the displayed speed stable across the bursty
+        // per-part `done.fetch_add` cadence.
         let mut window: VecDeque<(Instant, u64)> = VecDeque::new();
         window.push_back((Instant::now(), 0));
         loop {
@@ -149,22 +159,15 @@ fn spawn_assembly_sampler(
             let now = Instant::now();
             let cur = done.load(Ordering::Relaxed);
             window.push_back((now, cur));
-            trim_speed_window(&mut window, now, ASSEMBLY_SPEED_WINDOW);
+            trim_speed_window(&mut window, now, STAGE_SPEED_WINDOW);
             if let Some(rate) = speed_window_rate(&window) {
-                ctx.emit(ProgressEvent::Speed {
-                    bytes_per_second: rate,
-                });
                 ctx.emit(ProgressEvent::PartSpeed {
-                    ulid: ASSEMBLY_ULID.to_string(),
+                    ulid: ulid.to_string(),
                     bytes_per_second: rate,
                 });
             }
-            ctx.emit(ProgressEvent::Progress {
-                downloaded: cur,
-                total: Some(total),
-            });
             ctx.emit(ProgressEvent::PartProgress {
-                ulid: ASSEMBLY_ULID.to_string(),
+                ulid: ulid.to_string(),
                 downloaded: cur,
                 total,
             });

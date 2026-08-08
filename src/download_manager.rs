@@ -759,7 +759,7 @@ impl DownloadManager {
                     .await
                     .unwrap_or(false)
                 && opts.verify_checksums()
-                && check_final_file_checksum(&metadata, &instruction, false, true)
+                && check_final_file_checksum(&metadata, &instruction, false, true, None)
                     .await
                     .is_ok()
             {

@@ -92,7 +92,7 @@ where
     let mut should_reset_state = false;
     if metadata.finished {
         let checksum_result: Result<(), OdlError> =
-            check_final_file_checksum(&metadata, instruction, true, verify_contents).await;
+            check_final_file_checksum(&metadata, instruction, true, verify_contents, None).await;
 
         match checksum_result {
             Ok(_) => {

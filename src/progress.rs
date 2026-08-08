@@ -31,6 +31,13 @@ use tokio::sync::Notify;
 /// count.
 pub const ASSEMBLY_ULID: &str = "_assemble";
 
+/// Ulid carried by the part events that report checksum verification.
+///
+/// The same idea as [`ASSEMBLY_ULID`]: verification is not a part, but
+/// hashing a large file takes long enough to need a bar of its own, so it is
+/// reported through the machinery a consumer already has.
+pub const VERIFY_ULID: &str = "_verify";
+
 /// Sampling cadence for speed / progress events emitted by the lib.
 ///
 /// 8 Hz (~125 ms): high enough that bars animate smoothly, low enough

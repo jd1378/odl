@@ -578,6 +578,14 @@ impl ProgressReporter for CliReporter {
                 metrics.total.store(size, Ordering::Relaxed);
                 let style = build_child_style(&metrics);
                 let bar = self.mp.add(ProgressBar::new(size).with_style(style));
+                // The two pseudo-parts look exactly like a connection's row
+                // otherwise, and both run after the transfer, when a row that
+                // is still moving is the thing most in need of explaining.
+                match ulid.as_str() {
+                    odl::progress::ASSEMBLY_ULID => bar.set_message("assembling"),
+                    odl::progress::VERIFY_ULID => bar.set_message("verifying"),
+                    _ => {}
+                }
                 bar.enable_steady_tick(SAMPLE_INTERVAL);
                 self.parts
                     .lock()
