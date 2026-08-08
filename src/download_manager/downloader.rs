@@ -166,10 +166,15 @@ impl Downloader {
         }
         Self {
             instruction,
+            // Splitting a part means asking for a range, so a server that
+            // does not serve ranges is left with the one part it can answer —
+            // whatever the caller asked for, and however much spare capacity
+            // the connection cap appears to leave. Read before `metadata`
+            // moves into the field below.
+            dynamic_split: dynamic_split && metadata.is_resumable,
             metadata: Arc::new(Mutex::new(metadata)),
             client: Arc::new(client),
             randomize_user_agent,
-            dynamic_split,
             rampup,
             speed_limiter,
             retry_policy,
@@ -291,9 +296,33 @@ impl Downloader {
     }
 
     async fn run_inner(self) -> Result<DownloadMetadata, OdlError> {
+        let mut join_set: JoinSet<Result<PartEvent, OdlError>> = JoinSet::new();
+        let outcome = self.drive_parts(&mut join_set).await;
+        // No part task may outlive this call. Dropping the set only *asks*
+        // them to stop, and a caller that reacts to the error by clearing the
+        // work directory would then be racing tasks still writing into it.
+        // `shutdown` aborts and joins, so by the time the error is returned
+        // nothing is left holding a part.
+        join_set.shutdown().await;
+        outcome?;
+
+        let metadata_mutex = Arc::try_unwrap(self.metadata).map_err(|_| {
+            OdlError::MetadataError(MetadataError::Other {
+                message: "Failed to unwrap metadata Arc".to_string(),
+            })
+        })?;
+        Ok(metadata_mutex.into_inner())
+    }
+
+    /// Schedule and supervise every part until they are all finished, the
+    /// caller cancels, or one of them fails terminally. Leaves teardown of
+    /// `join_set` to [`Self::run_inner`], which does it on every path.
+    async fn drive_parts(
+        &self,
+        join_set: &mut JoinSet<Result<PartEvent, OdlError>>,
+    ) -> Result<(), OdlError> {
         let mut pending = self.pending_parts().await;
         let mut active: HashMap<String, ActiveTask> = HashMap::new();
-        let mut join_set: JoinSet<Result<PartEvent, OdlError>> = JoinSet::new();
         // Cause of the most recent exhausted part, so a download that ends
         // with work still queued reports what actually went wrong.
         let mut last_failure: Option<OdlError> = None;
@@ -302,7 +331,7 @@ impl Downloader {
         // we'll expand to fill the full concurrency capacity.
         if let Some(first_part) = pending.pop_front() {
             let probe = Arc::new(Notify::new());
-            self.schedule_part(first_part, &mut active, &mut join_set, Some(probe.clone()))
+            self.schedule_part(first_part, &mut active, join_set, Some(probe.clone()))
                 .await?;
 
             // Wait until either the probe signals it has started receiving data,
@@ -322,18 +351,17 @@ impl Downloader {
                     // situation with parallel opens.
                     self.ramp_armed.store(false, std::sync::atomic::Ordering::Relaxed);
                     if let Some(res) = maybe_res {
-                        self.handle_join_result_item(res, &mut pending, &mut active, &mut join_set, &mut last_failure).await?;
+                        self.handle_join_result_item(res, &mut pending, &mut active, &mut last_failure).await?;
                     }
                 }
                 _ = self.ctx.cancel.cancelled() => {
-                    join_set.shutdown().await;
                     return Err(OdlError::Cancelled);
                 }
             }
         }
 
         // Now fill remaining capacity up to configured concurrency.
-        self.fill_capacity(&mut pending, &mut active, &mut join_set, &mut last_failure)
+        self.fill_capacity(&mut pending, &mut active, join_set, &mut last_failure)
             .await?;
 
         loop {
@@ -341,12 +369,11 @@ impl Downloader {
             tokio::pin!(live_changed);
             tokio::select! {
                 _ = self.ctx.cancel.cancelled() => {
-                    join_set.shutdown().await;
                     return Err(OdlError::Cancelled);
                 }
                 _ = &mut live_changed => {
                     self.apply_live_cap(&mut active);
-                    self.fill_capacity(&mut pending, &mut active, &mut join_set, &mut last_failure)
+                    self.fill_capacity(&mut pending, &mut active, join_set, &mut last_failure)
                         .await?;
                 }
                 next = join_set.join_next() => {
@@ -355,14 +382,13 @@ impl Downloader {
                         result,
                         &mut pending,
                         &mut active,
-                        &mut join_set,
                         &mut last_failure,
                     )
                     .await?;
                     self.fill_capacity(
                         &mut pending,
                         &mut active,
-                        &mut join_set,
+                        join_set,
                         &mut last_failure,
                     )
                     .await?;
@@ -401,12 +427,7 @@ impl Downloader {
             }));
         }
 
-        let metadata_mutex = Arc::try_unwrap(self.metadata).map_err(|_| {
-            OdlError::MetadataError(MetadataError::Other {
-                message: "Failed to unwrap metadata Arc".to_string(),
-            })
-        })?;
-        Ok(metadata_mutex.into_inner())
+        Ok(())
     }
 
     async fn pending_parts(&self) -> VecDeque<PartDetails> {
@@ -506,14 +527,8 @@ impl Downloader {
                             return Ok(());
                         };
                         let is_failure = matches!(&result, Ok(Ok(PartEvent::Failed { .. })));
-                        self.handle_join_result_item(
-                            result,
-                            pending,
-                            active,
-                            join_set,
-                            last_failure,
-                        )
-                        .await?;
+                        self.handle_join_result_item(result, pending, active, last_failure)
+                            .await?;
                         if is_failure {
                             break;
                         }
@@ -577,7 +592,6 @@ impl Downloader {
         res: Result<Result<PartEvent, OdlError>, tokio::task::JoinError>,
         pending: &mut VecDeque<PartDetails>,
         active: &mut HashMap<String, ActiveTask>,
-        join_set: &mut JoinSet<Result<PartEvent, OdlError>>,
         last_failure: &mut Option<OdlError>,
     ) -> Result<(), OdlError> {
         match res {
@@ -604,7 +618,6 @@ impl Downloader {
                     // paused job reported as Failed is one a caller may
                     // auto-restart, and the exit code flips 130 to 1.
                     if self.ctx.is_cancelled() {
-                        join_set.shutdown().await;
                         return Err(OdlError::Cancelled);
                     }
                     // Kept so a download that ends with parts still queued can
@@ -618,7 +631,6 @@ impl Downloader {
                     if let Some(task) = active.remove(&ulid) {
                         if pending.is_empty() && active.is_empty() {
                             // No other work to do — all parts have failed
-                            join_set.shutdown().await;
                             return Err(OdlError::Other {
                                 message: format!(
                                     "All parts failed; last part {} failed after {} attempts",
@@ -640,7 +652,6 @@ impl Downloader {
                         // If the task wasn't in `active`, still check whether
                         // everything else is done and fail if so.
                         if pending.is_empty() && active.is_empty() {
-                            join_set.shutdown().await;
                             return Err(OdlError::Other {
                                 message: format!(
                                     "All parts failed; last part {} failed after {} attempts",
@@ -652,12 +663,8 @@ impl Downloader {
                     }
                 }
             },
-            Ok(Err(e)) => {
-                join_set.shutdown().await;
-                return Err(e);
-            }
+            Ok(Err(e)) => return Err(e),
             Err(join_err) => {
-                join_set.shutdown().await;
                 return Err(OdlError::Other {
                     message: "Download task panicked".to_string(),
                     origin: Box::new(join_err),

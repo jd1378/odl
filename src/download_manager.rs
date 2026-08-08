@@ -37,14 +37,16 @@ use crate::progress::{DownloadContext, Phase, ProgressEvent};
 use crate::response_info::ResponseInfo;
 use crate::retry_policies::{FixedThenExponentialRetry, wait_for_retry};
 use crate::{
-    conflict::{SaveConflictResolver, ServerConflictResolver},
+    conflict::{
+        NotResumableResolution, SaveConflictResolver, ServerConflict, ServerConflictResolver,
+    },
     download_manager::io::sum_parts_on_disk,
 };
 use crate::{credentials::Credentials, user_agents::random_user_agent};
 use crate::{
     download::Download,
     download_metadata::{DownloadMetadata, PartDetails},
-    error::OdlError,
+    error::{ConflictError, OdlError},
 };
 
 /// High level manager responsible for evaluating and running downloads.
@@ -776,8 +778,10 @@ impl DownloadManager {
             // the downloader actually has more work to schedule in
             // parallel. Decreases are intentionally ignored — shrinking
             // would require merging parts (and their part files), which
-            // is more invasive than it's worth.
-            if opts.max_connections() > metadata.max_connections {
+            // is more invasive than it's worth. A download the server will
+            // not serve in ranges stays whole no matter what was asked for:
+            // every extra part would be a request it answers from byte zero.
+            if metadata.is_resumable && opts.max_connections() > metadata.max_connections {
                 grow_parts(&instruction, &mut metadata, opts.max_connections()).await?;
                 persist_metadata(&metadata, &instruction).await?;
             }
@@ -802,34 +806,85 @@ impl DownloadManager {
                     n_fixed_retries: opts.n_fixed_retries(),
                 };
                 ctx.emit(ProgressEvent::PhaseChanged(Phase::Downloading));
-                let downloader = Downloader::new(
-                    Arc::new(instruction.clone()),
-                    metadata,
-                    client,
-                    randomize_user_agent,
-                    opts.speed_limit(),
-                    opts.dynamic_split(),
-                    RampupConfig {
-                        enabled: opts.rampup(),
-                        batch_size: opts.rampup_batch_size(),
-                        delay_min: opts.rampup_delay_min(),
-                        delay_max: opts.rampup_delay_max(),
-                    },
-                    retry_policy,
-                    ctx.clone(),
-                );
+                // A server that stops honouring `Range` mid-download answers
+                // a part with a whole-file `200`, and every part in flight is
+                // then writing to an offset the body does not belong at. That
+                // is recoverable — throw away what is on disk and pull the
+                // file in a single connection from byte zero — but it costs
+                // the caller everything downloaded so far, so it is their
+                // call, made through the same resolver that decides the
+                // not-resumable conflict found before the download starts.
+                let mut restarted_unranged = false;
+                loop {
+                    let downloader = Downloader::new(
+                        Arc::new(instruction.clone()),
+                        metadata.clone(),
+                        client.clone(),
+                        randomize_user_agent,
+                        opts.speed_limit(),
+                        opts.dynamic_split(),
+                        RampupConfig {
+                            enabled: opts.rampup(),
+                            batch_size: opts.rampup_batch_size(),
+                            delay_min: opts.rampup_delay_min(),
+                            delay_max: opts.rampup_delay_max(),
+                        },
+                        retry_policy,
+                        ctx.clone(),
+                    );
 
-                // Persist per-part finished flags but DO NOT set the
-                // overall `metadata.finished = true` here: assembly is
-                // still ahead and may be interrupted. The aggregate
-                // flag is only flipped after assembly + checksum +
-                // part cleanup all succeed below — that way an
-                // interrupt mid-assembly leaves `finished = false` and
-                // the next run re-runs assembly instead of trusting a
-                // partial final file.
-                let mdata = downloader.run().await?;
-                persist_metadata(&mdata, &instruction).await?;
-                metadata = mdata;
+                    // Persist per-part finished flags but DO NOT set the
+                    // overall `metadata.finished = true` here: assembly is
+                    // still ahead and may be interrupted. The aggregate
+                    // flag is only flipped after assembly + checksum +
+                    // part cleanup all succeed below — that way an
+                    // interrupt mid-assembly leaves `finished = false` and
+                    // the next run re-runs assembly instead of trusting a
+                    // partial final file.
+                    match downloader.run().await {
+                        Ok(mdata) => {
+                            persist_metadata(&mdata, &instruction).await?;
+                            metadata = mdata;
+                            break;
+                        }
+                        Err(OdlError::Conflict(ConflictError::Server {
+                            conflict: conflict @ ServerConflict::NotResumable,
+                        })) if !restarted_unranged => {
+                            match conflict_resolver.resolve_not_resumable(&instruction).await {
+                                NotResumableResolution::Abort => {
+                                    return Err(OdlError::Conflict(ConflictError::Server {
+                                        conflict,
+                                    }));
+                                }
+                                NotResumableResolution::Restart => {
+                                    // Only ever once: if the single-connection
+                                    // attempt hits the same wall, the server is
+                                    // not serving what it advertised and there
+                                    // is nothing left to fall back to.
+                                    restarted_unranged = true;
+                                    remove_all_parts(instruction.download_dir()).await;
+                                    metadata.is_resumable = false;
+                                    metadata.max_connections = 1;
+                                    metadata.parts = Download::determine_parts(metadata.size, 1);
+                                    persist_metadata(&metadata, &instruction).await?;
+                                    // `Downloader::new` only seeds the live cap
+                                    // when it is unset, and the first attempt
+                                    // already set it — narrow it explicitly.
+                                    ctx.live.set_max_connections(1);
+                                    // The parts just deleted were announced to
+                                    // the caller and will never finish; without
+                                    // this their rows outlive the download.
+                                    ctx.emit(ProgressEvent::PartsCleared);
+                                    ctx.emit(ProgressEvent::Progress {
+                                        downloaded: 0,
+                                        total: metadata.size,
+                                    });
+                                }
+                            }
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
             }
 
             // Defensively delete any partial final file from a prior

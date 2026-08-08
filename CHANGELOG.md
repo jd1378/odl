@@ -1,5 +1,46 @@
 # Changelog
 
+## 2.0.4
+
+### A server that stops honouring `Range` is recoverable
+
+A `200` answering a ranged request means the parts in flight are writing the
+whole file at their own offsets, so the run was ended with a `NotResumable`
+conflict and no way for the caller to say what to do about it. Recovering
+meant reaching around odl: catch the error, wipe the work directory, run again
+with one connection. That is now what odl does itself, through the same
+`resolve_not_resumable` resolver the pre-download check uses — abort still
+aborts (`--on-not-resumable abort`), and restart discards the parts and
+re-fetches the file whole, once.
+
+The observation is also recorded: a download that saw the server ignore
+`Range` keeps `is_resumable: false` on disk, outranking the `accept-ranges`
+the headers keep advertising, so a later resume does not split the file up and
+ask for slices again. Such a download is no longer grown to more parts by a
+larger `--max-connections` either.
+
+### A download the server won't range is never split
+
+`--dynamic-split` subdivided a part whenever a connection looked idle, without
+asking whether the server serves ranges at all. On a non-resumable download
+that turned one correct request into several the server answers from byte zero
+— the corruption above, provoked by odl rather than by the server changing its
+mind. Splitting is now gated on the download being resumable.
+
+### New event: `ProgressEvent::PartsCleared`
+
+A restart deletes parts that were already announced through `PartAdded` and
+will never send `PartFinished`, because they did not finish. Consumers holding
+per-part state (a row, a bar) get this event and drop all of it; new
+`PartAdded` events follow. The enum is `#[non_exhaustive]`, so a consumer that
+ignores it keeps compiling — it will just show the stale rows.
+
+### `ASSEMBLY_ULID` is reachable
+
+The ulid carried by the part events that report final-file assembly lived in a
+private module, so a consumer had to hard-code `"_assemble"` to tell assembly
+apart from a real part. It is now `odl::progress::ASSEMBLY_ULID`.
+
 ## 2.0.3
 
 ### A resumed download could fail with all its bytes present

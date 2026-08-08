@@ -23,11 +23,28 @@ fn run_against(
     (code, file)
 }
 
+/// As [`run_against`], with extra command-line arguments appended.
+fn run_with_args(
+    get: impl FnOnce(&mut mockito::Server) -> mockito::Mock,
+    connections: &str,
+    extra: &[&str],
+) -> (Option<i32>, Option<Vec<u8>>, String) {
+    run_capturing_with_args(get, connections, extra)
+}
+
 /// As [`run_against`], also returning odl's JSON output so a test can assert
 /// on which failure was reported, not merely that one was.
 fn run_capturing(
     get: impl FnOnce(&mut mockito::Server) -> mockito::Mock,
     connections: &str,
+) -> (Option<i32>, Option<Vec<u8>>, String) {
+    run_capturing_with_args(get, connections, &[])
+}
+
+fn run_capturing_with_args(
+    get: impl FnOnce(&mut mockito::Server) -> mockito::Mock,
+    connections: &str,
+    extra: &[&str],
 ) -> (Option<i32>, Option<Vec<u8>>, String) {
     let mut server = mockito::Server::new();
     let url = format!("{}/file", server.url());
@@ -57,6 +74,7 @@ fn run_capturing(
         .arg("0")
         .arg("--format")
         .arg("json")
+        .args(extra)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -100,27 +118,65 @@ fn a_transfer_failure_is_reported_as_one() {
     );
 }
 
+fn ignores_range(s: &mut mockito::Server) -> mockito::Mock {
+    s.mock("GET", "/file")
+        .expect_at_least(1)
+        .with_status(200)
+        .with_header("content-length", &SIZE.to_string())
+        .with_body(body())
+        .create()
+}
+
 #[test]
 fn a_whole_file_answer_to_a_ranged_request_is_refused() {
     // A server that quietly stopped honouring `Range` answers 200 with the
     // entire file. Each part would write the *first* part-size bytes of it at
     // its own offset, producing a file of exactly the right length whose
     // contents are wrong — the one failure nothing downstream can catch.
-    let (code, file) = run_against(
-        |s| {
-            s.mock("GET", "/file")
-                .expect_at_least(1)
-                .with_status(200)
-                .with_header("content-length", &SIZE.to_string())
-                .with_body(body())
-                .create()
-        },
-        "4",
-    );
+    // Asked to abort, odl delivers nothing rather than that.
+    let (code, file, _) = run_with_args(ignores_range, "4", &["--on-not-resumable", "abort"]);
     assert_eq!(code, Some(4), "must surface as a conflict, not success");
     assert!(
         file.is_none(),
         "no file may be delivered from a bad response"
+    );
+}
+
+#[test]
+fn the_restart_after_an_unranged_answer_happens_at_most_once() {
+    // The restart is a fallback, not a retry policy: a server whose whole-file
+    // answer is *also* wrong (here, shorter than it told the probe) cannot be
+    // recovered from, and the second refusal has to end the run. This test
+    // hangs rather than fails if that bound is ever lost.
+    let short = SIZE / 2;
+    let (code, file, reported) = run_with_args(
+        |s| {
+            s.mock("GET", "/file")
+                .expect_at_least(2)
+                .with_status(200)
+                .with_header("content-length", &short.to_string())
+                .with_body(&body()[..short])
+                .create()
+        },
+        "4",
+        &[],
+    );
+    assert_eq!(code, Some(4), "the second refusal must end it: {reported}");
+    assert!(file.is_none(), "no file may be delivered: {reported}");
+}
+
+#[test]
+fn a_server_that_stops_honouring_range_is_re_downloaded_whole() {
+    // The same response, with the default resolution: the parts are thrown
+    // away and the file is fetched in one connection from byte zero, which is
+    // the only shape this server can answer correctly. It is the caller's
+    // choice, not odl's — `--on-not-resumable abort` above takes the other.
+    let (code, file, reported) = run_with_args(ignores_range, "4", &[]);
+    assert_eq!(code, Some(0), "the restart should succeed: {reported}");
+    assert_eq!(
+        file.as_deref(),
+        Some(body().as_slice()),
+        "the restarted download must deliver the real bytes"
     );
 }
 

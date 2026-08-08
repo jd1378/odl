@@ -48,9 +48,20 @@ where
     {
         Ok(mut disk_metadata) => {
             // update disk_metadata from instruction
-            disk_metadata.is_resumable = instruction.is_resumable();
+            //
+            // `is_resumable` is the exception: on disk it can hold what the
+            // server actually *did* — stopped honouring `Range` part-way
+            // through — which outranks what its headers advertise, since the
+            // instruction only ever repeats the advertisement. Once observed,
+            // it stays false, and the restart below re-splits the download
+            // into the single part such a server can serve.
+            disk_metadata.is_resumable &= instruction.is_resumable();
             disk_metadata.filename = instruction.filename().to_string();
-            disk_metadata.max_connections = instruction.max_connections();
+            disk_metadata.max_connections = if disk_metadata.is_resumable {
+                instruction.max_connections()
+            } else {
+                1
+            };
             disk_metadata.requires_auth = instruction.requires_auth();
             disk_metadata.requires_basic_auth = instruction.requires_basic_auth();
             disk_metadata.use_server_time = instruction.use_server_time();
@@ -216,6 +227,41 @@ mod tests {
         async fn resolve_not_resumable(&self, _: &Download) -> NotResumableResolution {
             NotResumableResolution::Restart
         }
+    }
+
+    /// Once a server has been seen ignoring `Range` mid-download, the record
+    /// of that outranks the `accept-ranges` its headers keep advertising:
+    /// a resume must not split the file up and ask for slices again.
+    #[tokio::test]
+    async fn an_observed_non_resumable_server_stays_non_resumable()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let tmp = tempfile::tempdir()?;
+        let save_dir = tempfile::tempdir()?;
+
+        let size = Some(Download::MIN_PART_SIZE * 8);
+        let instruction = DownloadBuilder::default()
+            .download_dir(tmp.path().to_path_buf())
+            .save_dir(save_dir.path().to_path_buf())
+            .url(Url::parse("http://example.invalid/file")?)
+            .filename("file".to_string())
+            .size(size)
+            // What the probe advertises, which is what was disproved.
+            .is_resumable(true)
+            .max_connections(6)
+            .parts(Download::determine_parts(size, 6))
+            .build()?;
+
+        let mut on_disk = instruction.as_metadata();
+        on_disk.is_resumable = false;
+        on_disk.max_connections = 1;
+        on_disk.parts = Download::determine_parts(size, 1);
+        persist_metadata(&on_disk, &instruction).await?;
+
+        let resolved = resolve_server_conflicts(&instruction, &RestartResolver, true).await?;
+        assert!(!resolved.is_resumable);
+        assert_eq!(resolved.max_connections, 1);
+        assert_eq!(resolved.parts.len(), 1);
+        Ok(())
     }
 
     /// A resumed download must show the headers of the probe that just ran,

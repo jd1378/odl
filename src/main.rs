@@ -611,6 +611,11 @@ impl ProgressReporter for CliReporter {
                     p.bar.finish_and_clear();
                 }
             }
+            ProgressEvent::PartsCleared => {
+                for (_, p) in self.parts.lock().unwrap().drain() {
+                    p.bar.finish_and_clear();
+                }
+            }
             ProgressEvent::PartRetrying { ulid, attempt } => {
                 if let Some(p) = self.parts.lock().unwrap().get(&ulid) {
                     p.bar.set_message(format!("retry #{attempt}"));

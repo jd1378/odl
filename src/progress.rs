@@ -22,6 +22,15 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
 
+/// Ulid carried by the part events that report final-file assembly.
+///
+/// Assembly is not a real part, but it is reported through the same
+/// `Part*` events so a consumer can render it with the machinery it
+/// already has. Match on this to tell the two apart — for instance to
+/// label the bar differently, or to keep assembly out of a per-connection
+/// count.
+pub const ASSEMBLY_ULID: &str = "_assemble";
+
 /// Sampling cadence for speed / progress events emitted by the lib.
 ///
 /// 8 Hz (~125 ms): high enough that bars animate smoothly, low enough
@@ -92,6 +101,12 @@ pub enum ProgressEvent {
     },
     /// A part finished successfully.
     PartFinished { ulid: String },
+    /// Every part announced so far is gone: the download was restarted and
+    /// re-split, so the ulids already reported name nothing. Consumers that
+    /// keep per-part state (a row, a bar) must drop all of it — no
+    /// [`ProgressEvent::PartFinished`] is coming for those parts, because
+    /// they did not finish. New [`ProgressEvent::PartAdded`] events follow.
+    PartsCleared,
     /// Latest sampled bytes-per-second for a single part. Emitted on the
     /// same cadence as aggregate [`ProgressEvent::Speed`]. Raw window
     /// rate, no smoothing.

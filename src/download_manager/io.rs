@@ -16,7 +16,7 @@ use crate::{
     error::OdlError,
     fs_utils::{atomic_write, set_file_mtime_async},
     progress::{
-        DownloadContext, Phase, ProgressEvent, SAMPLE_INTERVAL, speed_window_rate,
+        ASSEMBLY_ULID, DownloadContext, Phase, ProgressEvent, SAMPLE_INTERVAL, speed_window_rate,
         trim_speed_window,
     },
 };
@@ -27,10 +27,6 @@ const COPY_BUF_SIZE: usize = 1024 * 1024;
 /// as `SPEED_WINDOW` in the downloader: bridges per-part `fetch_add`
 /// jitter so the rendered rate stays stable.
 const ASSEMBLY_SPEED_WINDOW: Duration = Duration::from_millis(1500);
-
-/// Synthetic ulid used for the assembly progress bar so consumers can
-/// render it as a regular child / part bar.
-pub const ASSEMBLY_ULID: &str = "_assemble";
 
 /// removes all .part files on disk
 pub async fn remove_all_parts(download_dir: &Path) {
