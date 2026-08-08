@@ -969,6 +969,10 @@ async fn run(args: Args) -> Result<(), OdlError> {
             args::Commands::Tools { action } => {
                 return run_tools(&args, action, format).await;
             }
+            #[cfg(feature = "self-update")]
+            args::Commands::Update { check, yes } => {
+                return run_update(&args, *check, *yes, format).await;
+            }
             args::Commands::Probe { url } => {
                 return run_probe(&args, url, format).await;
             }
@@ -1622,7 +1626,7 @@ fn confirm(question: &str) -> Option<bool> {
 /// Built from the user's own download settings rather than from invented
 /// constants: someone who needs a proxy to reach the internet needs it here
 /// too, and a connect timeout they chose should not be silently overridden.
-#[cfg(feature = "ytdlp")]
+#[cfg(any(feature = "ytdlp", feature = "self-update"))]
 fn install_client(net: &odl::config::DownloadOptions) -> Result<reqwest::Client, OdlError> {
     let mut builder = reqwest::Client::builder();
     if let Some(proxy) = Option::<reqwest::Proxy>::from(net) {
@@ -1773,6 +1777,168 @@ async fn download_asset(
 
     // Verification is the downloader's job: it checks after assembly and
     // fails with a conflict rather than leaving a bad binary in place.
+    let digest = odl::hash::HashDigest::parse_cli(&format!("sha256:{}", plan.sha256))
+        .map_err(|message| OdlError::CliError { message })?;
+    instruction.add_checksums([digest]);
+
+    dlm.download(DownloadRequest::new(instruction, &resolver))
+        .await
+}
+
+/// `odl update` — replace this binary with the latest published release.
+#[cfg(feature = "self-update")]
+async fn run_update(
+    args: &Args,
+    check_only: bool,
+    assume_yes: bool,
+    format: OutputFormat,
+) -> Result<(), OdlError> {
+    use odl::self_update;
+
+    let current = env!("CARGO_PKG_VERSION");
+    // Resolve symlinks: replacing the link would leave its target behind and
+    // put a second, older odl on the PATH.
+    let exe = std::env::current_exe()
+        .and_then(|p| p.canonicalize())
+        .map_err(|e| OdlError::CliError {
+            message: format!("could not find the running odl binary: {e}"),
+        })?;
+
+    // Answered up front, so a refusal costs nothing: telling someone after the
+    // download that odl was never going to install it wastes their bandwidth.
+    // `--check` still reports what is out there — knowing a release exists is
+    // useful even where odl is not the thing that may install it.
+    let blocked = self_update::eligibility(&exe).await.err();
+    if !check_only && let Some(reason) = blocked {
+        return Err(OdlError::CliError {
+            message: reason.explain(),
+        });
+    }
+
+    let cfg = Config::load_from_file(&config_path_for(args)).await?;
+    let client = install_client(cfg.download())?;
+    let Some(plan) = self_update::plan(&client, current).await? else {
+        match format {
+            OutputFormat::Json => println!(
+                "{}",
+                json!({
+                    "type": "update",
+                    "status": "up_to_date",
+                    "current_version": current,
+                    "path": exe.to_string_lossy(),
+                    "can_install": blocked.is_none(),
+                    "blocked_because": blocked.as_ref().map(|r| r.explain()),
+                })
+            ),
+            OutputFormat::Text => println!("odl {current} is the latest release."),
+        }
+        return Ok(());
+    };
+
+    if check_only {
+        match format {
+            OutputFormat::Json => println!(
+                "{}",
+                json!({
+                    "type": "update",
+                    "status": "available",
+                    "current_version": current,
+                    "new_version": plan.version,
+                    "tag": plan.tag,
+                    "asset": plan.name,
+                    "size": plan.size,
+                    "path": exe.to_string_lossy(),
+                    "can_install": blocked.is_none(),
+                    "blocked_because": blocked.as_ref().map(|r| r.explain()),
+                })
+            ),
+            OutputFormat::Text => {
+                println!("odl {} is available (running {current}).", plan.version);
+                match &blocked {
+                    None => println!("Run `odl update` to install it over {}.", exe.display()),
+                    Some(reason) => println!("odl cannot install it: {}", reason.explain()),
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    if !assume_yes && format == OutputFormat::Text {
+        eprintln!(
+            "This replaces {} with odl {} from {}.",
+            exe.display(),
+            plan.version,
+            plan.url
+        );
+        match confirm("Update now?") {
+            Some(true) => {}
+            Some(false) => {
+                eprintln!("Left odl {current} in place.");
+                return Ok(());
+            }
+            // A scripted run must not be updated by a question nobody saw.
+            None => {
+                return Err(OdlError::CliError {
+                    message: "no terminal to confirm on; re-run `odl update -y` to update without                               asking"
+                        .to_string(),
+                });
+            }
+        }
+    }
+
+    // The archive comes down through odl itself: resumable, retrying, and
+    // checksum-verified against what the release published.
+    let dlm = build_download_manager(args).await?;
+    let archive = download_release_asset(&dlm, &plan).await?;
+    let replaced = self_update::finish(&archive, &exe).await?;
+    let _ = tokio::fs::remove_file(&archive).await;
+
+    match format {
+        OutputFormat::Json => println!(
+            "{}",
+            json!({
+                "type": "update",
+                "status": "updated",
+                "previous_version": current,
+                "new_version": plan.version,
+                "tag": plan.tag,
+                "path": replaced.to_string_lossy(),
+            })
+        ),
+        OutputFormat::Text => println!(
+            "Updated {} from {current} to {}.",
+            replaced.display(),
+            plan.version
+        ),
+    }
+    Ok(())
+}
+
+/// Fetch the release archive with odl itself, and return where it landed.
+#[cfg(feature = "self-update")]
+async fn download_release_asset(
+    dlm: &DownloadManager,
+    plan: &odl::self_update::UpdatePlan,
+) -> Result<PathBuf, OdlError> {
+    let url = Url::parse(&plan.url).map_err(|e| OdlError::CliError {
+        message: format!("release asset URL is not usable: {e}"),
+    })?;
+    let staging = odl::self_update::staging_dir();
+    tokio::fs::create_dir_all(&staging).await?;
+
+    let resolver = ForcedResolver {};
+    let mut instruction = dlm
+        .evaluate(
+            EvaluateRequest::new(url, staging, &resolver)
+                // The engine that resolves media links has no business here:
+                // this is a plain file at a known URL.
+                .engine(EnginePreference::Engine(Engine::HttpMultipart)),
+        )
+        .await?;
+    instruction.set_filename(plan.name.clone());
+
+    // Verification is the downloader's job: it checks after assembly and
+    // fails with a conflict rather than leaving a bad archive to be unpacked.
     let digest = odl::hash::HashDigest::parse_cli(&format!("sha256:{}", plan.sha256))
         .map_err(|message| OdlError::CliError { message })?;
     instruction.add_checksums([digest]);

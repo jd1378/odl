@@ -49,6 +49,18 @@ if [ "$removed" -eq 0 ]; then
   echo "odl not found in $INSTALL_DIR or PATH" >&2
 fi
 
+# The receipt tells `odl update` this install came from the script; with the
+# binary gone it describes nothing. Removed even without --purge, since it is
+# odl's own bookkeeping rather than the user's configuration.
+case "$(uname -s)" in
+  Darwin) DATA_DIR="$HOME/Library/Application Support/odl" ;;
+  *)      DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/odl" ;;
+esac
+if [ "$removed" -eq 1 ] && [ -f "$DATA_DIR/install-receipt.toml" ]; then
+  rm -f "$DATA_DIR/install-receipt.toml"
+  echo "removed install receipt: $DATA_DIR/install-receipt.toml"
+fi
+
 if [ "$PURGE" = "1" ]; then
   case "$(uname -s)" in
     Darwin) CFG_DIRS="$HOME/Library/Application Support/odl $HOME/.config/odl" ;;

@@ -2,6 +2,28 @@
 
 ## 2.1.0
 
+### `odl update`
+
+odl can now replace itself with the latest GitHub release: `odl update --check`
+reports whether one exists, `odl update` installs it after asking, `-y` skips
+the question. `--format json` reports the same as a single object.
+
+It only ever replaces an odl that the install script put in place. The scripts
+now leave a receipt naming the directory they wrote to, and an install that
+predates the receipt still qualifies if it sits where the scripts default to
+(`~/.local/bin`, `%LOCALAPPDATA%\Programs\odl`) and the user can write it.
+A copy from `cargo install`, Homebrew, Nix or a distribution package is refused
+with the command that owns it named — writing over a package manager's file is
+how a machine ends up with a manager reporting a version nothing on disk has.
+
+The release workflow now publishes a `.sha256` beside every archive, and the
+update verifies against it before overwriting anything; a release without one
+is refused rather than installed with a warning. As with the yt-dlp installer,
+that covers a corrupted transfer or a tampered mirror, not a compromised
+upstream — the sums ship from the same place as the files. The download itself
+goes through odl: resumable, retrying, and checksum-verified by the downloader
+that already does this for every other file.
+
 ### A server that stops honouring `Range` is recoverable
 
 A `200` answering a ranged request means the parts in flight are writing the

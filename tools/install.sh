@@ -147,6 +147,24 @@ mkdir -p "$INSTALL_DIR"
 install -m 0755 "$BIN" "$INSTALL_DIR/odl"
 ok "installed: $INSTALL_DIR/odl"
 
+# Receipt for `odl update`: it replaces only a binary this script installed.
+# Written to odl's data directory, which the user always owns -- the install
+# directory may not be (e.g. --dir /usr/local/bin).
+case "$(uname -s)" in
+  Darwin) DATA_DIR="$HOME/Library/Application Support/odl" ;;
+  *)      DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/odl" ;;
+esac
+if mkdir -p "$DATA_DIR" 2>/dev/null; then
+  cat > "$DATA_DIR/install-receipt.toml" <<EOF
+install_dir = "$INSTALL_DIR"
+tag = "$TAG"
+installer = "install.sh"
+EOF
+  info "recorded install for \`odl update\`"
+else
+  info "note: could not record the install receipt in $DATA_DIR; \`odl update\` may refuse"
+fi
+
 case ":$PATH:" in
   *":$INSTALL_DIR:"*) ;;
   *) info "note: $INSTALL_DIR not in PATH. Add: export PATH=\"$INSTALL_DIR:\$PATH\"" ;;

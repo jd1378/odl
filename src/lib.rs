@@ -56,6 +56,8 @@ pub mod hash;
 pub mod progress;
 mod response_info;
 mod retry_policies;
+#[cfg(feature = "self-update")]
+pub mod self_update;
 pub mod user_agents;
 #[cfg(feature = "ytdlp")]
 pub mod ytdlp;

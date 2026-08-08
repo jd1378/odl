@@ -169,6 +169,23 @@ installed. Declining an interactive offer is recorded
 (`ytdlp.offer_*_install = false`) and never asked again; an explicit
 `odl tools install` overrides that.
 
+## Self-update (`odl update`)
+
+`odl update --check --format json` reports whether a newer release exists and
+whether odl is allowed to install it:
+
+```json
+{"type":"update","status":"available","current_version":"2.1.0","new_version":"2.1.1",
+ "tag":"v2.1.1","asset":"odl-v2.1.1-x86_64-unknown-linux-gnu.tar.gz","size":4194304,
+ "path":"/home/u/.local/bin/odl","can_install":true,"blocked_because":null}
+```
+
+`status` is `available`, `up_to_date` or `ineligible`. `odl update -y` performs
+it and prints `{"type":"update","status":"updated",...}`. Without `--check`, an
+install odl may not replace (cargo, Homebrew, Nix, system package) is an error
+exit 2 with the reason. The downloaded archive is checked against the SHA-256
+published beside it; a release without one is refused.
+
 ## Error object (→ stderr)
 
 On any top-level failure, one JSON object on **stderr**:

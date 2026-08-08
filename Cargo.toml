@@ -75,11 +75,15 @@ default = ["cli", "ytdlp"]
 # `tokio/signal` powers the interrupt handler: engines that drive a helper
 # process isolate it in its own process group, so a terminal's Ctrl-C never
 # reaches it and odl has to do the teardown itself.
-cli = ["dep:clap", "dep:indicatif", "dep:tracing-subscriber", "dep:serde_json", "tokio/signal"]
+cli = ["dep:clap", "dep:indicatif", "dep:tracing-subscriber", "dep:serde_json", "tokio/signal", "self-update"]
 # Delegate downloads of known media hosts to an externally installed `yt-dlp`.
 # Adds no crate dependencies of its own beyond JSON parsing and process control;
 # `yt-dlp` itself is discovered at runtime and is never bundled.
 ytdlp = ["dep:serde_json", "dep:windows-sys", "tokio/process", "tokio/io-util"]
+# Replace odl's own binary with the latest GitHub release (`odl update`).
+# Needs JSON to read the release listing and a process spawn to unpack the
+# archive; the binary it replaces is only ever one odl's installer put there.
+self-update = ["dep:serde_json", "tokio/process"]
 vendored-protoc = ["protobuf-src"]
 
 [[bin]]

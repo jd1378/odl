@@ -304,8 +304,20 @@ jobs:
         esac;
         popd >/dev/null
 
+        # Checksum published beside the archive. `odl update` refuses an
+        # archive it cannot verify, and a release without this file can only
+        # be installed by hand.
+        pushd "${PKG_STAGING}/" >/dev/null
+        if command -v sha256sum >/dev/null 2>&1; then
+          sha256sum "${PKG_NAME}" > "${PKG_NAME}.sha256"
+        else
+          shasum -a 256 "${PKG_NAME}" > "${PKG_NAME}.sha256"
+        fi
+        popd >/dev/null
+
         # Let subsequent steps know where to find the compressed package
         echo "PKG_PATH=${PKG_STAGING}/${PKG_NAME}" >> $GITHUB_OUTPUT
+        echo "PKG_SUM_PATH=${PKG_STAGING}/${PKG_NAME}.sha256" >> $GITHUB_OUTPUT
 
     - name: Create Debian package
       id: debian-package
@@ -419,4 +431,4 @@ jobs:
         prerelease: true
         replacesArtifacts: true
         updateOnlyUnreleased: false
-        artifacts: ${{ steps.package.outputs.PKG_PATH }},${{ steps.debian-package.outputs.DPKG_PATH }}
+        artifacts: ${{ steps.package.outputs.PKG_PATH }},${{ steps.package.outputs.PKG_SUM_PATH }},${{ steps.debian-package.outputs.DPKG_PATH }}

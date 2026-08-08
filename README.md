@@ -33,6 +33,19 @@ irm https://raw.githubusercontent.com/jd1378/odl/main/tools/install.ps1 | iex
 cargo install odl
 ```
 
+### Update
+
+```bash
+odl update --check   # is there a newer release?
+odl update           # replace this binary with it (asks first; -y to skip)
+```
+
+Only an odl that the install script put in place is replaced. A copy from
+`cargo install`, Homebrew, Nix or a distribution package is left to the command
+that owns it, and odl says which one that is. The release archive is verified
+against the SHA-256 published beside it before anything is overwritten — an
+update that cannot be verified is refused rather than completed with a warning.
+
 ### Uninstall
 
 **Linux / macOS:**

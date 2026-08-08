@@ -543,6 +543,24 @@ pub enum Commands {
         action: ToolsAction,
     },
 
+    /// Replace this odl with the latest GitHub release.
+    ///
+    /// Only an odl the install script put in place is replaced — a copy
+    /// installed by cargo, Homebrew, Nix or a distribution package is left to
+    /// the command that owns it. The archive is verified against the SHA-256
+    /// published beside it before anything is overwritten.
+    #[cfg(feature = "self-update")]
+    Update {
+        /// Report what an update would do and exit, without downloading or
+        /// replacing anything.
+        #[arg(long)]
+        check: bool,
+
+        /// Do not ask before replacing the binary.
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+
     /// Probe a URL without downloading: report the resolved filename,
     /// size, resumability, etag, last-modified, and any server-advertised
     /// checksums. Pair with `--format json` for machine-readable output.

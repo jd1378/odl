@@ -79,6 +79,24 @@ try {
   $dest = Join-Path $InstallDir 'odl.exe'
   Copy-Item -Force $exe.FullName $dest
   Ok "installed: $dest"
+
+  # Receipt for `odl update`: it replaces only a binary this script installed.
+  # Written to odl's data directory, which the user always owns -- the install
+  # directory may not be.
+  $dataDir = Join-Path $env:APPDATA 'odl'
+  try {
+    New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
+    $receipt = @(
+      # TOML basic strings escape a backslash, so each one is doubled.
+      "install_dir = `"$($InstallDir -replace '\\','\\')`""
+      "tag = `"$tag`""
+      'installer = "install.ps1"'
+    ) -join "`n"
+    Set-Content -Path (Join-Path $dataDir 'install-receipt.toml') -Value $receipt -Encoding UTF8
+    Info 'recorded install for `odl update`'
+  } catch {
+    Info "note: could not record the install receipt in $dataDir; ``odl update`` may refuse"
+  }
 } finally {
   if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
 }

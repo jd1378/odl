@@ -16,5 +16,13 @@ fn main() {
         }
     }
 
+    // The target triple names the release asset `odl update` must fetch.
+    // `std::env::consts` cannot tell gnu from musl, and installing the wrong
+    // one produces a binary that will not start.
+    println!(
+        "cargo:rustc-env=ODL_BUILD_TARGET={}",
+        std::env::var("TARGET").unwrap_or_else(|_| "unknown".to_string())
+    );
+
     prost_build::compile_protos(&["src/proto/download_metadata.proto"], &["src/"]).unwrap();
 }
