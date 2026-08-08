@@ -228,6 +228,11 @@ pub fn channel_reporter() -> (Arc<ChannelReporter>, mpsc::UnboundedReceiver<Prog
 /// before drop (e.g. `Completed` / `Failed` / `Cancelled`) are not lost.
 pub struct AsyncReporter {
     tx: mpsc::UnboundedSender<ProgressEvent>,
+    /// Events sent but not yet handed to the wrapped reporter.
+    queued: Arc<AtomicUsize>,
+    /// Signalled whenever `queued` reaches zero, so [`Self::drained`] can
+    /// wait rather than poll.
+    idle: Arc<Notify>,
     /// Worker handle is kept so the task is owned by this struct.
     /// Dropping the JoinHandle detaches (does not abort) the task —
     /// after `tx` is dropped the channel closes and the worker exits
@@ -240,15 +245,43 @@ impl AsyncReporter {
     /// `Arc<AsyncReporter>` ready to plug into a [`DownloadContext`].
     pub fn spawn<R: ProgressReporter>(inner: R) -> Arc<Self> {
         let (tx, mut rx) = mpsc::unbounded_channel::<ProgressEvent>();
+        let queued = Arc::new(AtomicUsize::new(0));
+        let idle = Arc::new(Notify::new());
+        let queued_for_worker = Arc::clone(&queued);
+        let idle_for_worker = Arc::clone(&idle);
         let worker = tokio::spawn(async move {
             while let Some(ev) = rx.recv().await {
                 inner.on_event(ev);
+                if queued_for_worker.fetch_sub(1, Ordering::AcqRel) == 1 {
+                    idle_for_worker.notify_waiters();
+                }
             }
         });
         Arc::new(Self {
             tx,
+            queued,
+            idle,
             _worker: worker,
         })
+    }
+
+    /// Wait until every event sent so far has reached the wrapped reporter.
+    ///
+    /// The hand-off is what makes emitting cheap for the download tasks, but
+    /// it also means an event can still be in flight when the work that
+    /// produced it has returned. A caller that is about to say something else
+    /// about the same download — or to exit — waits here first, so the two do
+    /// not arrive out of order or, at exit, not at all.
+    pub async fn drained(&self) {
+        loop {
+            // Registered before the check: an event completing in between
+            // would otherwise notify nobody and leave this waiting forever.
+            let idle = self.idle.notified();
+            if self.queued.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            idle.await;
+        }
     }
 }
 
@@ -256,7 +289,14 @@ impl ProgressReporter for AsyncReporter {
     fn on_event(&self, event: ProgressEvent) {
         // Lock-free: tokio's UnboundedSender uses an atomic intrusive
         // queue, no Mutex on the producer path.
-        let _ = self.tx.send(event);
+        self.queued.fetch_add(1, Ordering::AcqRel);
+        if self.tx.send(event).is_err() {
+            // Nobody will ever take it off the queue; not counting it keeps
+            // `drained` from waiting for a worker that is gone.
+            if self.queued.fetch_sub(1, Ordering::AcqRel) == 1 {
+                self.idle.notify_waiters();
+            }
+        }
     }
 }
 

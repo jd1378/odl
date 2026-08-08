@@ -107,6 +107,14 @@ fn error_kind(e: &OdlError) -> &'static str {
     }
 }
 
+/// Set once a download's own line has already stated why it ended.
+///
+/// The progress display owns the terminal while it runs, so a second `eprintln`
+/// of the same text does not merely repeat it — it is written straight past
+/// `MultiProgress` and lands on top of a bar that is still drawing.
+static FAILURE_ALREADY_SHOWN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Emit a top-level error in the selected format and return its exit code.
 fn report_error(e: &OdlError, format: OutputFormat) -> ExitCode {
     match format {
@@ -114,6 +122,12 @@ fn report_error(e: &OdlError, format: OutputFormat) -> ExitCode {
         // handler already acknowledged it and every download's own line shows
         // it, so a third "Error:" banner is noise.
         OutputFormat::Text if matches!(e, OdlError::Cancelled) => {}
+        // Likewise a failure the download already reported as `✕ name: why`.
+        // The banner would say the same sentence a second time, and say it
+        // through a channel the progress display does not coordinate with.
+        // Errors that never reached a download — a bad flag, an unreadable
+        // config — leave the flag clear and are still announced here.
+        OutputFormat::Text if FAILURE_ALREADY_SHOWN.load(std::sync::atomic::Ordering::Relaxed) => {}
         OutputFormat::Text => {
             eprintln!("Error: {}", e);
             #[cfg(debug_assertions)]
@@ -1052,6 +1066,10 @@ async fn run(args: Args) -> Result<(), OdlError> {
     // large remote lists). This keeps the number of active tasks
     // bounded by the download manager's semaphore.
     let mut handles = Vec::new();
+    // The text-mode forwarders, so the run can wait for their queues before it
+    // reports anything of its own. Empty in JSON mode, where events are
+    // written directly.
+    let mut forwarders: Vec<Arc<AsyncReporter>> = Vec::new();
 
     let expected_checksums = args
         .checksums
@@ -1161,7 +1179,13 @@ async fn run(args: Args) -> Result<(), OdlError> {
                 // hops never run on the download tasks themselves.
                 let cli_reporter =
                     CliReporter::new(Arc::clone(&mp), parent, parent_metrics, url.to_string());
-                AsyncReporter::spawn(cli_reporter) as Arc<dyn ProgressReporter>
+                let async_reporter = AsyncReporter::spawn(cli_reporter);
+                // Kept so the run can wait for the queue to empty before it
+                // says anything else: the hand-off that makes emitting cheap
+                // also lets a download's own last line arrive after the code
+                // that would summarise it.
+                forwarders.push(Arc::clone(&async_reporter));
+                async_reporter as Arc<dyn ProgressReporter>
             }
         };
         let ctx = DownloadContext::new()
@@ -1243,12 +1267,31 @@ async fn run(args: Args) -> Result<(), OdlError> {
             Err(join_err) => results.push(Err(OdlError::from(join_err))),
         }
     }
+    // Every download has finished, but its events may not have been drawn:
+    // they were handed to a worker task. Wait for that queue, so a `✕` line
+    // cannot land after the process has moved on to something else.
+    for forwarder in &forwarders {
+        forwarder.drained().await;
+    }
+
     // Per-download failures were already surfaced through each download's
-    // reporter (a `Failed` bar line in text mode, a `failed` NDJSON event
+    // reporter (a `✕ name: why` line in text mode, a `failed` NDJSON event
     // in json mode). Propagate the first failure so the process exit code
-    // reflects it; `report_error` prints the single top-level summary.
+    // reflects it.
     let first_err = results.into_iter().find_map(|r| r.err());
     if let Some(e) = first_err {
+        // That line already said the whole of it, and it named the download —
+        // which a top-level banner cannot do when several were running. Text
+        // mode leaves it at that. JSON keeps its error object: a consumer
+        // reads the stream for events and the exit for the verdict, and the
+        // object is what carries the exit code.
+        //
+        // Unless nothing was drawn: with output redirected, indicatif discards
+        // every line it is given, so suppressing the banner too would leave a
+        // failed run explaining itself nowhere.
+        if !forwarders.is_empty() && !mp.is_hidden() {
+            FAILURE_ALREADY_SHOWN.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         return Err(e);
     }
 

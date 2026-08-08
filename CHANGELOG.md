@@ -2,6 +2,23 @@
 
 ## 2.2.0
 
+### A failed download is reported once
+
+The download's own line already read `✕ name: why`, and the process then
+printed `Error: why` again — through a channel the progress display does not
+coordinate with, so it landed on top of a bar that was still drawing, and
+before the line it was repeating. Text mode now leaves it to the `✕` line,
+which is the one that names *which* download failed. An error that never
+reached a download — a bad argument, an unreadable config — still gets the
+banner, as does a run whose output is redirected, where the progress display
+draws nothing at all. `--format json` is unchanged: the `failed` event and the
+error object both carry it, and the object carries the exit code.
+
+`AsyncReporter::drained` is new, and the CLI waits on it before reporting
+anything of its own. Events are handed to a worker task, so a download's last
+line could otherwise be drawn after the code that summarises it has run — or,
+at exit, not at all.
+
 ### Verification reports progress
 
 Hashing the finished file ran to completion silently, so the one stage where a
