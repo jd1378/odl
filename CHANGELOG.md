@@ -1,6 +1,6 @@
 # Changelog
 
-## 2.0.4
+## 2.1.0
 
 ### A server that stops honouring `Range` is recoverable
 
@@ -34,6 +34,23 @@ will never send `PartFinished`, because they did not finish. Consumers holding
 per-part state (a row, a bar) get this event and drop all of it; new
 `PartAdded` events follow. The enum is `#[non_exhaustive]`, so a consumer that
 ignores it keeps compiling — it will just show the stale rows.
+
+### A retrying part says so on its own row
+
+The parent line already counts a backoff down, but with several parts in
+flight it does not say which of them is waiting — the part's own row showed
+`retry #2` and nothing more. It now reads `retry #2/5 in 20s`, or
+`server asked #2/5 in 20s` when the delay is the server's own `Retry-After`,
+which no shorter backoff can improve. The countdown keeps the parent line to
+itself, including for retries of whole-download steps such as the probe.
+
+### Rampup is settable from the command line
+
+`--rampup`, `--rampup-batch-size`, `--rampup-delay-min` and
+`--rampup-delay-max` join `--dynamic-split`, on both the download command and
+`odl config`. Turning off staggered connection opening — the first thing to
+try against a server that refuses parallel opens — previously meant writing a
+config file.
 
 ### `ASSEMBLY_ULID` is reachable
 

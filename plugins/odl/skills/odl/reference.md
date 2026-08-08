@@ -199,7 +199,7 @@ In a batch, individual `failed` events also stream to stdout; the stderr
 | `--proxy URL` | `http(s)://` or `socks://` |
 | `--on-final-file-exists abort\|replace-and-continue\|add-number-to-name-and-continue` | default `replace-and-continue` (overwrites) |
 | `--on-same-download-exists abort\|resume\|add-number-to-name-and-continue` | default `resume` |
-| `--on-file-changed abort\|restart`, `--on-not-resumable abort\|restart` | default `restart` |
+| `--on-file-changed abort\|restart`, `--on-not-resumable abort\|restart` | default `restart`. `--on-not-resumable` also decides what happens when a server stops honouring `Range` *during* a download: `restart` discards the parts and re-fetches whole on one connection, `abort` exits 4 |
 | `--remote-list` | treat INPUT URL as a downloadable list of URLs |
 | `--accept-invalid-certs` | TLS bypass — avoid unless you must |
 | `--log-level off\|error\|warn\|info\|debug\|trace` | diagnostics to stderr; `RUST_LOG` overrides |

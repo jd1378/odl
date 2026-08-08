@@ -621,6 +621,39 @@ impl ProgressReporter for CliReporter {
                     p.bar.set_message(format!("retry #{attempt}"));
                 }
             }
+            // The parent line already carries a live countdown, emitted as
+            // `Message` by `wait_for_retry`. What it cannot say is *which*
+            // part is waiting, so this only ever writes to a part's own row —
+            // a retry with no part (the probe) is left to the countdown.
+            ProgressEvent::RetryScheduled {
+                ulid: Some(ulid),
+                attempt,
+                max_attempts,
+                delay,
+                server_requested,
+            } => {
+                if let Some(p) = self.parts.lock().unwrap().get(&ulid) {
+                    // Whole seconds once past a second: the wait is
+                    // interruptible and this row is not redrawn as it ticks
+                    // down, so "4s 321ms" would be false precision.
+                    let rounded = if delay >= std::time::Duration::from_secs(1) {
+                        std::time::Duration::from_secs(delay.as_secs())
+                    } else {
+                        delay
+                    };
+                    // Whose idea the wait was, because a server's
+                    // `Retry-After` is not something a shorter backoff fixes.
+                    let who = if server_requested {
+                        "server asked"
+                    } else {
+                        "retry"
+                    };
+                    p.bar.set_message(format!(
+                        "{who} #{attempt}/{max_attempts} in {}",
+                        humantime::format_duration(rounded)
+                    ));
+                }
+            }
             ProgressEvent::Message(msg) => {
                 if !msg.is_empty() {
                     self.parent.set_message(msg);
@@ -801,6 +834,10 @@ async fn run(args: Args) -> Result<(), OdlError> {
                 accept_invalid_certs,
                 http2,
                 dynamic_split,
+                rampup,
+                rampup_batch_size,
+                rampup_delay_min,
+                rampup_delay_max,
             } => {
                 // determine directory where config is stored
                 let config_path = if let Some(c) = config_file {
@@ -882,6 +919,18 @@ async fn run(args: Args) -> Result<(), OdlError> {
                 }
                 if let Some(v) = dynamic_split {
                     dl_b.dynamic_split(*v);
+                }
+                if let Some(v) = rampup {
+                    dl_b.rampup(*v);
+                }
+                if let Some(v) = rampup_batch_size {
+                    dl_b.rampup_batch_size(*v);
+                }
+                if let Some(v) = rampup_delay_min {
+                    dl_b.rampup_delay_min(*v);
+                }
+                if let Some(v) = rampup_delay_max {
+                    dl_b.rampup_delay_max(*v);
                 }
                 let new_download = dl_b.build()?;
 
@@ -1294,6 +1343,18 @@ async fn build_download_manager(args: &Args) -> Result<DownloadManager, OdlError
     }
     if let Some(v) = args.dynamic_split {
         dl_b.dynamic_split(v);
+    }
+    if let Some(v) = args.rampup {
+        dl_b.rampup(v);
+    }
+    if let Some(v) = args.rampup_batch_size {
+        dl_b.rampup_batch_size(v);
+    }
+    if let Some(v) = args.rampup_delay_min {
+        dl_b.rampup_delay_min(v);
+    }
+    if let Some(v) = args.rampup_delay_max {
+        dl_b.rampup_delay_max(v);
     }
     let download = dl_b.build()?;
 

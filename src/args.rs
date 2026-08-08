@@ -363,6 +363,26 @@ pub struct Args {
     #[arg(long)]
     pub dynamic_split: Option<bool>,
 
+    /// Stagger the opening of connections so a server enforcing a per-IP
+    /// connection-rate limit is not tripped. Default: enabled. Pass
+    /// `--rampup false` to open every connection at once.
+    #[arg(long)]
+    pub rampup: Option<bool>,
+
+    /// Connections opened per rampup batch. Must be >= 1.
+    #[arg(long, value_name = "COUNT")]
+    pub rampup_batch_size: Option<u64>,
+
+    /// Lower bound of the random delay between rampup batches. Fractions
+    /// are supported.
+    #[arg(long, value_name = "DURATION", value_parser = humantime::parse_duration)]
+    pub rampup_delay_min: Option<Duration>,
+
+    /// Upper bound of the random delay between rampup batches. Must be
+    /// >= `--rampup-delay-min`. Fractions are supported.
+    #[arg(long, value_name = "DURATION", value_parser = humantime::parse_duration)]
+    pub rampup_delay_max: Option<Duration>,
+
     /// Custom HTTP headers to include in each request. Specify as `KEY:VALUE`.
     #[arg(long = "header", value_name = "KEY:VALUE", num_args = 0.., action = clap::ArgAction::Append)]
     pub headers: Vec<String>,
@@ -418,6 +438,10 @@ pub struct Args {
 }
 
 #[derive(Subcommand, Debug)]
+// `Config` carries one optional field per persisted setting, so it dwarfs the
+// other variants. Boxing it would mean giving up clap's derive on the variant
+// for a struct that is built once, at startup, from argv.
+#[allow(clippy::large_enum_variant)]
 pub enum Commands {
     /// Configure persistent download-manager settings saved in odl/config.toml
     Config {
@@ -489,6 +513,22 @@ pub enum Commands {
         /// Allow mid-flight subdivision of long-running parts.
         #[arg(long)]
         dynamic_split: Option<bool>,
+
+        /// Stagger the opening of connections against per-IP rate limits
+        #[arg(long)]
+        rampup: Option<bool>,
+
+        /// Connections opened per rampup batch
+        #[arg(long, value_name = "COUNT")]
+        rampup_batch_size: Option<u64>,
+
+        /// Lower bound of the random delay between rampup batches
+        #[arg(long, value_name = "DURATION", value_parser = humantime::parse_duration)]
+        rampup_delay_min: Option<Duration>,
+
+        /// Upper bound of the random delay between rampup batches
+        #[arg(long, value_name = "DURATION", value_parser = humantime::parse_duration)]
+        rampup_delay_max: Option<Duration>,
     },
 
     /// Install or inspect the helper programs odl uses for media sites.
