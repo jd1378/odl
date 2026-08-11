@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### `PartProgress` cadence is now part of the contract
+
+The built-in downloader has always sampled every in-flight part on its 125 ms
+tick whether or not bytes arrived, but the event was documented only as "a part
+advanced". A consumer wanting to know which parts are on a connection right now
+has nothing else to read — parts leave the wire to be re-scheduled without an
+event of their own — so it was depending on the implementation rather than on
+anything promised. `ProgressEvent::PartProgress` now states the guarantee: an
+in-flight part is sampled at `SAMPLE_INTERVAL` regardless of byte arrival, so
+the absence of samples means the part is not being transferred. `PartAdded`
+says what it actually announces along with it — that a part exists, which is
+not the same as being on a connection, and which can be said more than once for
+the same ulid. A test holds a connection open saying nothing and asserts the
+samples keep coming.
+
 ## 2.2.0
 
 ### A failed download is reported once

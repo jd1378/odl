@@ -94,13 +94,46 @@ pub enum ProgressEvent {
     /// at [`SAMPLE_INTERVAL`] cadence whenever a download or assembly
     /// is in progress.
     Speed { bytes_per_second: f64 },
-    /// A new part was added (initial split or dynamic split).
+    /// A part exists and will be transferred (initial split or dynamic
+    /// split). Announcing a part is not the same as putting it on a
+    /// connection: a part split off while every connection is busy is
+    /// announced when it is created and again when it is scheduled, and a
+    /// part taken off the wire to be re-scheduled later is announced once
+    /// more. Consumers keyed by `ulid` should treat a repeat as an update of
+    /// the part they already have, and read
+    /// [`ProgressEvent::PartProgress`] — not this event — as the signal that
+    /// a part is being transferred right now.
     PartAdded {
         ulid: String,
         offset: u64,
         size: u64,
     },
-    /// A part advanced.
+    /// Byte count for a single part.
+    ///
+    /// The built-in downloader emits this for **every in-flight part on every
+    /// [`SAMPLE_INTERVAL`] tick, whether or not bytes arrived** — a part whose
+    /// connection is open but silent keeps reporting its unchanged count. A
+    /// part is in-flight from the moment it is scheduled on a connection until
+    /// it either reports [`ProgressEvent::PartFinished`] or is taken off the
+    /// wire to be re-scheduled later (surplus connection, or a failed attempt
+    /// awaiting its backoff). That second case has no event of its own: the
+    /// samples simply stop, and a later [`ProgressEvent::PartAdded`] for the
+    /// same ulid says the part is back. So the sample cadence *is* the
+    /// part's liveness signal — no `PartProgress` for several ticks means the
+    /// part is not on a connection right now. This is a promise of the API,
+    /// not an accident of the sampler.
+    ///
+    /// In-flight means scheduled on a connection, not that data is moving: a
+    /// part stalled mid-response, or waiting out a retry the task handles
+    /// itself, keeps sampling at a flat byte count. Telling a stall from a
+    /// slow transfer is the consumer's call, from the reported counts.
+    ///
+    /// The assembly and verification rows ([`ASSEMBLY_ULID`],
+    /// [`VERIFY_ULID`]) are sampled on the same cadence while they run.
+    ///
+    /// Engines that delegate to an external downloader report whatever that
+    /// tool reports (see [`ProgressReporter`]); only the built-in downloader
+    /// promises the clock-driven cadence.
     PartProgress {
         ulid: String,
         downloaded: u64,
