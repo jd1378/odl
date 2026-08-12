@@ -1,6 +1,23 @@
 # Changelog
 
-## Unreleased
+## 2.3.0
+
+### Building odl no longer needs `protoc`
+
+`prost-build` shells out to a `protoc` binary, so building odl meant having
+one — and where there wasn't one (the `cross` containers), the
+`vendored-protoc` feature pulled in `protobuf-src` and compiled protobuf's
+C++ from source. A build-environment workaround does not belong in a crate's
+public feature list, and every CI job carried a step to install a compiler
+that only the build script used.
+
+The schema is now compiled by `protox`, a protobuf compiler written in Rust,
+in-process. `prost-build` still generates the code, from the descriptor set
+protox hands it: the generated Rust is byte-identical to what protoc produced,
+and the descriptors match protoc's own output field for field, so nothing
+about the on-disk metadata format changes. `vendored-protoc` and the
+`protobuf-src` dependency are gone, along with every protoc install step in
+CI. Building odl now needs nothing but a Rust toolchain.
 
 ### `PartProgress` cadence is now part of the contract
 

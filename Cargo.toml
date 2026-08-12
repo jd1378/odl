@@ -1,6 +1,6 @@
 [package]
 name = "odl"
-version = "2.2.0"
+version = "2.3.0"
 edition = "2024"
 # let-chains are used throughout, which is what sets the floor.
 rust-version = "1.88"
@@ -68,7 +68,14 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [build-dependencies]
 prost-build = "0.14"
-protobuf-src = { version = "2.1", optional = true }
+# Compiles the schema in-process. Building odl needs no `protoc` on the
+# machine, so cross builds and minimal containers work with no extra step.
+#
+# Pinned exactly rather than by range: this crate is young, it runs on the
+# build machine, and its output is the wire format everything on disk is
+# written in. A new release should be read and its generated code diffed
+# against the current one before it builds anything here.
+protox = "=0.9.1"
 
 [features]
 default = ["cli", "ytdlp"]
@@ -84,7 +91,6 @@ ytdlp = ["dep:serde_json", "dep:windows-sys", "tokio/process", "tokio/io-util"]
 # Needs JSON to read the release listing and a process spawn to unpack the
 # archive; the binary it replaces is only ever one odl's installer put there.
 self-update = ["dep:serde_json", "tokio/process"]
-vendored-protoc = ["protobuf-src"]
 
 [[bin]]
 name = "odl"

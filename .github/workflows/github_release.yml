@@ -65,12 +65,6 @@ jobs:
       with:
         fetch-depth: 0
         ref: ${{ needs.crate_metadata.outputs.tag }}
-    - run: |
-        sudo apt-get -y update
-        sudo apt-get -y install protobuf-compiler
-        if command -v protoc >/dev/null 2>&1; then
-          echo "PROTOC=$(command -v protoc)" >> $GITHUB_ENV
-        fi
     - run: cargo fmt -- --check
     - run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
@@ -87,13 +81,7 @@ jobs:
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
     - name: Build and install
-      run: |
-        sudo apt-get -y update
-        sudo apt-get -y install protobuf-compiler
-        if command -v protoc >/dev/null 2>&1; then
-          echo "PROTOC=$(command -v protoc)" >> $GITHUB_ENV
-        fi
-        cargo install --locked --path .
+      run: cargo install --locked --path .
     - name: Run unit tests
       run: cargo test --locked
 
@@ -140,56 +128,17 @@ jobs:
       #   fetch-depth: 0
       #   ref: ${{ needs.crate_metadata.outputs.tag }}
 
-    - name: Install prerequisites (linux / macos)
-      if: startsWith(matrix.job.os, 'ubuntu') || startsWith(matrix.job.os, 'macos')
+    # The schema is compiled by `protox`, in the build script, so no `protoc`
+    # is installed anywhere here — only the cross-compilers the linkers need.
+    - name: Install prerequisites (linux)
+      if: startsWith(matrix.job.os, 'ubuntu')
       shell: bash
       run: |
-        case ${{ matrix.job.os }} in
-          ubuntu*|linux*)
-            echo "installing linux prerequisites"
-            sudo apt-get -y update
-            case ${{ matrix.job.target }} in
-              arm-unknown-linux-*) sudo apt-get -y install gcc-arm-linux-gnueabihf ;;
-              aarch64-unknown-linux-gnu) sudo apt-get -y install gcc-aarch64-linux-gnu ;;
-            esac
-            ;;
-          macos*)
-            brew update
-            brew install protobuf
-            if ! command -v protoc >/dev/null 2>&1; then
-              echo "protoc not installed properly on macOS, exiting with error..."
-              exit 1
-            fi
-            PROTOC_PATH=$(command -v protoc)
-            chmod 755 "$PROTOC_PATH" || true
-            ;;
+        sudo apt-get -y update
+        case ${{ matrix.job.target }} in
+          arm-unknown-linux-*) sudo apt-get -y install gcc-arm-linux-gnueabihf ;;
+          aarch64-unknown-linux-gnu) sudo apt-get -y install gcc-aarch64-linux-gnu ;;
         esac
-
-        if [ -n "$PROTOC_PATH" ]; then
-          echo "PROTOC found at: $PROTOC_PATH"
-          echo "PROTOC=$PROTOC_PATH" >> $GITHUB_ENV
-        else
-          echo "PROTOC not found"
-        fi
-
-    - name: Install prerequisites (windows)
-      if: startsWith(matrix.job.os, 'windows-')
-      shell: pwsh
-      run: |
-        choco install protoc -y --no-progress
-        # refresh environment so current session sees updated PATH
-        refreshenv
-        $proto = (Get-Command protoc -ErrorAction SilentlyContinue).Source
-        if (-not [string]::IsNullOrEmpty($proto)) {
-          Write-Host "PROTOC found at: $proto"
-          Add-Content -Path $env:GITHUB_ENV -Value "PROTOC=$proto"
-          # also ensure PATH contains Chocolatey bin for processes that just call "protoc"
-          Add-Content -Path $env:GITHUB_ENV -Value ("PATH=" + $env:Path + ";" + (Split-Path $proto))
-          protoc --version
-        } else {
-          Write-Host "PROTOC not found"
-          exit 1
-        }
 
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
@@ -219,19 +168,7 @@ jobs:
 
     - name: Build
       shell: bash
-      run: |
-        if [ -n "$PROTOC" ]; then
-          echo "PROTOC env is set: $PROTOC"
-        fi
-
-        # Enable vendored-protoc when using cross builds (leave macOS/Windows alone)
-        BUILD_FEATURES=""
-        if [ "${{ matrix.job.use-cross }}" = "true" ]; then
-          echo "Enabling vendored-protoc feature for cross build"
-          BUILD_FEATURES="--features vendored-protoc"
-        fi
-
-        $BUILD_CMD build $BUILD_FEATURES --locked --release --target=${{ matrix.job.target }}
+      run: $BUILD_CMD build --locked --release --target=${{ matrix.job.target }}
 
     - name: Set binary name & path
       id: bin
@@ -258,23 +195,16 @@ jobs:
         # test only library unit tests and binary for arm-type targets
         unset CARGO_TEST_OPTIONS
         unset CARGO_TEST_OPTIONS ; case ${{ matrix.job.target }} in arm-* | aarch64-*) CARGO_TEST_OPTIONS="--lib --bin ${{ needs.crate_metadata.outputs.name }}" ;; esac;
-        # If we're using cross, enable vendored-protoc for tests as well
-        CARGO_TEST_FEATURES=""
-        if [ "${{ matrix.job.use-cross }}" = "true" ]; then
-          CARGO_TEST_FEATURES="--features vendored-protoc"
-        fi
-
         echo "CARGO_TEST_OPTIONS=${CARGO_TEST_OPTIONS}" >> $GITHUB_OUTPUT
-        echo "CARGO_TEST_FEATURES=${CARGO_TEST_FEATURES}" >> $GITHUB_OUTPUT
 
     - name: Run tests
       shell: bash
       run: |
         if [[ ${{ matrix.job.os }} = windows-* ]]
         then
-          powershell.exe -command "$BUILD_CMD test --locked --target=${{ matrix.job.target }} ${{ steps.test-options.outputs.CARGO_TEST_OPTIONS}} ${{ steps.test-options.outputs.CARGO_TEST_FEATURES}}"
+          powershell.exe -command "$BUILD_CMD test --locked --target=${{ matrix.job.target }} ${{ steps.test-options.outputs.CARGO_TEST_OPTIONS}}"
         else
-          $BUILD_CMD test --locked --target=${{ matrix.job.target }} ${{ steps.test-options.outputs.CARGO_TEST_OPTIONS}} ${{ steps.test-options.outputs.CARGO_TEST_FEATURES}}
+          $BUILD_CMD test --locked --target=${{ matrix.job.target }} ${{ steps.test-options.outputs.CARGO_TEST_OPTIONS}}
         fi
 
     - name: Create tarball
