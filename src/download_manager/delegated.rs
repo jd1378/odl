@@ -492,7 +492,7 @@ mod imp {
             use_server_time: instruction.use_server_time(),
             proxy: opts.proxy(),
             speed_limit: opts.speed_limit(),
-            headers: instruction.headers().as_ref(),
+            headers: instruction.headers(),
             concurrent_fragments: opts.max_connections(),
             max_retries: opts.max_retries(),
             wait_between_retries: opts.wait_between_retries(),

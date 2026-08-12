@@ -48,7 +48,7 @@ use url::Url;
 /// The example below is illustrative and intentionally ignored for doctests
 /// because the required `ResponseInfo` type is internal to the crate.
 ///
-/// ```ignore
+/// ```text
 /// // pseudo-code:
 /// // let instr = manager
 /// //     .evaluate(EvaluateRequest::new(url, save_dir, &save_resolver))
@@ -350,8 +350,8 @@ impl Download {
         self.size
     }
 
-    pub fn etag(&self) -> &Option<String> {
-        &self.etag
+    pub fn etag(&self) -> Option<&str> {
+        self.etag.as_deref()
     }
 
     pub fn last_modified(&self) -> Option<i64> {
@@ -371,12 +371,12 @@ impl Download {
         self.requires_basic_auth
     }
 
-    pub fn credentials(&self) -> &Option<Credentials> {
-        &self.credentials
+    pub fn credentials(&self) -> Option<&Credentials> {
+        self.credentials.as_ref()
     }
 
-    pub fn headers(&self) -> &Option<HeaderMap> {
-        &self.headers
+    pub fn headers(&self) -> Option<&HeaderMap> {
+        self.headers.as_ref()
     }
 
     /// Headers returned by the server during [`crate::download_manager::DownloadManager::evaluate`].
@@ -463,9 +463,8 @@ impl Download {
     }
 
     /// The response headers as persisted: credential-bearing ones dropped,
-    /// oversized values skipped, total capped at
-    /// [`MAX_STORED_RESPONSE_HEADERS_BYTES`]. Server order and repeated
-    /// header names are preserved.
+    /// oversized values skipped, and the total capped. Server order and
+    /// repeated header names are preserved.
     ///
     /// Prefer this over [`Self::response_headers`] when showing headers to a
     /// user: a live probe's map still holds `set-cookie`, bearer tokens and

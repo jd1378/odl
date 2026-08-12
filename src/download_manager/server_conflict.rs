@@ -21,7 +21,7 @@ async fn apply_restart_state_to_metadata(
     new_checksums: Vec<FileChecksum>,
 ) {
     metadata.finished = false;
-    metadata.last_etag = new_download.etag().to_owned();
+    metadata.last_etag = new_download.etag().map(str::to_owned);
     metadata.last_modified = new_download.last_modified();
     metadata.size = new_download.size();
     remove_all_parts(new_download.download_dir()).await;
@@ -152,7 +152,7 @@ where
         // Since resolution of either of issues is restarting the download, we just need to check one.
         if !metadata.is_resumable {
             conflict = Some(ServerConflict::NotResumable)
-        } else if metadata.last_etag != *instruction.etag()
+        } else if metadata.last_etag.as_deref() != instruction.etag()
             || metadata.last_modified != instruction.last_modified()
             || metadata.size != instruction.size()
             || metadata.checksums != new_checksums

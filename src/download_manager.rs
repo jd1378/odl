@@ -55,7 +55,7 @@ use crate::{
 ///
 /// Typical usage (illustrative):
 ///
-/// ```ignore
+/// ```text
 /// // Create manager and evaluate a URL to receive a `Download` instruction.
 /// // The manager will perform an HTTP probe and return a populated
 /// // `Download` value which can then be passed to `DownloadManager::download`.

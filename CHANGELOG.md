@@ -2,6 +2,14 @@
 
 ## 3.0.0
 
+### Optional accessors hand back a reference to the value, not to the `Option`
+
+`Download::etag`, `Download::credentials` and `Download::headers` returned
+`&Option<T>`, which every caller then had to unwrap through `.as_ref()` or a
+deref before it composed with anything. They return `Option<&T>` now —
+`Option<&str>` for the etag — matching the accessors elsewhere on the type and
+on `DownloadOptions`.
+
 ### `Download` no longer carries a proxy it never used
 
 `Download` and `YtdlpSpec` each held an `Option<reqwest::Proxy>`. Nothing read

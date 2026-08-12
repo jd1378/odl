@@ -115,9 +115,11 @@ pub struct DownloadOptions {
     ///
     /// Example in `config.toml`:
     ///
+    /// ```toml
     /// [headers]
     /// Authorization = "Bearer TOKEN"
     /// Accept = "application/json"
+    /// ```
     #[serde(default = "default_headers")]
     headers: Option<indexmap::IndexMap<String, String>>,
 

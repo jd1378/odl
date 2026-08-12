@@ -2165,10 +2165,7 @@ async fn run_probe(args: &Args, url_str: &str, format: OutputFormat) -> Result<(
             // Fields the engine cannot observe are left out rather than shown
             // as `-`, which would read as "the server sent nothing".
             if caps.response_headers {
-                println!(
-                    "etag:          {}",
-                    instruction.etag().as_deref().unwrap_or("-")
-                );
+                println!("etag:          {}", instruction.etag().unwrap_or("-"));
                 println!(
                     "last_modified: {}",
                     last_modified_rfc3339.as_deref().unwrap_or("-")
