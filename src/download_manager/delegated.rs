@@ -339,7 +339,6 @@ mod imp {
                 quality,
                 use_server_time: opts.use_server_time(),
                 ascii_filenames: opts.ascii_filenames(),
-                proxy: opts.proxy_client_setting(),
                 headers: Some(HeaderMap::from(opts)),
             },
         );
@@ -663,7 +662,6 @@ mod tests {
                 },
                 use_server_time: false,
                 ascii_filenames: false,
-                proxy: None,
                 headers: None,
             },
         )
@@ -693,7 +691,6 @@ mod tests {
                     },
                     use_server_time: false,
                     ascii_filenames: false,
-                    proxy: None,
                     headers: None,
                 }
             },

@@ -2,6 +2,27 @@
 
 ## 3.0.0
 
+### `Download` no longer carries a proxy it never used
+
+`Download` and `YtdlpSpec` each held an `Option<reqwest::Proxy>`. Nothing read
+either one: the proxy that reaches the wire is built from `DownloadOptions` at
+request time, and a `reqwest::Proxy` is an opaque client object that cannot be
+serialized, so the field was not persisted with the rest of the instruction
+either. What it did do was put reqwest in odl's public API. Both fields, and
+`Download::proxy`, are gone; `DownloadOptions::proxy` is where the setting
+lives and always was.
+
+### The metadata lock uses the standard library
+
+File locking has been in `std` since Rust 1.89, so the `fs2` dependency —
+unmaintained since 2018 — bought nothing. The calls underneath are the same
+ones fs2 made: `flock` with `LOCK_EX | LOCK_NB` on Unix, `LockFileEx` with
+`LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY` on Windows, released on
+`unlock` or when the file closes. Contention is still reported as
+`MetadataError::LockfileInUse`.
+
+The minimum supported Rust version is now 1.89.
+
 ### reqwest is no longer part of odl's public API
 
 Which HTTP client odl uses was visible from the outside: `self_update::plan`

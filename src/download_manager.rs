@@ -8,7 +8,6 @@ mod server_conflict;
 
 use std::{path::PathBuf, sync::Arc};
 
-use fs2::FileExt;
 use http::header::{HeaderMap, USER_AGENT};
 use reqwest::Client;
 use url::Url;
@@ -631,14 +630,14 @@ impl DownloadManager {
                 )),
             })?;
         let f = f.into_std().await;
-        if f.try_lock_exclusive().is_err() {
+        if f.try_lock().is_err() {
             return Err(OdlError::MetadataError(MetadataError::LockfileInUse));
         }
 
         let result = self
             .process_download(instruction, conflict_resolver, ctx, opts)
             .await;
-        let _ = FileExt::unlock(&f);
+        let _ = f.unlock();
         result
     }
 

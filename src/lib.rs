@@ -37,6 +37,16 @@
 //! odl = { version = "3", default-features = false, features = ["ytdlp"] }
 //! ```
 //!
+//! # Public dependencies
+//!
+//! Types from other crates appear in odl's API, which means a consumer has to
+//! resolve a compatible version of those crates to pass them: [`url::Url`],
+//! `http::HeaderMap`, `chrono::DateTime`, `prost`'s generated types in
+//! [`proto`], and `tokio`'s `AcquireError`. Every one of them is a declared
+//! dependency, so the version to match is visible in odl's manifest.
+//!
+//! Which HTTP client odl downloads with is deliberately **not** on that list.
+//!
 //! Two runtime switches exist as well, for builds that do include the feature:
 //! set `enabled = false` on [`config::YtdlpOptions`], or pass
 //! [`engine::EnginePreference::Engine`] with the HTTP engine on an individual

@@ -15,7 +15,6 @@ use crate::{
 use chrono::{DateTime, Utc};
 use derive_builder::{Builder, UninitializedFieldError};
 use http::header::{HeaderMap, HeaderName, HeaderValue};
-use reqwest::Proxy;
 use std::{
     collections::HashMap,
     path::{self, PathBuf},
@@ -94,9 +93,6 @@ pub struct Download {
     /// username and password to use, when requires_auth is true and this is provided
     #[builder(default = None)]
     credentials: Option<Credentials>,
-    /// proxy to use, if provided
-    #[builder(default = None)]
-    proxy: Option<Proxy>,
     #[builder(default = None)]
     headers: Option<HeaderMap>,
     /// Headers the server sent on the evaluate probe. Instructions rebuilt
@@ -199,7 +195,6 @@ pub struct YtdlpSpec {
     pub use_server_time: bool,
     /// Transliterate the title to ASCII before it becomes a path component.
     pub ascii_filenames: bool,
-    pub proxy: Option<Proxy>,
     pub headers: Option<HeaderMap>,
 }
 
@@ -380,10 +375,6 @@ impl Download {
         &self.credentials
     }
 
-    pub fn proxy(&self) -> &Option<Proxy> {
-        &self.proxy
-    }
-
     pub fn headers(&self) -> &Option<HeaderMap> {
         &self.headers
     }
@@ -540,7 +531,6 @@ impl Download {
             credentials: None,
             requires_auth: metadata.requires_auth,
             requires_basic_auth: metadata.requires_basic_auth,
-            proxy: None,
             headers: if metadata.headers.is_empty() {
                 None
             } else {
@@ -648,7 +638,6 @@ impl Download {
             quality,
             use_server_time,
             ascii_filenames,
-            proxy,
             headers,
         } = spec;
 
@@ -680,7 +669,6 @@ impl Download {
             credentials: None,
             requires_auth: false,
             requires_basic_auth: false,
-            proxy,
             headers,
             // The engine never exposes the underlying HTTP exchange.
             response_headers: None,
@@ -730,7 +718,6 @@ impl Download {
     ) -> Download {
         let max_connections = opts.max_connections();
         let use_server_time = opts.use_server_time();
-        let proxy = opts.proxy_client_setting();
         let headers = Some(HeaderMap::from(opts));
         let filename = fs_utils::cleanup_filename(
             response_info.extract_filename().as_str(),
@@ -756,7 +743,6 @@ impl Download {
             credentials,
             requires_auth: response_info.requires_auth(),
             requires_basic_auth: response_info.requires_basic_auth(),
-            proxy,
             headers,
             response_headers_probed_at: response_headers.is_some().then(|| Utc::now().timestamp()),
             response_headers,
