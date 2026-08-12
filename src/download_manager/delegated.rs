@@ -303,9 +303,15 @@ mod imp {
         // Extraction is odl's to retry: the tool was told not to, so each
         // failure is counted, reported and interruptible here.
         let info = with_retries(opts, ctx, opts.max_retries(), || async {
-            extract::extract(url, ytdlp_opts, &tools, opts.proxy(), selector_expr)
-                .await
-                .map_err(OdlError::from)
+            extract::extract(
+                url,
+                ytdlp_opts,
+                &tools,
+                opts.proxy_process_arg(),
+                selector_expr,
+            )
+            .await
+            .map_err(OdlError::from)
         })
         .await?;
         if ctx.is_cancelled() {
@@ -490,7 +496,7 @@ mod imp {
             stem: &stem,
             total_size: metadata.size,
             use_server_time: instruction.use_server_time(),
-            proxy: opts.proxy(),
+            proxy: opts.proxy_process_arg(),
             speed_limit: opts.speed_limit(),
             headers: instruction.headers(),
             concurrent_fragments: opts.max_connections(),

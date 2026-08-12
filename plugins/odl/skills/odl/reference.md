@@ -214,6 +214,7 @@ In a batch, individual `failed` events also stream to stdout; the stderr
 | `--checksum ALGO:DIGEST` | verify the file against a known hash; repeatable. `ALGO`: `md5`/`sha1`/`sha256`/`sha384`/`sha512`. Digest hex by default, or `ALGO:base64:DIGEST`. Mismatch ⇒ exit 4 |
 | `--http-user`, `--http-password` | HTTP basic auth |
 | `--proxy URL` | `http(s)://` or `socks://` |
+| `--no-proxy` | connect directly: ignores the configured proxy and `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`. Conflicts with `--proxy` |
 | `--on-final-file-exists abort\|replace-and-continue\|add-number-to-name-and-continue` | default `replace-and-continue` (overwrites) |
 | `--on-same-download-exists abort\|resume\|add-number-to-name-and-continue` | default `resume` |
 | `--on-file-changed abort\|restart`, `--on-not-resumable abort\|restart` | default `restart`. `--on-not-resumable` also decides what happens when a server stops honouring `Range` *during* a download: `restart` discards the parts and re-fetches whole on one connection, `abort` exits 4 |

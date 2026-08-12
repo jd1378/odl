@@ -45,6 +45,8 @@ pub struct DownloadPlan<'a> {
     pub stem: &'a str,
     pub total_size: Option<u64>,
     pub use_server_time: bool,
+    /// yt-dlp's `--proxy` value; `Some("")` forces a direct connection. See
+    /// [`crate::ytdlp::extract::base_args`].
     pub proxy: Option<&'a str>,
     pub speed_limit: Option<u64>,
     pub headers: Option<&'a HeaderMap>,

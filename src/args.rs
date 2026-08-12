@@ -316,6 +316,10 @@ pub struct Args {
     #[arg(long, value_name = "(http(s)|socks)://")]
     pub proxy: Option<String>,
 
+    /// Connect directly: ignore the configured proxy and any proxy set in the environment
+    #[arg(long, conflicts_with = "proxy")]
+    pub no_proxy: bool,
+
     /// Connect timeout for requests. Accepts suffixes like `30s`, `5m`, `2h`, `1d` or long forms (`seconds`, `minutes`, `hours`, `days`). Default `5s`.
     #[arg(short, long = "timeout", value_name = "DURATION", value_parser = humantime::parse_duration)]
     pub timeout: Option<Duration>,
@@ -493,6 +497,11 @@ pub enum Commands {
         /// Proxy as string
         #[arg(long)]
         proxy: Option<String>,
+
+        /// Connect directly, ignoring the configured proxy and the environment's.
+        /// Turning it on clears any stored proxy.
+        #[arg(long)]
+        no_proxy: Option<bool>,
 
         /// Connect timeout for requests. Accepts suffixes like `30s`, `5m`, `2h`, `1d` or long forms (`seconds`, `minutes`, `hours`, `days`). Default `5s`.
         #[arg(short, long = "timeout", value_name = "DURATION", value_parser = humantime::parse_duration)]

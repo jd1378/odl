@@ -29,6 +29,7 @@ mod defaults {
     pub fn default_user_agent() -> Option<String> { None }
     pub fn default_randomize_user_agent() -> bool { false }
     pub fn default_proxy() -> Option<String> { None }
+    pub fn default_no_proxy() -> bool { false }
     pub fn default_use_server_time() -> bool { false }
     pub fn default_accept_invalid_certs() -> bool { false }
     pub fn default_speed_limit() -> Option<u64> { None }
@@ -94,6 +95,18 @@ pub struct DownloadOptions {
     /// Custom request Proxy to use for downloads (proxy URL string)
     #[serde(default = "default_proxy")]
     proxy: Option<String>,
+
+    /// Connect directly, ignoring every proxy: the one set in [`Self::proxy`]
+    /// as well as the ones the environment supplies (`HTTP_PROXY`,
+    /// `HTTPS_PROXY`, `ALL_PROXY`, and the platform's system proxy), which are
+    /// otherwise picked up automatically.
+    ///
+    /// Setting this wins over `proxy`: a caller layering an override on top of
+    /// a config that names a proxy means to bypass it, and the pair is
+    /// collapsed at build time so nothing downstream can read the dropped
+    /// value and reach for it anyway.
+    #[serde(default = "default_no_proxy")]
+    no_proxy: bool,
 
     /// Whether to use the last-modified sent by server when saving the file
     #[serde(default = "default_use_server_time")]
@@ -189,6 +202,7 @@ impl From<DownloadOptions> for DownloadOptionsBuilder {
             .user_agent(o.user_agent)
             .randomize_user_agent(o.randomize_user_agent)
             .proxy(o.proxy)
+            .no_proxy(o.no_proxy)
             .use_server_time(o.use_server_time)
             .accept_invalid_certs(o.accept_invalid_certs)
             .speed_limit(o.speed_limit)
@@ -216,6 +230,7 @@ impl Default for DownloadOptions {
             user_agent: default_user_agent(),
             randomize_user_agent: default_randomize_user_agent(),
             proxy: default_proxy(),
+            no_proxy: default_no_proxy(),
             use_server_time: default_use_server_time(),
             accept_invalid_certs: default_accept_invalid_certs(),
             speed_limit: default_speed_limit(),
@@ -259,6 +274,9 @@ impl DownloadOptions {
     }
     pub fn proxy(&self) -> Option<&str> {
         self.proxy.as_deref()
+    }
+    pub fn no_proxy(&self) -> bool {
+        self.no_proxy
     }
     pub fn use_server_time(&self) -> bool {
         self.use_server_time
@@ -325,6 +343,12 @@ impl DownloadOptions {
                 default_rampup_batch_size()
             );
             self.rampup_batch_size = default_rampup_batch_size();
+        }
+        if self.no_proxy && self.proxy.is_some() {
+            tracing::warn!(
+                "no_proxy is set; ignoring the configured proxy and connecting directly"
+            );
+            self.proxy = None;
         }
         if let Some(headers) = self.headers.as_mut() {
             headers.retain(|k, v| {
@@ -809,7 +833,24 @@ impl DownloadOptions {
     /// consumers to the same major version of a client they never asked
     /// about. [`Self::proxy`] already exposes the setting itself.
     pub(crate) fn proxy_client_setting(&self) -> Option<Proxy> {
+        if self.no_proxy {
+            // Normally already `None` — sanitize drops the pair — but direct
+            // deserialization skips that, and a proxy must never win here.
+            return None;
+        }
         self.proxy.as_deref().and_then(|s| Proxy::all(s).ok())
+    }
+
+    /// The proxy setting as a helper process wants it on its command line.
+    ///
+    /// `yt-dlp` reads `HTTP_PROXY` and friends from the environment it
+    /// inherits, so "no proxy" cannot be expressed by passing nothing: the
+    /// empty string is its own spelling of a direct connection.
+    pub(crate) fn proxy_process_arg(&self) -> Option<&str> {
+        if self.no_proxy {
+            return Some("");
+        }
+        self.proxy()
     }
 }
 
@@ -880,6 +921,7 @@ M-Header = "m"
             original.randomize_user_agent()
         );
         assert_eq!(round.proxy(), original.proxy());
+        assert_eq!(round.no_proxy(), original.no_proxy());
         assert_eq!(round.use_server_time(), original.use_server_time());
         assert_eq!(round.ascii_filenames(), original.ascii_filenames());
         assert_eq!(
@@ -985,6 +1027,40 @@ M-Header = "m"
             err,
             DownloadOptionsBuilderError::ValidationError(_)
         ));
+    }
+
+    #[test]
+    fn no_proxy_drops_a_configured_proxy() {
+        let opts = DownloadOptionsBuilder::default()
+            .proxy(Some("http://127.0.0.1:8080".to_owned()))
+            .no_proxy(true)
+            .build()
+            .expect("builds");
+        assert!(opts.no_proxy());
+        assert_eq!(opts.proxy(), None);
+        assert!(opts.proxy_client_setting().is_none());
+        // yt-dlp reads the environment on its own, so "direct" has to be said
+        // out loud rather than left unsaid.
+        assert_eq!(opts.proxy_process_arg(), Some(""));
+    }
+
+    #[test]
+    fn proxy_survives_when_no_proxy_is_off() {
+        let opts = DownloadOptionsBuilder::default()
+            .proxy(Some("http://127.0.0.1:8080".to_owned()))
+            .build()
+            .expect("builds");
+        assert_eq!(opts.proxy(), Some("http://127.0.0.1:8080"));
+        assert!(opts.proxy_client_setting().is_some());
+        assert_eq!(opts.proxy_process_arg(), Some("http://127.0.0.1:8080"));
+    }
+
+    #[test]
+    fn deserialized_no_proxy_beats_a_proxy_that_skipped_sanitize() {
+        let opts: DownloadOptions =
+            toml::from_str("proxy = \"http://127.0.0.1:8080\"\nno_proxy = true\n").expect("parse");
+        assert!(opts.proxy_client_setting().is_none());
+        assert_eq!(opts.proxy_process_arg(), Some(""));
     }
 
     #[test]

@@ -21,7 +21,9 @@ use crate::{config::DownloadOptions, error::OdlError};
 /// timeout they chose should not be silently overridden.
 pub(crate) fn client_for(net: &DownloadOptions) -> Result<Client, OdlError> {
     let mut builder = Client::builder();
-    if let Some(proxy) = net.proxy_client_setting() {
+    if net.no_proxy() {
+        builder = builder.no_proxy();
+    } else if let Some(proxy) = net.proxy_client_setting() {
         builder = builder.proxy(proxy);
     }
     if net.accept_invalid_certs() {

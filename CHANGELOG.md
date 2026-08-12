@@ -1,5 +1,23 @@
 # Changelog
 
+## 3.1.0
+
+### A direct-connection knob: `no_proxy`
+
+`DownloadOptions::proxy` could name a proxy but never refuse one. With nothing
+set, reqwest still picks up `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and the
+platform's system proxy on its own, so an embedder that must reach a host
+directly — a link-local address, a service inside the same network — had no way
+to say so.
+
+`DownloadOptions::no_proxy` (config key `no_proxy`, CLI `--no-proxy`) turns
+every proxy off for the job: the configured one, the environment's, and the
+system's. It wins over `proxy`, and the pair is collapsed when the options are
+built, so `proxy()` reads back `None` rather than a value nothing honours. It
+reaches the delegated `yt-dlp` engine too, as `--proxy ""` — that tool reads
+the environment itself, so a direct connection has to be stated on its command
+line rather than left unsaid.
+
 ## 3.0.0
 
 ### Optional accessors hand back a reference to the value, not to the `Option`

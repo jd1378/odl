@@ -428,6 +428,11 @@ pub fn parse_info(source_url: &Url, json: &[u8]) -> Result<ExtractedInfo, YtdlpE
 /// Shared flags for every yt-dlp invocation.
 ///
 /// `extra_args` are appended last so a user override wins over our defaults.
+///
+/// `proxy` is yt-dlp's own `--proxy` value, so `Some("")` forces a direct
+/// connection — the only way to stop the tool from picking up `HTTP_PROXY`
+/// and friends out of the environment it inherits. `None` leaves the flag off
+/// and lets it do exactly that.
 pub fn base_args(opts: &YtdlpOptions, tools: &Tools, proxy: Option<&str>) -> Vec<String> {
     let mut args: Vec<String> = vec![
         // A link that also names a playlist means the video, not the playlist.
@@ -690,6 +695,22 @@ mod tests {
             .position(|a| a == "--proxy")
             .expect("proxy flag");
         assert_eq!(args[i + 1], "socks5://127.0.0.1:9050");
+    }
+
+    #[test]
+    fn base_args_spell_out_a_direct_connection() {
+        let opts = YtdlpOptions::default();
+        let tools = Tools {
+            ytdlp: std::path::PathBuf::from("/usr/bin/yt-dlp"),
+            ffmpeg: None,
+        };
+        let args = base_args(&opts, &tools, Some(""));
+        let i = args
+            .iter()
+            .position(|a| a == "--proxy")
+            .expect("proxy flag");
+        // Omitting the flag would let yt-dlp fall back to $HTTP_PROXY.
+        assert_eq!(args[i + 1], "");
     }
 
     #[test]

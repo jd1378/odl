@@ -659,7 +659,11 @@ impl DownloadManager {
         if opts.headers().is_some_and(|x| !x.is_empty()) {
             client = client.default_headers(HeaderMap::from(opts));
         }
-        if let Some(proxy) = opts.proxy_client_setting() {
+        if opts.no_proxy() {
+            // Also switches off the environment/system proxy reqwest would
+            // otherwise pick up on its own.
+            client = client.no_proxy();
+        } else if let Some(proxy) = opts.proxy_client_setting() {
             client = client.proxy(proxy);
         }
 

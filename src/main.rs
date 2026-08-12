@@ -851,6 +851,7 @@ async fn run(args: Args) -> Result<(), OdlError> {
                 user_agent,
                 randomize_user_agent,
                 proxy,
+                no_proxy,
                 timeout,
                 use_server_time,
                 accept_invalid_certs,
@@ -923,6 +924,9 @@ async fn run(args: Args) -> Result<(), OdlError> {
                 }
                 if let Some(v) = proxy {
                     dl_b.proxy(Some(v.clone()));
+                }
+                if let Some(v) = no_proxy {
+                    dl_b.no_proxy(*v);
                 }
                 if let Some(v) = use_server_time {
                     dl_b.use_server_time(*v);
@@ -1367,6 +1371,11 @@ async fn build_download_manager(args: &Args) -> Result<DownloadManager, OdlError
     }
     if let Some(v) = args.proxy.clone() {
         dl_b.proxy(Some(v));
+    }
+    // Only ever turned on from the command line, so its absence leaves a
+    // config that asked for a direct connection alone.
+    if args.no_proxy {
+        dl_b.no_proxy(true);
     }
     if let Some(v) = args.use_server_time {
         dl_b.use_server_time(v);
