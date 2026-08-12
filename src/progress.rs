@@ -45,8 +45,8 @@ pub const VERIFY_ULID: &str = "_verify";
 /// reactively (no EWMA needed).
 pub const SAMPLE_INTERVAL: Duration = Duration::from_millis(125);
 
-use reqwest::Url;
 use tokio::sync::mpsc;
+use url::Url;
 
 pub use tokio_util::sync::CancellationToken;
 

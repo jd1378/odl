@@ -1,5 +1,50 @@
 # Changelog
 
+## 3.0.0
+
+### reqwest is no longer part of odl's public API
+
+Which HTTP client odl uses was visible from the outside: `self_update::plan`
+and `ytdlp::install::plan` both took a `reqwest::Client`, `OdlError`
+implemented `From<reqwest::Error>`, `DownloadOptions` converted into a
+`reqwest::Proxy`, and `Url` and `HeaderMap` were named through reqwest's
+re-exports. That made reqwest a *public* dependency: a consumer had to resolve
+the same major version of it as odl did, and odl could not upgrade its client
+without breaking them.
+
+Both `plan` functions now take the `&DownloadOptions` they were only ever
+using to build that client, so they configure proxy, certificate policy and
+connect timeout exactly as before, with one fewer thing for the caller to
+assemble. `Url` and `HeaderMap` are unchanged types, now imported from the
+`url` and `http` crates that define them — both are declared dependencies, so
+a consumer can match versions with odl directly. The reqwest error conversion
+and the proxy conversion are internal.
+
+Callers of `self_update::plan(&client, current)` pass
+`&config.download()` instead of a client; callers of
+`ytdlp::install::plan(&client, tool)` likewise. Anyone who relied on `?`
+converting a `reqwest::Error` into an `OdlError` was reaching through odl to
+its client, and now needs their own mapping.
+
+### TLS is served by rustls, not a vendored OpenSSL
+
+reqwest 0.13 makes rustls its default backend, and its `rustls` feature now
+pulls in `rustls-platform-verifier` on its own — so verification against the
+platform's own trust store, which was the reason to prefer native-tls in the
+first place, comes for free.
+
+What native-tls still cost was the vendored build. `native-tls-vendored`
+compiled OpenSSL from source on every build, which meant a perl and C
+toolchain on every build host, and it froze a copy of OpenSSL into the shipped
+binary that only saw CVE fixes when someone remembered to bump `openssl-src`.
+Both are gone; a Rust toolchain is again all that building odl needs.
+
+rustls declines TLS 1.0/1.1 and the legacy cipher suites OpenSSL still
+accepts, so a server old enough to need one of them now fails the handshake
+rather than negotiating down to it. Trust anchors come from the platform store
+rather than the vendored bundle, so OpenSSL's `SSL_CERT_FILE` and its
+neighbours no longer have any bearing on which roots odl trusts.
+
 ## 2.3.1
 
 ### A resumed download whose parts are all present no longer fails

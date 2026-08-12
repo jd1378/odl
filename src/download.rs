@@ -14,10 +14,8 @@ use crate::{
 };
 use chrono::{DateTime, Utc};
 use derive_builder::{Builder, UninitializedFieldError};
-use reqwest::{
-    Proxy, Url,
-    header::{HeaderMap, HeaderName, HeaderValue},
-};
+use http::header::{HeaderMap, HeaderName, HeaderValue};
+use reqwest::Proxy;
 use std::{
     collections::HashMap,
     path::{self, PathBuf},
@@ -26,6 +24,7 @@ use std::{
 use thiserror::Error;
 use tokio::sync::Semaphore;
 use ulid::Ulid;
+use url::Url;
 
 /// Represents a download instruction.
 ///
@@ -731,7 +730,7 @@ impl Download {
     ) -> Download {
         let max_connections = opts.max_connections();
         let use_server_time = opts.use_server_time();
-        let proxy = Option::<Proxy>::from(opts);
+        let proxy = opts.proxy_client_setting();
         let headers = Some(HeaderMap::from(opts));
         let filename = fs_utils::cleanup_filename(
             response_info.extract_filename().as_str(),

@@ -1463,7 +1463,7 @@ dependencies = [
 
 [[package]]
 name = "odl"
-version = "2.3.1"
+version = "3.0.0"
 dependencies = [
  "async-trait",
  "atomicwrites",
@@ -1478,6 +1478,7 @@ dependencies = [
  "filetime",
  "fs2",
  "futures",
+ "http",
  "humantime",
  "indexmap",
  "indicatif",
@@ -1508,6 +1509,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ulid",
+ "url",
  "windows-sys 0.61.2",
 ]
 

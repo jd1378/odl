@@ -170,8 +170,15 @@ fn find_dns_message(e: &(dyn Error + 'static)) -> Option<String> {
     }
 }
 
-impl From<reqwest::Error> for OdlError {
-    fn from(e: reqwest::Error) -> Self {
+impl OdlError {
+    /// Classify a transport failure into the network error it describes.
+    ///
+    /// Deliberately an inherent method rather than a `From` impl: a trait impl
+    /// naming `reqwest::Error` would make reqwest part of odl's public API,
+    /// binding every consumer to the same major version of it and turning any
+    /// future reqwest upgrade into a breaking release of odl. Which HTTP
+    /// client odl uses is nobody's business but odl's.
+    pub(crate) fn from_reqwest(e: reqwest::Error) -> Self {
         if let Some(status) = e.status()
             && !status.is_success()
         {

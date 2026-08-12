@@ -1,6 +1,6 @@
 [package]
 name = "odl"
-version = "2.3.1"
+version = "3.0.0"
 edition = "2024"
 # let-chains are used throughout, which is what sets the floor.
 rust-version = "1.88"
@@ -15,6 +15,11 @@ keywords = ["download", "manager", "idm", "dl", "download-manager"]
 [dependencies]
 reqwest = { version = "0.13", default-features = false, features = ["http2", "gzip", "brotli", "rustls", "socks", "stream"] }
 reqwest-retry = "0.9"
+# `Url` and `HeaderMap` appear in odl's own public API. Depending on the crates
+# that define them, rather than on reqwest's re-exports, is what lets a
+# consumer match versions with odl without knowing which HTTP client it uses.
+url = "2.5"
+http = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
 tokio-util = { version = "0.7", default-features = false }
 thiserror = "2.0.12"

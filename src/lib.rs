@@ -31,10 +31,10 @@
 //!
 //! ```toml
 //! # Pure library: no CLI dependencies, no engine that spawns anything.
-//! odl = { version = "2", default-features = false }
+//! odl = { version = "3", default-features = false }
 //!
 //! # Library plus media-site support.
-//! odl = { version = "2", default-features = false, features = ["ytdlp"] }
+//! odl = { version = "3", default-features = false, features = ["ytdlp"] }
 //! ```
 //!
 //! Two runtime switches exist as well, for builds that do include the feature:
@@ -53,6 +53,8 @@ pub mod error;
 pub mod format;
 mod fs_utils;
 pub mod hash;
+#[cfg(any(feature = "ytdlp", feature = "self-update"))]
+mod http;
 pub mod progress;
 mod response_info;
 mod retry_policies;

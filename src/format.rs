@@ -12,7 +12,7 @@
 //! partially downloaded file from being continued in a different encoding.
 
 use async_trait::async_trait;
-use reqwest::Url;
+use url::Url;
 
 /// What a format offers, in the terms a person judges it by.
 ///

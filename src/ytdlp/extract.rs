@@ -11,9 +11,9 @@ use crate::config::YtdlpOptions;
 use crate::error::YtdlpError;
 use crate::format::{FormatOffer, MediaFormat, Quality, SubtitleTrack};
 use crate::ytdlp::binary::{self, Tools};
-use reqwest::Url;
 use serde::Deserialize;
 use std::path::Path;
+use url::Url;
 
 /// Cap on captured stderr, so a pathological failure cannot buffer without
 /// bound before we turn it into an error message.

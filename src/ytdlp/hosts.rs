@@ -6,7 +6,7 @@
 //! not meant to mirror yt-dlp's full extractor set; users who need more can
 //! extend it through `ytdlp.extra_hosts`.
 
-use reqwest::Url;
+use url::Url;
 
 /// Registrable domains delegated to `yt-dlp`.
 ///

@@ -14,7 +14,7 @@ use crate::engine::{Engine, EnginePreference};
 use crate::error::OdlError;
 use crate::format::FormatSelector;
 use crate::progress::DownloadContext;
-use reqwest::Url;
+use url::Url;
 
 /// Everything the delegation seam needs to decide on and prepare a download.
 ///
@@ -53,7 +53,7 @@ mod imp {
     use crate::format::DefaultFormatSelector;
     use crate::fs_utils::read_delimited_message_from_path;
     use crate::progress::{Phase, ProgressEvent};
-    use reqwest::{Proxy, header::HeaderMap};
+    use http::header::HeaderMap;
 
     /// Whether a failure is worth a fresh process.
     ///
@@ -339,7 +339,7 @@ mod imp {
                 quality,
                 use_server_time: opts.use_server_time(),
                 ascii_filenames: opts.ascii_filenames(),
-                proxy: Option::<Proxy>::from(opts),
+                proxy: opts.proxy_client_setting(),
                 headers: Some(HeaderMap::from(opts)),
             },
         );

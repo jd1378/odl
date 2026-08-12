@@ -1,14 +1,13 @@
 use chrono::{DateTime, Utc};
+use http::header::{
+    ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG,
+    HeaderMap, LAST_MODIFIED, WWW_AUTHENTICATE,
+};
 use once_cell::sync::Lazy;
 use percent_encoding::percent_decode_str;
 use regex::Regex;
-use reqwest::{
-    Response, Url,
-    header::{
-        ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG,
-        HeaderMap, LAST_MODIFIED, WWW_AUTHENTICATE,
-    },
-};
+use reqwest::Response;
+use url::Url;
 
 use crate::hash::HashDigest;
 
@@ -455,7 +454,7 @@ pub struct ContentRange {
 #[cfg(test)]
 mod tests {
     use chrono::Datelike;
-    use reqwest::header::HeaderValue;
+    use http::header::HeaderValue;
 
     use super::*;
 

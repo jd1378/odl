@@ -18,7 +18,7 @@ pub mod run;
 
 use crate::config::YtdlpOptions;
 use crate::error::YtdlpError;
-use reqwest::Url;
+use url::Url;
 
 pub use binary::Tools;
 pub use process::ManagedChild;

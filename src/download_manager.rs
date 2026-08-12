@@ -9,10 +9,9 @@ mod server_conflict;
 use std::{path::PathBuf, sync::Arc};
 
 use fs2::FileExt;
-use reqwest::{
-    Client, Proxy, Url,
-    header::{HeaderMap, USER_AGENT},
-};
+use http::header::{HeaderMap, USER_AGENT};
+use reqwest::Client;
+use url::Url;
 
 use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore};
 
@@ -445,7 +444,7 @@ impl DownloadManager {
                         if ctx.is_cancelled() {
                             return Err(OdlError::Cancelled);
                         }
-                        return Err(OdlError::from(e));
+                        return Err(OdlError::from_reqwest(e));
                     }
                 }
             }
@@ -661,7 +660,7 @@ impl DownloadManager {
         if opts.headers().is_some_and(|x| !x.is_empty()) {
             client = client.default_headers(HeaderMap::from(opts));
         }
-        if let Some(proxy) = Option::<Proxy>::from(opts) {
+        if let Some(proxy) = opts.proxy_client_setting() {
             client = client.proxy(proxy);
         }
 
@@ -687,7 +686,7 @@ impl DownloadManager {
             // window grow further as needed.
             client = client.http2_adaptive_window(true);
         }
-        Ok(client.build()?)
+        client.build().map_err(OdlError::from_reqwest)
     }
 
     async fn process_download<CR>(

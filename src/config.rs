@@ -1,8 +1,6 @@
 use derive_builder::Builder;
-use reqwest::{
-    Proxy,
-    header::{HeaderMap, HeaderName, HeaderValue},
-};
+use http::header::{HeaderMap, HeaderName, HeaderValue};
+use reqwest::Proxy;
 use serde::{Deserialize, Serialize};
 use std::{
     io,
@@ -801,11 +799,15 @@ impl From<&DownloadOptions> for HeaderMap {
     }
 }
 
-impl From<&DownloadOptions> for Option<Proxy> {
-    fn from(opts: &DownloadOptions) -> Self {
-        opts.proxy
-            .as_deref()
-            .and_then(|s| reqwest::Proxy::all(s).ok())
+impl DownloadOptions {
+    /// The configured proxy, as the HTTP client wants it.
+    ///
+    /// Crate-internal on purpose: a public `From<&DownloadOptions>` for
+    /// `Option<reqwest::Proxy>` would put reqwest in odl's public API, tying
+    /// consumers to the same major version of a client they never asked
+    /// about. [`Self::proxy`] already exposes the setting itself.
+    pub(crate) fn proxy_client_setting(&self) -> Option<Proxy> {
+        self.proxy.as_deref().and_then(|s| Proxy::all(s).ok())
     }
 }
 

@@ -30,7 +30,7 @@
 //! identically whether odl or the user runs `tar`, because the figure is set
 //! by how the archive was compressed rather than by who reads it.
 
-use crate::error::YtdlpError;
+use crate::{config::DownloadOptions, error::YtdlpError};
 use reqwest::Client;
 use std::path::{Path, PathBuf};
 
@@ -254,10 +254,17 @@ pub struct AssetPlan {
 }
 
 /// Work out what to download for `tool`, without downloading it.
-pub async fn plan(client: &Client, tool: Tool) -> Result<AssetPlan, YtdlpError> {
+///
+/// The listing is fetched with `net`'s proxy, certificate and timeout
+/// settings, so reaching the release host obeys the same network rules as
+/// reaching anything else odl downloads.
+pub async fn plan(net: &DownloadOptions, tool: Tool) -> Result<AssetPlan, YtdlpError> {
+    let client = crate::http::client_for(net).map_err(|e| YtdlpError::Other {
+        message: e.to_string(),
+    })?;
     match tool {
-        Tool::Ytdlp => plan_ytdlp(client).await,
-        Tool::Ffmpeg => plan_ffmpeg(client).await,
+        Tool::Ytdlp => plan_ytdlp(&client).await,
+        Tool::Ffmpeg => plan_ffmpeg(&client).await,
     }
 }
 

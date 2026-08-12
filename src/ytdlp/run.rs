@@ -12,12 +12,12 @@ use crate::progress::{DownloadContext, Phase, ProgressEvent};
 use crate::ytdlp::binary::{self, Tools};
 use crate::ytdlp::extract::{base_args, last_meaningful_line, output_path_file};
 use crate::ytdlp::process::{DEFAULT_GRACE, ManagedChild};
-use reqwest::Url;
-use reqwest::header::HeaderMap;
+use http::header::HeaderMap;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufReadExt, BufReader};
+use url::Url;
 
 /// Progress lines are emitted at most this often. Fast enough for a smooth
 /// bar, slow enough that a fragmented download with thousands of fragments

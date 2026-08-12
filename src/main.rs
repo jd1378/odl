@@ -29,11 +29,11 @@ use odl::{
         SAMPLE_INTERVAL,
     },
 };
-use reqwest::Url;
 use serde_json::json;
 use std::io::IsTerminal;
 use std::process::ExitCode;
 use tokio::{self, io::AsyncBufReadExt};
+use url::Url;
 mod args;
 mod json;
 use args::{Args, LogLevel, OutputFormat};
@@ -1672,28 +1672,6 @@ fn confirm(question: &str) -> Option<bool> {
     ))
 }
 
-/// HTTP client for fetching a helper.
-///
-/// Built from the user's own download settings rather than from invented
-/// constants: someone who needs a proxy to reach the internet needs it here
-/// too, and a connect timeout they chose should not be silently overridden.
-#[cfg(any(feature = "ytdlp", feature = "self-update"))]
-fn install_client(net: &odl::config::DownloadOptions) -> Result<reqwest::Client, OdlError> {
-    let mut builder = reqwest::Client::builder();
-    if let Some(proxy) = Option::<reqwest::Proxy>::from(net) {
-        builder = builder.proxy(proxy);
-    }
-    if net.accept_invalid_certs() {
-        builder = builder.danger_accept_invalid_certs(true);
-    }
-    if let Some(timeout) = net.connect_timeout() {
-        builder = builder.connect_timeout(timeout);
-    }
-    builder.build().map_err(|e| OdlError::CliError {
-        message: format!("could not create an HTTP client: {e}"),
-    })
-}
-
 /// What came of offering to install a helper.
 #[cfg(feature = "ytdlp")]
 enum OfferOutcome {
@@ -1773,8 +1751,7 @@ async fn offer_tool(
     // The release listing is a few kilobytes of JSON, fetched directly with
     // the user's own network settings — their proxy, connect timeout and
     // certificate policy.
-    let client = install_client(net)?;
-    let plan = install::plan(&client, tool).await.map_err(OdlError::from)?;
+    let plan = install::plan(net, tool).await.map_err(OdlError::from)?;
 
     // The asset itself goes through odl's own downloader: resumable, retrying,
     // checksum-verified. Fetching forty megabytes over a bad line is the
@@ -1867,8 +1844,7 @@ async fn run_update(
     }
 
     let cfg = Config::load_from_file(&config_path_for(args)).await?;
-    let client = install_client(cfg.download())?;
-    let Some(plan) = self_update::plan(&client, current).await? else {
+    let Some(plan) = self_update::plan(cfg.download(), current).await? else {
         match format {
             OutputFormat::Json => println!(
                 "{}",

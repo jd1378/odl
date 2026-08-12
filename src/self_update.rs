@@ -294,9 +294,17 @@ fn digest_from_checksum_file(body: &str, asset: &str) -> Option<String> {
 
 /// Work out what to download, without downloading it.
 ///
+/// The listing is fetched with `net`'s proxy, certificate and timeout
+/// settings, so reaching GitHub obeys the same network rules as reaching
+/// anything else odl downloads.
+///
 /// Returns `Ok(None)` when the published release is not newer than `current`.
-pub async fn plan(client: &reqwest::Client, current: &str) -> Result<Option<UpdatePlan>, OdlError> {
-    plan_from(client, RELEASE_API, BUILD_TARGET, current).await
+pub async fn plan(
+    net: &crate::config::DownloadOptions,
+    current: &str,
+) -> Result<Option<UpdatePlan>, OdlError> {
+    let client = crate::http::client_for(net)?;
+    plan_from(&client, RELEASE_API, BUILD_TARGET, current).await
 }
 
 /// [`plan`] against a given listing and target, so the decisions can be tested

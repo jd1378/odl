@@ -9,10 +9,11 @@ use std::{
 use tokio_util::sync::CancellationToken;
 
 use bytes::Bytes;
-use reqwest::{
-    Client, StatusCode,
+use http::{
+    StatusCode,
     header::{ACCEPT_ENCODING, CONTENT_RANGE, HeaderValue, RANGE, RETRY_AFTER, USER_AGENT},
 };
+use reqwest::Client;
 use tokio::{
     fs,
     sync::{Mutex, Notify, mpsc},
@@ -1430,7 +1431,7 @@ async fn download_part(
             // request completed but returned an error (network error)
             Ok(Err(e)) => {
                 file.finish().await?;
-                let cause = OdlError::from(e);
+                let cause = OdlError::from_reqwest(e);
                 match retry_sleep_or_fail_part(
                     &policy,
                     attempts,
@@ -1555,7 +1556,7 @@ async fn download_part(
                 r = time::timeout(STALE_CONNECTION_TIMEOUT, resp.chunk()) => r,
             };
             let maybe_chunk = match chunk_result {
-                Ok(chunk_res) => match chunk_res.map_err(OdlError::from) {
+                Ok(chunk_res) => match chunk_res.map_err(OdlError::from_reqwest) {
                     Ok(opt) => opt,
                     Err(e) => {
                         // network/body error -> consider retrying
@@ -1789,9 +1790,9 @@ mod tests {
     use crate::download::DownloadBuilder;
     use futures::FutureExt;
     use mockito::{Matcher, Server};
-    use reqwest::Url;
     use tempfile::tempdir;
     use tokio::{fs, time};
+    use url::Url;
 
     const TEST_FILENAME: &str = "test.bin";
 
