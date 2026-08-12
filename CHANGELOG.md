@@ -1,5 +1,18 @@
 # Changelog
 
+## 2.3.1
+
+### A resumed download whose parts are all present no longer fails
+
+The ramped fill opens a batch of connections and waits for each to report a
+first chunk. When every part in the batch finished before the task awaiting
+those reports was polled, the scheduler read the empty task set as a reason to
+stop and returned with the rest of the queue unopened — so a download ended
+claiming parts were left over, with every byte of it already on disk. Parts
+already complete on disk lose that race most often, since they finish without
+transferring anything, which makes a resume the way to meet it. An empty task
+set now ends the batch rather than the fill.
+
 ## 2.3.0
 
 ### Building odl no longer needs `protoc`

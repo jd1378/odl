@@ -536,7 +536,18 @@ impl Downloader {
                     }
                     res = join_set.join_next() => {
                         let Some(result) = res else {
-                            return Ok(());
+                            // Nothing is in flight any more: every part in
+                            // this batch finished before the task waiting on
+                            // their probes got to run. That is a finished
+                            // batch, not a reason to stop — returning here
+                            // left whatever is still in `pending` unopened,
+                            // and the run ended reporting parts left over
+                            // with nothing to blame them on. Parts already
+                            // complete on disk lose this race most often:
+                            // they return without transferring a byte, so
+                            // which task runs first is all that decides it.
+                            batch_ok = true;
+                            break;
                         };
                         let is_failure = matches!(&result, Ok(Ok(PartEvent::Failed { .. })));
                         self.handle_join_result_item(result, pending, active, last_failure)
