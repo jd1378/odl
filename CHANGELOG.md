@@ -1,5 +1,29 @@
 # Changelog
 
+## 3.1.1
+
+### A delegated download's reported size no longer shrinks mid-transfer
+
+A merged `yt-dlp` download fetches its formats one after another — video, then
+audio — and restarts both its byte counters at each one. odl summed the
+downloaded bytes across formats but passed through whatever total the *current*
+format reported, so the moment the video track finished, the size of the job
+collapsed from the video's tens of megabytes to the audio track's few, while
+the progress kept climbing past it.
+
+Totals are now tracked per format alongside the bytes and summed the same way.
+A format that has reported a size keeps it when a later line omits one; while
+any started format still has no size at all, no total is reported, because a
+partial sum describes a smaller download than the one running; and the sum is
+never reported as less than the bytes already on disk, which is what absorbs an
+undershooting fragment estimate. The whole-merge size from the extractor is
+still preferred when there is one — this only changes what happens in its
+absence.
+
+Formats enter the sum as they start, so a merge still steps its total up once
+when the audio track begins. That direction is the correctable one: it moves
+toward the real size instead of away from it.
+
 ## 3.1.0
 
 ### A direct-connection knob: `no_proxy`

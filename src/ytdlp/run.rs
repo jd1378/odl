@@ -91,26 +91,64 @@ struct StatusLine {
     st: Option<String>,
 }
 
+/// Latest figures reported for one format.
+#[derive(Debug, Default, Clone, Copy)]
+struct FormatBytes {
+    downloaded: u64,
+    /// Zero until the format reports a total; an unknown total must not be
+    /// mistaken for a format that is genuinely empty.
+    total: u64,
+}
+
 /// Tracks bytes across the several formats a merged download fetches in
 /// sequence.
 ///
-/// yt-dlp restarts `downloaded_bytes` from zero for each format, so summing
-/// the latest value per format is what makes the aggregate monotonic.
+/// yt-dlp restarts both `downloaded_bytes` and `total_bytes` from zero for
+/// each format, so summing the latest value per format is what makes the
+/// aggregate monotonic. Summing the totals the same way is what stops the
+/// reported size from collapsing to the audio track's few megabytes the
+/// moment the video track finishes.
 #[derive(Debug, Default)]
 struct ByteTracker {
-    per_format: HashMap<String, u64>,
+    per_format: HashMap<String, FormatBytes>,
 }
 
 impl ByteTracker {
-    fn record(&mut self, format: Option<&str>, downloaded: u64) -> u64 {
+    fn record(&mut self, format: Option<&str>, downloaded: u64, total: Option<u64>) -> Totals {
         let key = format.unwrap_or("_").to_owned();
-        self.per_format.insert(key, downloaded);
-        self.total()
+        let entry = self.per_format.entry(key).or_default();
+        entry.downloaded = downloaded;
+        // A format that has already reported a size keeps it when a later line
+        // omits one, rather than dropping back out of the sum.
+        if let Some(total) = total {
+            entry.total = total;
+        }
+        self.totals()
     }
 
-    fn total(&self) -> u64 {
-        self.per_format.values().copied().sum()
+    fn totals(&self) -> Totals {
+        let downloaded = self.per_format.values().map(|b| b.downloaded).sum();
+        // Every format must have a figure before the sum means anything: with
+        // one still unknown the total would describe a smaller download than
+        // the one actually running.
+        let total = self
+            .per_format
+            .values()
+            .map(|b| b.total)
+            .try_fold(0u64, |acc, t| (t > 0).then_some(acc + t))
+            // Formats are fetched in sequence and only appear here once they
+            // start, so a sum over what is known so far still trails the truth
+            // until the last one begins. Clamping keeps it from ever reading
+            // as less than the bytes already on disk.
+            .map(|t: u64| t.max(downloaded));
+        Totals { downloaded, total }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Totals {
+    downloaded: u64,
+    total: Option<u64>,
 }
 
 /// `j` renders a value as JSON, `%(a,b)` falls back to a second field, and
@@ -505,14 +543,14 @@ fn handle_line(
     match p.k.as_deref() {
         Some("d") => {
             if let Some(d) = p.d.filter(|d| d.is_finite() && *d >= 0.0) {
-                let total = tracker.record(p.f.as_deref(), d as u64);
+                let reported = p.t.filter(|t| t.is_finite() && *t > 0.0).map(|t| t as u64);
+                let totals = tracker.record(p.f.as_deref(), d as u64, reported);
                 ctx.emit(ProgressEvent::Progress {
-                    downloaded: total,
-                    // The plan's size covers every format of a merge; a single
-                    // format's total would under-report during the first half.
-                    total: plan
-                        .total_size
-                        .or_else(|| p.t.filter(|t| t.is_finite() && *t > 0.0).map(|t| t as u64)),
+                    downloaded: totals.downloaded,
+                    // The plan's size already covers every format of a merge,
+                    // so it is preferred; the tracked sum is the fallback for
+                    // when the extractor could not offer one.
+                    total: plan.total_size.or(totals.total),
                 });
             }
             // Zero is also what the template emits when the speed is not yet
@@ -647,11 +685,42 @@ mod tests {
     #[test]
     fn byte_tracker_sums_formats_instead_of_following_the_reset() {
         let mut t = ByteTracker::default();
-        assert_eq!(t.record(Some("137"), 100), 100);
-        assert_eq!(t.record(Some("137"), 900), 900);
+        assert_eq!(t.record(Some("137"), 100, Some(1_000)).downloaded, 100);
+        assert_eq!(t.record(Some("137"), 900, Some(1_000)).downloaded, 900);
         // Second format starts from zero; the aggregate must not drop.
-        assert_eq!(t.record(Some("251"), 10), 910);
-        assert_eq!(t.record(Some("251"), 50), 950);
+        assert_eq!(t.record(Some("251"), 10, Some(100)).downloaded, 910);
+        assert_eq!(t.record(Some("251"), 50, Some(100)).downloaded, 950);
+    }
+
+    #[test]
+    fn byte_tracker_sums_totals_so_a_finished_format_still_counts() {
+        let mut t = ByteTracker::default();
+        assert_eq!(t.record(Some("137"), 900, Some(1_000)).total, Some(1_000));
+        // The audio track's own total is small; reporting it alone would make
+        // the download appear to shrink.
+        assert_eq!(t.record(Some("251"), 10, Some(100)).total, Some(1_100));
+    }
+
+    #[test]
+    fn byte_tracker_keeps_a_known_total_when_a_later_line_omits_it() {
+        let mut t = ByteTracker::default();
+        t.record(Some("137"), 100, Some(1_000));
+        assert_eq!(t.record(Some("137"), 200, None).total, Some(1_000));
+    }
+
+    #[test]
+    fn byte_tracker_withholds_a_total_while_one_format_has_none() {
+        let mut t = ByteTracker::default();
+        t.record(Some("137"), 100, Some(1_000));
+        assert_eq!(t.record(Some("251"), 10, None).total, None);
+    }
+
+    #[test]
+    fn byte_tracker_never_reports_a_total_below_the_bytes_on_disk() {
+        let mut t = ByteTracker::default();
+        // A fragment estimate that undershoots must not put the total behind
+        // what has already been written.
+        assert_eq!(t.record(Some("137"), 900, Some(500)).total, Some(900));
     }
 
     #[tokio::test]
@@ -714,7 +783,7 @@ mod tests {
             &p,
             &ctx,
         );
-        assert_eq!(tracker.total(), 0);
+        assert_eq!(tracker.totals().downloaded, 0);
     }
 
     #[tokio::test]
