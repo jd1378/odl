@@ -1024,13 +1024,33 @@ async fn run(args: Args) -> Result<(), OdlError> {
     let mut user_provided_filename: Option<String> = None;
     let save_dir: PathBuf = if let Some(path) = args.output.clone() {
         if let DownloadType::Url(_) = &download_type {
+            let path_str = path.to_string_lossy();
+            if path.is_dir() || path_str.ends_with('/') || path_str.ends_with('\\') {
+                let trimmed = path_str.trim_end_matches(['/', '\\']);
+                return Err(OdlError::CliError {
+                    message: format!(
+                        "output path `{}` is a directory; in single-URL mode, -o specifies the target file path (e.g. -o '{}{}<filename>'). To save into a directory with the default filename, omit -o or specify the full filename",
+                        path.display(),
+                        trimmed,
+                        std::path::MAIN_SEPARATOR
+                    ),
+                });
+            }
             user_provided_filename = path
                 .file_name()
                 .map(|os_str| os_str.to_string_lossy().into_owned());
             path.parent()
-                .expect("Failed to get output's parent directory")
+                .unwrap_or(std::path::Path::new(""))
                 .to_path_buf()
         } else {
+            if path.is_file() {
+                return Err(OdlError::CliError {
+                    message: format!(
+                        "output path `{}` is an existing file; when downloading a list of URLs, -o specifies the target directory",
+                        path.display()
+                    ),
+                });
+            }
             path
         }
     } else {
@@ -1443,30 +1463,29 @@ fn determine_download_type(args: &Args) -> Result<DownloadType, OdlError> {
             .to_string(),
     })?;
 
-    Ok(match Url::parse(input) {
-        Ok(url) => {
-            if args.remote_list {
+    if let Ok(url) = Url::parse(input) {
+        if url.scheme() == "http" || url.scheme() == "https" {
+            return Ok(if args.remote_list {
                 DownloadType::FileAtUrl(url)
             } else {
                 DownloadType::Url(url)
-            }
+            });
         }
-        Err(_) => {
-            let path = PathBuf::from(input);
-            if path.try_exists()? {
-                if args.remote_list {
-                    return Err(OdlError::CliError {
-                        message: "Expected input to be a Url, found file path instead".to_string(),
-                    });
-                }
-                DownloadType::File(Box::new(path))
-            } else {
-                return Err(OdlError::CliError {
-                    message: "Input is not a valid Url or a valid file path. Check file permissions if file exists.".to_string(),
-                });
-            }
+    }
+
+    let path = PathBuf::from(input);
+    if path.try_exists()? {
+        if args.remote_list {
+            return Err(OdlError::CliError {
+                message: "Expected input to be a Url, found file path instead".to_string(),
+            });
         }
-    })
+        Ok(DownloadType::File(Box::new(path)))
+    } else {
+        Err(OdlError::CliError {
+            message: "Input is not a valid Url or a valid file path. Check file permissions if file exists.".to_string(),
+        })
+    }
 }
 
 struct ForcedResolver;

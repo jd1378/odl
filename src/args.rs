@@ -231,7 +231,13 @@ ENGINES:
 
   Quality is chosen once and pinned: a resume never mixes encodings. To change
   it, name another format (--format-id) or ask again (--choose-format always);
-  either discards what was downloaded and starts over.";
+  either discards what was downloaded and starts over.
+
+OUTPUT PATH (-o, --output):
+  Single-URL input: specifies the destination file path (e.g. -o path/to/file.ext).
+                    Passing an existing directory or path ending with a slash is an error (exit 2).
+  File-list input:  specifies the destination directory for all downloaded files.
+                    Passing an existing file is an error (exit 2).";
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None, after_long_help = MACHINE_INTERFACE_HELP)]
@@ -293,6 +299,7 @@ pub struct Args {
     /// When `input` is a URL, this specifies the output file path.
     /// When `input` is a file containing URLs, this specifies the output directory for downloaded files.
     /// Will use server provided name if not specified or if `input` is a file.
+    /// Passing an existing directory in single-URL mode is an error (exit 2).
     #[arg(short, long, value_name = "FILE|DIR")]
     pub output: Option<PathBuf>,
 
