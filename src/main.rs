@@ -1836,7 +1836,7 @@ async fn run_update(
     // Resolve symlinks: replacing the link would leave its target behind and
     // put a second, older odl on the PATH.
     let exe = std::env::current_exe()
-        .and_then(|p| p.canonicalize())
+        .and_then(|p| dunce::canonicalize(&p))
         .map_err(|e| OdlError::CliError {
             message: format!("could not find the running odl binary: {e}"),
         })?;

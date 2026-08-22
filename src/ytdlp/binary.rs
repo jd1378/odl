@@ -123,7 +123,7 @@ fn which(program: &str) -> Option<PathBuf> {
         for name in &names {
             let candidate = dir.join(name);
             if is_executable_file(&candidate) {
-                return std::fs::canonicalize(&candidate).ok().or(Some(candidate));
+                return dunce::canonicalize(&candidate).ok().or(Some(candidate));
             }
         }
     }
@@ -138,7 +138,7 @@ fn which(program: &str) -> Option<PathBuf> {
 fn resolve_configured(configured: Option<&Path>, program: &str) -> Option<PathBuf> {
     match configured {
         Some(p) => is_executable_file(p)
-            .then(|| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())),
+            .then(|| dunce::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())),
         None => which(program),
     }
 }

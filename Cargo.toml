@@ -56,12 +56,16 @@ indexmap = { version = "2", features = ["serde"] }
 humantime = "2"
 reflink-copy = { version = "0.1.29", features = ["tracing"] }
 deunicode = "1.6.2"
+dunce = "1.0"
 
 [target.'cfg(windows)'.dependencies]
 # Job Objects are the only reliable way to tear down a spawned yt-dlp together
 # with the grandchildren it spawns (ffmpeg). Bindings-only crate: the code it
 # calls lives in the OS, so the binary-size cost is negligible.
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading"], optional = true }
+
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1"
 
 [dev-dependencies]
 reqwest = { version = "0.13", default-features = false, features = ["http2", "gzip", "brotli", "rustls", "socks", "stream", "blocking"] }

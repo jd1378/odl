@@ -16,4 +16,14 @@ fn main() {
     println!("cargo:rerun-if-changed={PROTO}");
     let descriptors = protox::compile([PROTO], ["src/"]).unwrap();
     prost_build::Config::new().compile_fds(descriptors).unwrap();
+
+    // Embed application manifest on Windows targets to declare longPathAware,
+    // UTF-8 activeCodePage, and supported OS compatibility GUIDs.
+    #[cfg(target_os = "windows")]
+    {
+        println!("cargo:rerun-if-changed=resources/odl.manifest");
+        let mut res = winres::WindowsResource::new();
+        res.set_manifest_file("resources/odl.manifest");
+        let _ = res.compile();
+    }
 }
