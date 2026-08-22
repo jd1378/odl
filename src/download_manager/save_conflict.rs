@@ -26,8 +26,15 @@ where
             }
             SameDownloadExistsResolution::AddNumberToNameAndContinue => {
                 let result = is_filename_unique(&instruction.download_dir()).await?;
-                if let IsUnique::SuggestedAlternative(filename) = result {
-                    instruction.set_filename(filename);
+                if let IsUnique::SuggestedAlternative(unique_dir_name) = result {
+                    if let Some(parent) = instruction.download_dir().parent() {
+                        instruction.set_download_dir(parent.join(unique_dir_name));
+                    }
+                }
+                let final_path = instruction.save_dir().join(instruction.filename());
+                let final_result = is_filename_unique(&final_path).await?;
+                if let IsUnique::SuggestedAlternative(new_filename) = final_result {
+                    instruction.set_filename(new_filename);
                 }
             }
             SameDownloadExistsResolution::Resume => {

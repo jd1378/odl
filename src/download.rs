@@ -649,7 +649,7 @@ impl Download {
             Quality::Subtitles { .. } | Quality::Unknown { .. } => (None, None, None, false),
         };
 
-        let dir_name = fs_utils::cleanup_filename(&title, ascii_filenames);
+        let dir_name = fs_utils::derive_download_dir_name(&title, source_url.as_str(), ascii_filenames);
         let filename = fs_utils::cleanup_filename(&format!("{title}.{ext}"), ascii_filenames);
 
         Self {
@@ -722,6 +722,11 @@ impl Download {
             response_info.extract_filename().as_str(),
             opts.ascii_filenames(),
         );
+        let dir_name = fs_utils::derive_download_dir_name(
+            &filename,
+            response_info.url().as_str(),
+            opts.ascii_filenames(),
+        );
         // Empty means no probe was made (`quick_evaluate`), not "server sent
         // nothing" — keep that distinguishable for downstream consumers.
         let response_headers = {
@@ -729,7 +734,7 @@ impl Download {
             (!h.is_empty()).then(|| h.clone())
         };
         Self {
-            download_dir: download_dir.join(&filename),
+            download_dir: download_dir.join(&dir_name),
             url: response_info.url().clone(),
             is_resumable: response_info.is_resumable(),
             use_server_time,

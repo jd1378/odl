@@ -102,6 +102,51 @@ pub fn cleanup_filename(input: &str, to_ascii: bool) -> String {
     result
 }
 
+/// Maximum length in bytes for the prefix component in download directory names.
+const MAX_DIR_PREFIX_BYTES: usize = 32;
+
+/// Derives a safe, bounded, deterministic subdirectory name for storing a download's
+/// metadata and in-flight part files.
+///
+/// Format: `<sanitized_prefix_max_32>_<sha256_hex_16>`
+///
+/// This decouples internal path length from arbitrary user URL/filename length,
+/// ensuring the internal metadata directory and its contents (`metadata.pb`, `odl.lock`, `part_*.part`)
+/// never exceed the Windows MAX_PATH (260 character) limit.
+pub fn derive_download_dir_name(title_or_filename: &str, url_or_key: &str, to_ascii: bool) -> String {
+    let clean = cleanup_filename(title_or_filename, to_ascii);
+    let stem = clean.rsplit_once('.').map(|(s, _)| s).unwrap_or(&clean);
+    let mut prefix = if stem.is_empty() {
+        FALLBACK_FILENAME.to_owned()
+    } else {
+        stem.to_owned()
+    };
+
+    if prefix.len() > MAX_DIR_PREFIX_BYTES {
+        let mut end = MAX_DIR_PREFIX_BYTES;
+        while end > 0 && !prefix.is_char_boundary(end) {
+            end -= 1;
+        }
+        prefix.truncate(end);
+        prefix = prefix
+            .trim_end_matches(|c: char| c.is_whitespace() || c == '.' || c == '_')
+            .to_string();
+        if prefix.is_empty() {
+            prefix = FALLBACK_FILENAME.to_owned();
+        }
+    }
+
+    use digest::Digest;
+    use sha2::Sha256;
+    let mut hasher = Sha256::new();
+    hasher.update(url_or_key.as_bytes());
+    let hash_bytes = hasher.finalize();
+    // 8 bytes -> 16 hex chars (64 bits entropy)
+    let hash_hex: String = hash_bytes[..8].iter().map(|b| format!("{:02x}", b)).collect();
+
+    format!("{prefix}_{hash_hex}")
+}
+
 /// Creates a file at the given path and sets its last modified time to the provided UNIX timestamp (seconds).
 pub async fn set_file_mtime_async<P: AsRef<Path>>(path: &P, unix_time_secs: i64) -> io::Result<()> {
     let file_time = FileTime::from_unix_time(unix_time_secs, 0);
@@ -530,5 +575,36 @@ mod tests {
         // and re-trimming always leaves at least that one.
         let input = format!("a{}b", ".".repeat(300));
         assert_eq!(cleanup_filename(&input, false), "a");
+    }
+
+    #[test]
+    fn test_derive_download_dir_name_bounded_length() {
+        let long_title = "ROwzJiD048JxVOfLUhz02YinXee29O9-EGzmqkNEsTr3ojiZd_bHKDhv-MPsvg9UJuaaU55-DYZDeXv3d2KxR_RLF_W8_Om16nRZHRYEZEBoAhRQuq2qKBZhMtJBZ-KzPZxWN65EZTVrF0vRVe76jmlVAIPaZvACne6xtsRZBFJlLjStwGzfSya68adEnne2p8YP-Vh0lXdyfCKH7DDIB5K3MlOV-iTRTv4C_20nLSKDyW6kb_NDBTQzQb52dcY7FDLJ-W80.png";
+        let url = "https://www.plantuml.com/plantuml/png/ROwzJiD048JxVOfLUhz02YinXee29O9-EGzmqkNEsTr3ojiZd_bHKDhv-MPsvg9UJuaaU55-DYZDeXv3d2KxR_RLF_W8_Om16nRZHRYEZEBoAhRQuq2qKBZhMtJBZ-KzPZxWN65EZTVrF0vRVe76jmlVAIPaZvACne6xtsRZBFJlLjStwGzfSya68adEnne2p8YP-Vh0lXdyfCKH7DDIB5K3MlOV-iTRTv4C_20nLSKDyW6kb_NDBTQzQb52dcY7FDLJ-W80.png";
+        let dir_name = derive_download_dir_name(long_title, url, false);
+        assert!(dir_name.len() <= 49, "dir_name len {} is too long: {}", dir_name.len(), dir_name);
+        assert!(dir_name.contains('_'));
+    }
+
+    #[test]
+    fn test_derive_download_dir_name_deterministic() {
+        let name = "sample.tar.gz";
+        let url = "https://example.com/downloads/sample.tar.gz";
+        let dir1 = derive_download_dir_name(name, url, false);
+        let dir2 = derive_download_dir_name(name, url, false);
+        assert_eq!(dir1, dir2);
+
+        let other_url = "https://example.com/downloads/other.tar.gz";
+        let dir3 = derive_download_dir_name(name, other_url, false);
+        assert_ne!(dir1, dir3);
+    }
+
+    #[test]
+    fn test_derive_download_dir_name_fallback_and_unicode() {
+        let dir_empty = derive_download_dir_name("...", "https://example.com/file", false);
+        assert!(dir_empty.starts_with(FALLBACK_FILENAME));
+
+        let dir_unicode = derive_download_dir_name("测试长文件名超长标题测试超长文件名测试超长文件名", "https://example.com/test", false);
+        assert!(dir_unicode.len() <= 49);
     }
 }
