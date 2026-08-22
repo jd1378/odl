@@ -652,8 +652,16 @@ impl Download {
         let dir_name = fs_utils::derive_download_dir_name(&title, source_url.as_str(), ascii_filenames);
         let filename = fs_utils::cleanup_filename(&format!("{title}.{ext}"), ascii_filenames);
 
+        let legacy_dir = download_root.join(fs_utils::cleanup_filename(&title, ascii_filenames));
+        let target_dir = download_root.join(&dir_name);
+        let download_dir = if !target_dir.exists() && legacy_dir.join(Self::METADATA_FILENAME).exists() {
+            legacy_dir
+        } else {
+            target_dir
+        };
+
         Self {
-            download_dir: download_root.join(&dir_name),
+            download_dir,
             url: source_url.clone(),
             // yt-dlp continues an interrupted transfer, and fragmented
             // formats keep their own resume state alongside the output.
@@ -733,8 +741,17 @@ impl Download {
             let h = response_info.response_headers();
             (!h.is_empty()).then(|| h.clone())
         };
+
+        let legacy_dir = download_dir.join(&filename);
+        let target_dir = download_dir.join(&dir_name);
+        let final_download_dir = if !target_dir.exists() && legacy_dir.join(Self::METADATA_FILENAME).exists() {
+            legacy_dir
+        } else {
+            target_dir
+        };
+
         Self {
-            download_dir: download_dir.join(&dir_name),
+            download_dir: final_download_dir,
             url: response_info.url().clone(),
             is_resumable: response_info.is_resumable(),
             use_server_time,
