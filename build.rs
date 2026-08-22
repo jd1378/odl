@@ -24,6 +24,7 @@ fn main() {
         println!("cargo:rerun-if-changed=resources/odl.manifest");
         let mut res = winres::WindowsResource::new();
         res.set_manifest_file("resources/odl.manifest");
-        let _ = res.compile();
+        res.compile()
+            .expect("failed to compile Windows application manifest");
     }
 }
