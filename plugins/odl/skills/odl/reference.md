@@ -206,6 +206,7 @@ In a batch, individual `failed` events also stream to stdout; the stderr
 | `--speed-limit BYTES/S` | e.g. `100K`, `1.5MiB` (base 1024) |
 | `--max-retries N`, `--n-fixed-retries N`, `--wait-between-retries DUR` | retry policy |
 | `--timeout DUR` | connect timeout, e.g. `30s` |
+| `--read-timeout DUR` | give up on a request that goes this long without receiving a byte, e.g. `30s`. Default `10s`; bounds silence, not transfer length, so a slow download is never cut off |
 | `--header "K: V"` | repeatable; use for auth tokens |
 | `--engine auto\|http\|ytdlp` | `auto` (default) delegates known media hosts to yt-dlp when installed; `ytdlp` fails if it is unavailable |
 | `--choose-format auto\|always\|never` | quality prompt for delegated downloads. **Agents should pass `never`** — `auto` already declines to prompt without a terminal, but `never` states it |

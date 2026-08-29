@@ -17,8 +17,11 @@ use reqwest::Client;
 use crate::{config::DownloadOptions, error::OdlError};
 
 /// A client honouring the network settings that apply everywhere: someone who
-/// needs a proxy to reach the internet needs it here too, and a connect
-/// timeout they chose should not be silently overridden.
+/// needs a proxy to reach the internet needs it here too, and the timeouts
+/// they chose should not be silently overridden. The read timeout matters
+/// most here: these fetches read a whole body in one call, with nothing
+/// watching it, so a server that goes quiet mid-response would otherwise
+/// hang the process for good.
 pub(crate) fn client_for(net: &DownloadOptions) -> Result<Client, OdlError> {
     let mut builder = Client::builder();
     if net.no_proxy() {
@@ -31,6 +34,9 @@ pub(crate) fn client_for(net: &DownloadOptions) -> Result<Client, OdlError> {
     }
     if let Some(timeout) = net.connect_timeout() {
         builder = builder.connect_timeout(timeout);
+    }
+    if let Some(timeout) = net.read_timeout() {
+        builder = builder.read_timeout(timeout);
     }
     builder.build().map_err(|e| OdlError::Other {
         message: format!("could not create an HTTP client: {e}"),

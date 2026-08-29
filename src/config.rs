@@ -34,6 +34,7 @@ mod defaults {
     pub fn default_accept_invalid_certs() -> bool { false }
     pub fn default_speed_limit() -> Option<u64> { None }
     pub fn default_connect_timeout() -> Option<Duration> { Some(Duration::from_secs(5)) }
+    pub fn default_read_timeout() -> Option<Duration> { Some(Duration::from_secs(10)) }
     pub fn default_headers() -> Option<indexmap::IndexMap<String, String>> { None }
     pub fn default_http2() -> bool { false }
     pub fn default_dynamic_split() -> bool { true }
@@ -124,6 +125,22 @@ pub struct DownloadOptions {
     #[serde(default = "default_connect_timeout")]
     connect_timeout: Option<Duration>,
 
+    /// How long a request may go without receiving a single byte before it is
+    /// treated as dead. Defaults to 10 seconds; `None` waits forever.
+    ///
+    /// A connect timeout only covers reaching the server. Once the socket is
+    /// open a server can accept the request and then say nothing: never
+    /// answering, or answering and then stopping mid-body, without ever
+    /// closing the connection. Nothing below the application layer reports
+    /// that, so without this a download simply stops making progress and
+    /// waits, indefinitely and silently.
+    ///
+    /// The clock resets on every byte received, so it bounds silence rather
+    /// than the transfer: a large file is never cut off for taking a long
+    /// time, only for going quiet.
+    #[serde(default = "default_read_timeout")]
+    read_timeout: Option<Duration>,
+
     /// Optional custom headers to add to each request. Keys and values are strings.
     ///
     /// Example in `config.toml`:
@@ -207,6 +224,7 @@ impl From<DownloadOptions> for DownloadOptionsBuilder {
             .accept_invalid_certs(o.accept_invalid_certs)
             .speed_limit(o.speed_limit)
             .connect_timeout(o.connect_timeout)
+            .read_timeout(o.read_timeout)
             .headers(o.headers)
             .http2(o.http2)
             .dynamic_split(o.dynamic_split)
@@ -235,6 +253,7 @@ impl Default for DownloadOptions {
             accept_invalid_certs: default_accept_invalid_certs(),
             speed_limit: default_speed_limit(),
             connect_timeout: default_connect_timeout(),
+            read_timeout: default_read_timeout(),
             headers: default_headers(),
             http2: default_http2(),
             dynamic_split: default_dynamic_split(),
@@ -289,6 +308,9 @@ impl DownloadOptions {
     }
     pub fn connect_timeout(&self) -> Option<Duration> {
         self.connect_timeout
+    }
+    pub fn read_timeout(&self) -> Option<Duration> {
+        self.read_timeout
     }
     pub fn headers(&self) -> Option<&indexmap::IndexMap<String, String>> {
         self.headers.as_ref()
@@ -392,6 +414,13 @@ impl DownloadOptions {
         {
             return Err(DownloadOptionsBuilderError::ValidationError(
                 "connect_timeout must be greater than 0".to_owned(),
+            ));
+        }
+        if let Some(t) = self.read_timeout
+            && t == Duration::from_millis(0)
+        {
+            return Err(DownloadOptionsBuilderError::ValidationError(
+                "read_timeout must be greater than 0".to_owned(),
             ));
         }
         if self.rampup && self.rampup_delay_max < self.rampup_delay_min {
@@ -893,6 +922,7 @@ M-Header = "m"
             .accept_invalid_certs(true)
             .speed_limit(Some(500_000))
             .connect_timeout(Some(Duration::from_secs(9)))
+            .read_timeout(Some(Duration::from_secs(21)))
             .headers({
                 let mut m = indexmap::IndexMap::new();
                 m.insert("X-Test".to_owned(), "yes".to_owned());
@@ -930,6 +960,7 @@ M-Header = "m"
         );
         assert_eq!(round.speed_limit(), original.speed_limit());
         assert_eq!(round.connect_timeout(), original.connect_timeout());
+        assert_eq!(round.read_timeout(), original.read_timeout());
         assert_eq!(round.headers(), original.headers());
         assert_eq!(round.http2(), original.http2());
     }
@@ -1027,6 +1058,27 @@ M-Header = "m"
             err,
             DownloadOptionsBuilderError::ValidationError(_)
         ));
+    }
+
+    #[test]
+    fn builder_rejects_zero_read_timeout() {
+        let err = DownloadOptionsBuilder::default()
+            .read_timeout(Some(Duration::from_millis(0)))
+            .build()
+            .expect_err("expected error");
+        assert!(matches!(
+            err,
+            DownloadOptionsBuilderError::ValidationError(_)
+        ));
+    }
+
+    /// A config written before the option existed must still come back with
+    /// the guard on: the whole point is that nobody has to ask for it.
+    #[test]
+    fn read_timeout_defaults_on_for_a_config_that_never_mentions_it() {
+        let cfg: Config = toml::from_str("max_connections = 1").expect("parse");
+        assert_eq!(cfg.download().read_timeout(), default_read_timeout());
+        assert!(default_read_timeout().is_some());
     }
 
     #[test]

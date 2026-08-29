@@ -676,6 +676,14 @@ impl DownloadManager {
         if let Some(timeout) = opts.connect_timeout() {
             client = client.connect_timeout(timeout);
         }
+        // Bounds silence rather than duration: the clock resets on every byte,
+        // so a slow download is never cut off, but a server that accepts the
+        // request and then stops speaking, without closing the connection,
+        // surfaces as a timeout instead of an indefinite wait. Applies to the
+        // evaluate `HEAD` and to every part body alike.
+        if let Some(timeout) = opts.read_timeout() {
+            client = client.read_timeout(timeout);
+        }
         if !opts.http2() {
             // Force HTTP/1.1: each part opens its own TCP connection, getting
             // an independent receive window. h2 multiplexes all parts on a

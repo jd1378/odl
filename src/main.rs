@@ -853,6 +853,7 @@ async fn run(args: Args) -> Result<(), OdlError> {
                 proxy,
                 no_proxy,
                 timeout,
+                read_timeout,
                 use_server_time,
                 accept_invalid_certs,
                 http2,
@@ -939,6 +940,9 @@ async fn run(args: Args) -> Result<(), OdlError> {
                 }
                 if let Some(v) = *timeout {
                     dl_b.connect_timeout(Some(v));
+                }
+                if let Some(v) = *read_timeout {
+                    dl_b.read_timeout(Some(v));
                 }
                 if let Some(v) = http2 {
                     dl_b.http2(*v);
@@ -1331,6 +1335,14 @@ async fn build_download_manager(args: &Args) -> Result<DownloadManager, OdlError
             None
         }
     });
+    let read_timeout = args.read_timeout.and_then(|d| {
+        let secs = d.as_secs_f64();
+        if secs.is_finite() && secs >= 0.0 {
+            Some(d)
+        } else {
+            None
+        }
+    });
 
     let headers = if args.headers.is_empty() {
         None
@@ -1398,6 +1410,9 @@ async fn build_download_manager(args: &Args) -> Result<DownloadManager, OdlError
     }
     if let Some(v) = connect_timeout {
         dl_b.connect_timeout(Some(v));
+    }
+    if let Some(v) = read_timeout {
+        dl_b.read_timeout(Some(v));
     }
     if let Some(v) = headers {
         dl_b.headers(Some(v));

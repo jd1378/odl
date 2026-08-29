@@ -324,6 +324,10 @@ pub struct Args {
     #[arg(short, long = "timeout", value_name = "DURATION", value_parser = humantime::parse_duration)]
     pub timeout: Option<Duration>,
 
+    /// Give up on a request that goes this long without receiving a byte. Same suffixes as `--timeout`. Default `10s`.
+    #[arg(long = "read-timeout", value_name = "DURATION", value_parser = humantime::parse_duration)]
+    pub read_timeout: Option<Duration>,
+
     /// Max number of retries in case of a network error
     #[arg(long, value_name = "COUNT")]
     pub max_retries: Option<u32>,
@@ -506,6 +510,10 @@ pub enum Commands {
         /// Connect timeout for requests. Accepts suffixes like `30s`, `5m`, `2h`, `1d` or long forms (`seconds`, `minutes`, `hours`, `days`). Default `5s`.
         #[arg(short, long = "timeout", value_name = "DURATION", value_parser = humantime::parse_duration)]
         timeout: Option<Duration>,
+
+        /// Give up on a request that goes this long without receiving a byte. Same suffixes as `--timeout`. Default `10s`.
+        #[arg(long = "read-timeout", value_name = "DURATION", value_parser = humantime::parse_duration)]
+        read_timeout: Option<Duration>,
 
         /// Use server time when saving
         #[arg(long)]

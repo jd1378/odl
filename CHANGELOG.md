@@ -1,5 +1,50 @@
 # Changelog
 
+## 3.2.0
+
+### A link that goes quiet no longer holds a download open forever
+
+A server can accept a connection, answer nothing, and never close it. Or
+answer, send part of the body, and then stop. Nothing under HTTP reports
+either one: the socket stays healthy and the bytes just never come, so the
+only evidence is silence, and odl was not measuring it. A connect timeout
+covers reaching the server and nothing after, so a download that met one of
+these servers waited for as long as the process was left alive: no progress,
+no error, no exit.
+
+`read_timeout` (config key `read_timeout`, CLI `--read-timeout`) bounds that
+silence. It defaults to 10 seconds and resets on every byte received, so it
+limits how long a request may say nothing rather than how long a transfer may
+take: a large file is never cut off for being slow, only for going quiet. It
+covers the evaluate `HEAD`, every part body, and the small fetches behind
+`odl update` and `odl tools install`, which read a whole response in one call
+with nothing watching it. Setting it to nothing waits forever, as before.
+
+The part downloader had its own ten-second guard on the response and each
+chunk. That guard is gone, replaced by this one: it is the same measurement,
+made in one place, and it now answers to the setting instead of ignoring it.
+
+### `--max-retries` bounds a part across reschedules, not just within one
+
+A part handed back unfinished is requeued, so a server that only tolerates a
+few connections still gets served one part at a time. The retry budget lived
+inside the part task, though, and every requeue handed out a fresh one. With
+more than one part in play neither was ever the last to fail, so each kept
+requeueing the other, and a download whose link had gone dead reopened
+connections against it without end, whatever `max_retries` said. Against a
+server that answers and then goes quiet, that is a job that never finishes and
+never fails.
+
+The budget is now measured where the part's lifetime actually is. Only rounds
+that moved no bytes count against it: a part making progress, however slowly
+or however often its connection breaks, has its allowance restored, which is
+what keeps a connection-capped server working as it always did.
+
+A retry taken mid-body is also no longer charged twice. Breaking out of the
+chunk loop to reissue the request fell through to the handler for a body that
+ended early, which spent a second attempt and slept a second backoff for the
+same failure.
+
 ## 3.1.1
 
 ### A delegated download's reported size no longer shrinks mid-transfer
