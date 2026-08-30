@@ -138,9 +138,13 @@ pub async fn read_delimited_message_from_path<M: Message + Default, P: AsRef<Pat
 pub(crate) const OWNER_ONLY_MODE: u32 = 0o600;
 
 pub async fn atomic_replace(src: PathBuf, dst: PathBuf) -> io::Result<()> {
-    tokio::task::spawn_blocking(move || atomicwrites::replace_atomic(&src, &dst))
-        .await
-        .map_err(io::Error::other)??;
+    tokio::task::spawn_blocking(move || {
+        let src_p = dunce::simplified(&src);
+        let dst_p = dunce::simplified(&dst);
+        atomicwrites::replace_atomic(src_p, dst_p)
+    })
+    .await
+    .map_err(io::Error::other)??;
 
     Ok(())
 }
@@ -212,6 +216,20 @@ pub async fn is_filename_unique<P: AsRef<Path>>(path: &P) -> io::Result<IsUnique
         }
         counter += 1;
     }
+}
+
+/// Canonicalizes a path using [`dunce`], avoiding unwanted `\\?\` verbatim prefixes
+/// on Windows for paths shorter than 260 characters while preserving them for long paths.
+#[allow(dead_code)]
+pub fn canonicalize<P: AsRef<Path>>(path: P) -> io::Result<PathBuf> {
+    dunce::canonicalize(path)
+}
+
+/// Simplifies a path using [`dunce`], stripping verbatim `\\?\` prefixes on Windows
+/// when the path is safely below MAX_PATH.
+#[allow(dead_code)]
+pub fn simplified(path: &Path) -> &Path {
+    dunce::simplified(path)
 }
 
 #[cfg(test)]
@@ -530,5 +548,20 @@ mod tests {
         // and re-trimming always leaves at least that one.
         let input = format!("a{}b", ".".repeat(300));
         assert_eq!(cleanup_filename(&input, false), "a");
+    }
+
+    #[test]
+    fn test_dunce_canonicalize_and_simplified() {
+        let temp = tempdir().unwrap();
+        let path = temp.path();
+        let canon = canonicalize(path).expect("canonicalize must succeed");
+        let simp = simplified(&canon);
+        assert!(!simp.as_os_str().is_empty());
+        #[cfg(windows)]
+        {
+            // For a normal short temp path, simplified/canonicalize strips \\?\
+            let s = canon.to_string_lossy();
+            assert!(!s.starts_with(r"\\?\"), "short path should not start with verbatim prefix: {}", s);
+        }
     }
 }
