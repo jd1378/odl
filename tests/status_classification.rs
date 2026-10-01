@@ -123,6 +123,17 @@ fn a_settled_refusal_does_not_spend_the_retry_budget() {
 }
 
 #[test]
+fn a_single_part_download_keeps_the_class_of_its_refusal() {
+    // One part is the last part standing from its first failure on, and the
+    // download used to end there with a generic error of its own, so the
+    // status that caused it never reached the exit code.
+    for (status, expected) in [(404, CONFLICT), (401, CONFLICT), (503, RETRYABLE)] {
+        let (code, _, out) = refuse_parts_over(1, status);
+        assert_eq!(code, expected, "HTTP {status} classified wrong: {out}");
+    }
+}
+
+#[test]
 fn a_probe_refused_for_good_fails_at_once() {
     for (status, expected) in [
         (404, CONFLICT),

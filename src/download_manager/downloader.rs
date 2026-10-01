@@ -718,14 +718,8 @@ impl Downloader {
                             )));
                         }
                         if pending.is_empty() && active.is_empty() {
-                            // No other work to do — all parts have failed
-                            return Err(OdlError::Other {
-                                message: format!(
-                                    "All parts failed; last part {} failed after {} attempts",
-                                    ulid, attempts
-                                ),
-                                origin: Box::new(std::io::Error::other("all parts failed")),
-                            });
+                            // No other work to do: all parts have failed.
+                            return Err(all_parts_failed(last_failure, &ulid, attempts));
                         } else {
                             // There are other pending/active parts; requeue this
                             // failed part so it will be retried later (one-by-one
@@ -740,13 +734,7 @@ impl Downloader {
                         // If the task wasn't in `active`, still check whether
                         // everything else is done and fail if so.
                         if pending.is_empty() && active.is_empty() {
-                            return Err(OdlError::Other {
-                                message: format!(
-                                    "All parts failed; last part {} failed after {} attempts",
-                                    ulid, attempts
-                                ),
-                                origin: Box::new(std::io::Error::other("all parts failed")),
-                            });
+                            return Err(all_parts_failed(last_failure, &ulid, attempts));
                         }
                     }
                 }
@@ -1335,6 +1323,16 @@ fn emit_part_complete(ctx: &DownloadContext, ulid: &str, total: u64) {
     ctx.emit(ProgressEvent::PartFinished {
         ulid: ulid.to_owned(),
     });
+}
+
+/// The error a download ends with when its last part fails: the failure
+/// itself, so a refusal keeps its class. A single-part download ends here on
+/// its first failure.
+fn all_parts_failed(last_failure: &mut Option<OdlError>, ulid: &str, attempts: u32) -> OdlError {
+    last_failure.take().unwrap_or_else(|| OdlError::Other {
+        message: format!("All parts failed; last part {ulid} failed after {attempts} attempts"),
+        origin: Box::new(std::io::Error::other("all parts failed")),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
