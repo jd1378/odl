@@ -58,7 +58,7 @@ odl --format json config --show
 | 0 | success | — |
 | 2 | usage / bad input | **no** — fix the command |
 | 3 | network | **yes** — transient |
-| 4 | conflict (file exists / changed / checksum) | no — change `--on-*` flags |
+| 4 | conflict (file exists / changed / checksum; URL gone or credentials refused) | no; change `--on-*` flags, the URL, or the credentials |
 | 5 | I/O | no — check disk/permissions |
 | 6 | metadata (lockfile held / corrupt) | maybe — another odl may be running |
 | 7 | yt-dlp missing/too old/failed, or unsupported URL | no — install or update yt-dlp |

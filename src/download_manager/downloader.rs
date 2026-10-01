@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use bytes::Bytes;
 use http::{
     StatusCode,
-    header::{ACCEPT_ENCODING, CONTENT_RANGE, HeaderValue, RANGE, RETRY_AFTER, USER_AGENT},
+    header::{ACCEPT_ENCODING, CONTENT_RANGE, HeaderValue, RANGE, USER_AGENT},
 };
 use reqwest::Client;
 use tokio::{
@@ -29,7 +29,9 @@ use crate::progress::{
     DownloadContext, ProgressEvent, ProgressTracker, SAMPLE_INTERVAL, speed_window_rate,
     trim_speed_window,
 };
-use crate::retry_policies::{FixedThenExponentialRetry, wait_for_retry};
+use crate::retry_policies::{
+    FixedThenExponentialRetry, StatusVerdict, classify_status, retry_after, wait_for_retry,
+};
 use crate::{
     conflict::ServerConflict,
     download::Download,
@@ -1335,54 +1337,6 @@ fn emit_part_complete(ctx: &DownloadContext, ulid: &str, total: u64) {
     });
 }
 
-/// Whether a refusal is worth trying again.
-///
-/// The retry policy exists for transfers that fail *in transit*. A server that
-/// answers a request correctly, with "no", is a different thing: no number of
-/// attempts turns a 404 into a file, and spending the budget on one costs the
-/// user seconds of backoff to reach a conclusion the first response already
-/// gave. Worse, it ends with a retryable error class, telling whatever runs
-/// odl to come back and do it again.
-enum StatusVerdict {
-    /// Settled. Fail the part now, with an error a caller will not retry.
-    Terminal(OdlError),
-    /// Might succeed later — the server is busy, throttling, or briefly broken.
-    Transient(OdlError),
-}
-
-fn classify_part_status(status: StatusCode, url: &reqwest::Url) -> StatusVerdict {
-    let as_network = || {
-        OdlError::Network(NetworkError::Status {
-            status_code: status.as_u16(),
-            reason: status.canonical_reason().map(str::to_owned),
-            url: Some(url.to_string()),
-        })
-    };
-    let conflict = |c: ServerConflict| OdlError::Conflict(ConflictError::Server { conflict: c });
-
-    match status.as_u16() {
-        // Credentials were accepted for the probe and are not accepted now,
-        // or never were. Retrying sends the same ones again.
-        401 | 403 | 407 => StatusVerdict::Terminal(conflict(ServerConflict::CredentialsInvalid)),
-        // The resource is gone. `UrlBroken` says exactly that, and unlike a
-        // network error it does not invite the caller to try again.
-        404 | 410 => StatusVerdict::Terminal(conflict(ServerConflict::UrlBroken)),
-        // Our range no longer fits the representation, which means the thing
-        // on the server is not the thing we started downloading.
-        416 => StatusVerdict::Terminal(conflict(ServerConflict::FileChanged)),
-        // Explicitly "later": timeouts, early-data replay, and rate limits.
-        408 | 425 | 429 => StatusVerdict::Transient(as_network()),
-        // Any other client error is our request being wrong in a way that
-        // repeating it will not fix.
-        code if (400..500).contains(&code) => StatusVerdict::Terminal(OdlError::Other {
-            message: format!("the server refused the request: {}", as_network()),
-            origin: Box::new(std::io::Error::other("request refused")),
-        }),
-        // 5xx and anything unrecognised: assume the server can recover.
-        _ => StatusVerdict::Transient(as_network()),
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn download_part(
     client: Arc<Client>,
@@ -1542,7 +1496,7 @@ async fn download_part(
             // Carry the status through so the failure is reported as what it
             // was, and let it decide whether trying again is worth the user's
             // time at all.
-            let cause = match classify_part_status(resp.status(), &url) {
+            let cause = match classify_status(resp.status(), &url) {
                 StatusVerdict::Terminal(cause) => {
                     return Ok(PartEvent::Failed {
                         ulid,
@@ -1552,13 +1506,7 @@ async fn download_part(
                 }
                 StatusVerdict::Transient(cause) => cause,
             };
-            // A server that says when to come back knows something odl's
-            // backoff curve does not; racing it just earns another refusal.
-            let retry_after = resp
-                .headers()
-                .get(RETRY_AFTER)
-                .and_then(|v| v.to_str().ok())
-                .and_then(crate::retry_policies::parse_retry_after);
+            let retry_after = retry_after(&resp);
             match retry_sleep_or_fail_part(
                 &policy,
                 attempts,

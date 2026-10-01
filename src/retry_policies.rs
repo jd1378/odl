@@ -1,10 +1,16 @@
-use crate::progress::{DownloadContext, ProgressEvent};
+use crate::{
+    conflict::ServerConflict,
+    error::{ConflictError, NetworkError, OdlError},
+    progress::{DownloadContext, ProgressEvent},
+};
+use http::{StatusCode, header::RETRY_AFTER};
 use reqwest_retry::{self, RetryDecision, RetryPolicy};
 use std::{
     cmp,
     time::{Duration, SystemTime},
 };
 use tokio::time::{self, Instant};
+use url::Url;
 
 /// Calculate exponential using base and number of past retries
 fn calculate_exponential(base: u32, n_past_retries: u32) -> u32 {
@@ -86,6 +92,67 @@ pub fn parse_retry_after(value: &str) -> Option<Duration> {
     let when = chrono::DateTime::parse_from_rfc2822(value).ok()?;
     let delta = when.timestamp() - chrono::Utc::now().timestamp();
     Some(Duration::from_secs(delta.max(0) as u64))
+}
+
+/// When the server asked to be tried again, if it said.
+///
+/// A server that says when to come back knows something odl's backoff curve
+/// does not; racing it just earns another refusal.
+pub fn retry_after(response: &reqwest::Response) -> Option<Duration> {
+    response
+        .headers()
+        .get(RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_retry_after)
+}
+
+/// Whether a refusal is worth trying again.
+///
+/// The retry policy exists for transfers that fail *in transit*. A server that
+/// answers a request correctly, with "no", is a different thing: no number of
+/// attempts turns a 404 into a file, and spending the budget on one costs the
+/// user seconds of backoff to reach a conclusion the first response already
+/// gave. Worse, it ends with a retryable error class, telling whatever runs
+/// odl to come back and do it again.
+pub enum StatusVerdict {
+    /// Settled. Fail now, with an error a caller will not retry.
+    Terminal(OdlError),
+    /// Might succeed later: the server is busy, throttling, or briefly broken.
+    Transient(OdlError),
+}
+
+/// Classify an error status from the evaluate probe or a part request.
+pub fn classify_status(status: StatusCode, url: &Url) -> StatusVerdict {
+    let as_network = || {
+        OdlError::Network(NetworkError::Status {
+            status_code: status.as_u16(),
+            reason: status.canonical_reason().map(str::to_owned),
+            url: Some(url.to_string()),
+        })
+    };
+    let conflict = |c: ServerConflict| OdlError::Conflict(ConflictError::Server { conflict: c });
+
+    match status.as_u16() {
+        // Credentials were not accepted, or are no longer. Retrying sends the
+        // same ones again.
+        401 | 403 | 407 => StatusVerdict::Terminal(conflict(ServerConflict::CredentialsInvalid)),
+        // The resource is gone. `UrlBroken` says exactly that, and unlike a
+        // network error it does not invite the caller to try again.
+        404 | 410 => StatusVerdict::Terminal(conflict(ServerConflict::UrlBroken)),
+        // Our range no longer fits the representation, which means the thing
+        // on the server is not the thing we started downloading.
+        416 => StatusVerdict::Terminal(conflict(ServerConflict::FileChanged)),
+        // Explicitly "later": timeouts, early-data replay, and rate limits.
+        408 | 425 | 429 => StatusVerdict::Transient(as_network()),
+        // Any other client error is our request being wrong in a way that
+        // repeating it will not fix.
+        code if (400..500).contains(&code) => StatusVerdict::Terminal(OdlError::Other {
+            message: format!("the server refused the request: {}", as_network()),
+            origin: Box::new(std::io::Error::other("request refused")),
+        }),
+        // 5xx and anything unrecognised: assume the server can recover.
+        _ => StatusVerdict::Transient(as_network()),
+    }
 }
 
 /// Consult the retry policy after a failed attempt. If retry is allowed,

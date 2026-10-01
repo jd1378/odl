@@ -197,8 +197,9 @@ EXIT CODES:
   0    success
   1    other / internal error
   2    usage or invalid input (bad URL, missing input, invalid config/flags)
-  3    network error (DNS, timeout, HTTP status, connection)
-  4    conflict (save/server conflict, checksum mismatch)
+  3    network error (DNS, timeout, connection, HTTP 408/425/429/5xx)
+  4    conflict (save/server conflict, checksum mismatch, HTTP 401/403/407,
+       404/410 or 416)
   5    I/O error
   6    metadata error (lockfile in use, decode failure)
   7    yt-dlp error (missing, too old, failed, or unsupported URL)

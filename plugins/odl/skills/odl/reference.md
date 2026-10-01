@@ -22,8 +22,8 @@ odl [OPTIONS] [INPUT] [COMMAND]
 | 0 | — | success |
 | 1 | `other` | other / internal error |
 | 2 | `cli`, `empty_input_file`, `url_decode`, `config`, `not_evaluated`, `invalid_request` | usage or invalid input |
-| 3 | `network` | DNS, timeout, HTTP status, connection; also a site refusing us as too frequent (HTTP 429) — **retryable** |
-| 4 | `conflict` | save/server conflict, checksum mismatch |
+| 3 | `network` | DNS, timeout, connection, or a server that is busy or failing (HTTP 408, 425, 429, 5xx), including a site refusing us as too frequent (429); **retryable** |
+| 4 | `conflict` | save/server conflict, checksum mismatch, or a refusal that will not change: credentials refused (HTTP 401, 403, 407), URL gone (404, 410), file changed (416). Applies to the first probe and to every part |
 | 5 | `io` | I/O error |
 | 6 | `metadata` | lockfile in use, decode failure |
 | 7 | `ytdlp` | yt-dlp missing, too old, or failed; unsupported URL. **Not** retryable — fix the toolchain |

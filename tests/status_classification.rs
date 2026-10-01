@@ -1,4 +1,5 @@
-//! What a part request's status code costs the user.
+//! What a refusal's status code costs the user, on the evaluate probe and on
+//! every part.
 //!
 //! The retry policy is for transfers that fail in transit. A server that
 //! answers correctly, with "no", is settled: retrying a 404 spends seconds of
@@ -14,6 +15,10 @@ const SIZE: usize = 4 * 1024 * 1024;
 /// Serve a resumable file on `HEAD` but answer every part `GET` with `status`.
 /// Returns odl's exit code and how long it spent before giving up.
 fn refuse_every_part_with(status: usize) -> (Option<i32>, Duration, String) {
+    refuse_parts_over(4, status)
+}
+
+fn refuse_parts_over(connections: usize, status: usize) -> (Option<i32>, Duration, String) {
     let mut server = mockito::Server::new();
     let url = format!("{}/file", server.url());
 
@@ -31,18 +36,36 @@ fn refuse_every_part_with(status: usize) -> (Option<i32>, Duration, String) {
         .with_body("no")
         .create();
 
+    run_odl(&url, connections)
+}
+
+/// Answer the evaluate probe itself with `status`.
+fn refuse_the_probe_with(status: usize) -> (Option<i32>, Duration, String) {
+    let mut server = mockito::Server::new();
+    let url = format!("{}/file", server.url());
+    let _head = server
+        .mock("HEAD", "/file")
+        .expect_at_least(1)
+        .with_status(status)
+        .create();
+    run_odl(&url, 4)
+}
+
+/// Run odl against `url`. Returns its exit code, how long it spent before
+/// giving up, and its JSON output.
+fn run_odl(url: &str, connections: usize) -> (Option<i32>, Duration, String) {
     let data_dir = tempfile::tempdir().unwrap();
     let save_dir = tempfile::tempdir().unwrap();
 
     let started = Instant::now();
     let output = Command::new(env!("CARGO_BIN_EXE_odl"))
-        .arg(&url)
+        .arg(url)
         .arg("-o")
         .arg(save_dir.path().join("file"))
         .arg("--download-dir")
         .arg(data_dir.path())
         .arg("--max-connections")
-        .arg("4")
+        .arg(connections.to_string())
         .arg("--format")
         .arg("json")
         .stdout(Stdio::piped())
@@ -96,5 +119,43 @@ fn a_settled_refusal_does_not_spend_the_retry_budget() {
     assert!(
         terminal * 2 < transient,
         "a 404 should cost far less than a 503: {terminal:?} vs {transient:?}"
+    );
+}
+
+#[test]
+fn a_probe_refused_for_good_fails_at_once() {
+    for (status, expected) in [
+        (404, CONFLICT),
+        (410, CONFLICT),
+        (403, CONFLICT),
+        (401, CONFLICT),
+        (400, Some(1)),
+    ] {
+        let (code, _, out) = refuse_the_probe_with(status);
+        assert_eq!(
+            code, expected,
+            "HTTP {status} probe classified wrong: {out}"
+        );
+    }
+}
+
+#[test]
+fn a_busy_server_is_still_probed_again() {
+    for status in [429, 500, 503] {
+        let (code, _, out) = refuse_the_probe_with(status);
+        assert_eq!(
+            code, RETRYABLE,
+            "HTTP {status} probe must stay retryable: {out}"
+        );
+    }
+}
+
+#[test]
+fn a_probe_refused_for_good_does_not_spend_the_retry_budget() {
+    let (_, terminal, _) = refuse_the_probe_with(404);
+    let (_, transient, _) = refuse_the_probe_with(503);
+    assert!(
+        terminal * 2 < transient,
+        "a 404 probe should cost far less than a 503: {terminal:?} vs {transient:?}"
     );
 }

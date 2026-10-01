@@ -33,7 +33,9 @@ use crate::error::MetadataError;
 use crate::format::{FormatSelector, Quality};
 use crate::progress::{DownloadContext, Phase, ProgressEvent};
 use crate::response_info::ResponseInfo;
-use crate::retry_policies::{FixedThenExponentialRetry, wait_for_retry};
+use crate::retry_policies::{
+    FixedThenExponentialRetry, StatusVerdict, classify_status, retry_after, wait_for_retry,
+};
 use crate::{
     conflict::{
         NotResumableResolution, SaveConflictResolver, ServerConflict, ServerConflictResolver,
@@ -434,20 +436,25 @@ impl DownloadManager {
                 req = req.header(USER_AGENT, random_user_agent());
             }
 
-            match req.send().await.and_then(|r| r.error_for_status()) {
-                Ok(r) => break r,
-                Err(e) => {
-                    attempts = attempts.saturating_add(1);
-                    if !wait_for_retry(&retry_policy, attempts, ctx, None, None).await {
-                        // `false` also means the wait was cancelled, and a
-                        // stopped download must not report the network error
-                        // that happened to precede the stop.
-                        if ctx.is_cancelled() {
-                            return Err(OdlError::Cancelled);
-                        }
-                        return Err(OdlError::from_reqwest(e));
-                    }
+            let (cause, retry_after) = match req.send().await {
+                Ok(r) if !r.status().is_client_error() && !r.status().is_server_error() => break r,
+                // Judged the way part requests are: a server that has
+                // settled the matter is not asked again.
+                Ok(r) => match classify_status(r.status(), r.url()) {
+                    StatusVerdict::Terminal(cause) => return Err(cause),
+                    StatusVerdict::Transient(cause) => (cause, retry_after(&r)),
+                },
+                Err(e) => (OdlError::from_reqwest(e), None),
+            };
+            attempts = attempts.saturating_add(1);
+            if !wait_for_retry(&retry_policy, attempts, ctx, None, retry_after).await {
+                // `false` also means the wait was cancelled, and a stopped
+                // download must not report the network error that happened
+                // to precede the stop.
+                if ctx.is_cancelled() {
+                    return Err(OdlError::Cancelled);
                 }
+                return Err(cause);
             }
         };
         let info = ResponseInfo::from_response(url, resp);
