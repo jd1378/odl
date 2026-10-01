@@ -1,5 +1,65 @@
 # Changelog
 
+## 3.3.0
+
+### Credentials stay with the host they were given for
+
+When a server redirected a download to another host, odl fetched the file
+from where the redirect led and sent the job's `Cookie` and `Authorization`
+headers there as well. The evaluate probe was never the problem: reqwest drops
+those headers when a redirect crosses to another scheme, host or port, the
+same rule browsers and curl apply. But the probe's answer became the
+download's URL, and every part request went straight to it, with no redirect
+of its own for that rule to run on.
+
+A GitHub release asset requested with github.com session cookies is how this
+showed up. github.com redirects to a signed URL on
+release-assets.githubusercontent.com, which was handed the github.com session
+and refused it with `401 Unauthorized`, so the download failed where the same
+request without cookies worked.
+
+A download now remembers the URL it was asked for next to the one serving it:
+`Download::requested_url`, stored as `requested_url` in the metadata. When the
+two differ in scheme, host or port, part requests leave out the headers
+reqwest drops on such a redirect: `Authorization`, `Cookie`, `Cookie2`,
+`Proxy-Authorization` and `WWW-Authenticate`. Every other header goes along as
+before, and a redirect that stays on the same origin changes nothing.
+
+Metadata written by earlier versions has no requested URL and is read as
+never redirected, since the URL it stores is the only one it knows. odl
+evaluates every download before starting it, which records the requested URL
+afresh, so this only matters to an embedder that downloads straight from
+`Download::from_metadata`.
+
+### Basic auth reaches every part, not only the probe
+
+Credentials given through `EvaluateRequest::credentials` (CLI `--http-user`
+and `--http-password`) were sent with the evaluate probe and with nothing
+after it. A server that wants basic auth on every request accepted the probe,
+then refused each part with `401`. Parts now carry them too, under the same
+origin rule as the headers above.
+
+### Request credentials are no longer written to disk
+
+The request headers kept in a download's `metadata.pb` were the job's headers
+verbatim, so a session cookie or token that a caller stored encrypted ended up
+in a plaintext file. They now pass through the filter the stored response
+headers already used, which drops `Cookie`, `Authorization` and any header
+whose name marks it as credential-bearing. Nothing read them back for a
+request: each request takes its headers from the options it is given. The
+`yt-dlp` engine was the one exception, taking them from the instruction; it
+now reads the options like the HTTP engine does, so an instruction rebuilt
+from metadata loses nothing.
+
+Files written by earlier versions are cleaned the next time odl rewrites
+them, which resuming an unfinished download always does.
+
+### The `odl` binary is built against patched h2 and rustls
+
+The lockfile now pins h2 0.4.19 (past RUSTSEC-2026-0258) and rustls 0.23.45
+(RUSTSEC-2026-0285). Library users resolve their own versions of both, and a
+`cargo update` brings in the same fixes.
+
 ## 3.2.0
 
 ### A link that goes quiet no longer holds a download open forever
