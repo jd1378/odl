@@ -62,6 +62,10 @@ pub struct Download {
     download_dir: path::PathBuf,
     /// URL of the file to download.
     url: Url,
+    /// URL the caller asked for, which redirects turned into `url`. `None`
+    /// when nothing recorded one, and `url` stands in for it.
+    #[builder(default = None)]
+    requested_url: Option<Url>,
     /// Whether the server supports using range requests (i.e., resumable downloads).
     #[builder(default = false)]
     is_resumable: bool,
@@ -122,9 +126,9 @@ pub struct Download {
     engine_details: Option<EngineDetails>,
 }
 
-/// Response headers never persisted to metadata: they carry session
-/// material and are useless in a properties dialog anyway.
-const RESPONSE_HEADER_DENYLIST: &[&str] = &[
+/// Headers never persisted to metadata, in either direction: they carry
+/// session material and are useless in a properties dialog anyway.
+const SECRET_HEADER_DENYLIST: &[&str] = &[
     "set-cookie",
     "set-cookie2",
     "www-authenticate",
@@ -139,7 +143,7 @@ const RESPONSE_HEADER_DENYLIST: &[&str] = &[
 /// exact name. Vendor headers are open-ended (`x-amz-security-token`,
 /// `x-api-key`, `x-goog-signature`, …), so this fails closed: an unknown
 /// header matching one of these is dropped rather than written to disk.
-const RESPONSE_HEADER_SECRET_MARKERS: &[&str] = &[
+const SECRET_HEADER_MARKERS: &[&str] = &[
     "auth",
     "cookie",
     "credential",
@@ -161,13 +165,36 @@ const MAX_STORED_RESPONSE_HEADERS_BYTES: usize = 8 * 1024;
 /// not consume the whole budget and crowd out the rest.
 const MAX_STORED_RESPONSE_HEADER_VALUE_BYTES: usize = 1024;
 
-/// Whether a response header may carry credentials and must stay off disk.
-/// `name` is expected lowercase, as [`HeaderName`] guarantees.
-fn is_secret_response_header(name: &str) -> bool {
-    RESPONSE_HEADER_DENYLIST.contains(&name)
-        || RESPONSE_HEADER_SECRET_MARKERS
+/// Whether a header may carry credentials and must stay off disk. `name` is
+/// expected lowercase, as [`HeaderName`] guarantees.
+fn is_secret_header(name: &str) -> bool {
+    SECRET_HEADER_DENYLIST.contains(&name)
+        || SECRET_HEADER_MARKERS
             .iter()
             .any(|marker| name.contains(marker))
+}
+
+/// Request headers scoped to one origin: the set reqwest drops when a
+/// redirect changes scheme, host or port. Parts go to the redirect target
+/// directly, with no redirect of their own to trigger that rule, so odl
+/// applies the same one and both hops agree on what a server gets to see.
+const ORIGIN_BOUND_HEADERS: &[&str] = &[
+    "authorization",
+    "cookie",
+    "cookie2",
+    "proxy-authorization",
+    "www-authenticate",
+];
+
+impl DownloadMetadata {
+    /// Drop credential-bearing request headers. Nothing sends headers read
+    /// back from disk, since every request takes them from the caller's
+    /// options, so this costs nothing and keeps sessions out of a plaintext
+    /// file, including ones written before the filter existed.
+    pub(crate) fn drop_secret_headers(&mut self) {
+        self.headers
+            .retain(|name, _| !is_secret_header(&name.to_ascii_lowercase()));
+    }
 }
 
 /// Inputs for [`Download::from_ytdlp`], gathered by the delegating engine
@@ -285,6 +312,39 @@ impl Download {
 
     pub fn url(&self) -> &Url {
         &self.url
+    }
+
+    /// The URL the caller asked for. [`Self::url`] is where its redirects
+    /// led, which is where the bytes come from.
+    pub fn requested_url(&self) -> &Url {
+        self.requested_url.as_ref().unwrap_or(&self.url)
+    }
+
+    /// Whether the bytes come from another origin (scheme, host or port)
+    /// than the one the caller named. Credentials given for that origin do
+    /// not follow them there.
+    fn leaves_requested_origin(&self) -> bool {
+        let (asked, serving) = (self.requested_url(), &self.url);
+        asked.scheme() != serving.scheme()
+            || asked.host_str() != serving.host_str()
+            || asked.port_or_known_default() != serving.port_or_known_default()
+    }
+
+    /// `headers` as they may be sent to [`Self::url`].
+    pub(crate) fn transfer_headers(&self, mut headers: HeaderMap) -> HeaderMap {
+        if self.leaves_requested_origin() {
+            for name in ORIGIN_BOUND_HEADERS {
+                headers.remove(*name);
+            }
+        }
+        headers
+    }
+
+    /// [`Self::credentials`], when they may be sent to [`Self::url`].
+    pub(crate) fn transfer_credentials(&self) -> Option<&Credentials> {
+        self.credentials
+            .as_ref()
+            .filter(|_| !self.leaves_requested_origin())
     }
 
     pub fn is_resumable(&self) -> bool {
@@ -479,7 +539,7 @@ impl Download {
         let mut budget = MAX_STORED_RESPONSE_HEADERS_BYTES;
         for (name, value) in headers.iter() {
             let name = name.as_str();
-            if is_secret_response_header(name) {
+            if is_secret_header(name) {
                 continue;
             }
             // Non-UTF8 values are rare (and undisplayable anyway); drop them
@@ -505,15 +565,21 @@ impl Download {
 
     pub fn from_metadata(
         download_dir: path::PathBuf,
-        metadata: DownloadMetadata,
+        mut metadata: DownloadMetadata,
     ) -> Result<Download, MetadataError> {
-        let url = Url::parse(&metadata.url).map_err(|e| MetadataError::Other {
-            message: e.to_string(),
-        })?;
+        let parse = |url: &str| {
+            Url::parse(url).map_err(|e| MetadataError::Other {
+                message: e.to_string(),
+            })
+        };
+        let url = parse(&metadata.url)?;
+        let requested_url = metadata.requested_url.as_deref().map(parse).transpose()?;
+        metadata.drop_secret_headers();
 
         Ok(Self {
             download_dir,
             url,
+            requested_url,
             is_resumable: metadata.is_resumable,
             use_server_time: metadata.use_server_time,
             filename: metadata.filename, // is cleaned up before its stored as metadata, by from_response
@@ -579,8 +645,9 @@ impl Download {
     }
 
     pub fn as_metadata(&self) -> DownloadMetadata {
-        DownloadMetadata {
+        let mut metadata = DownloadMetadata {
             url: self.url.to_string(),
+            requested_url: Some(self.requested_url().to_string()),
             filename: self.filename.clone(),
             save_dir: self.save_dir.to_string_lossy().into_owned(),
             is_resumable: self.is_resumable,
@@ -611,7 +678,9 @@ impl Download {
             finished: self.finished,
             engine: DownloadEngine::from(self.engine).into(),
             engine_details: self.engine_details.clone(),
-        }
+        };
+        metadata.drop_secret_headers();
+        metadata
     }
 
     /// Build a download that a delegating engine will perform.
@@ -655,6 +724,8 @@ impl Download {
         Self {
             download_dir: download_root.join(&dir_name),
             url: source_url.clone(),
+            // yt-dlp makes every request itself, from the page URL.
+            requested_url: None,
             // yt-dlp continues an interrupted transfer, and fragmented
             // formats keep their own resume state alongside the output.
             is_resumable: true,
@@ -731,6 +802,7 @@ impl Download {
         Self {
             download_dir: download_dir.join(&filename),
             url: response_info.url().clone(),
+            requested_url: Some(response_info.requested_url().clone()),
             is_resumable: response_info.is_resumable(),
             use_server_time,
             filename,
@@ -1089,6 +1161,88 @@ mod tests {
         assert_eq!(traces, vec!["first", "second"], "duplicates preserved");
         assert!(headers.get("set-cookie").is_none());
         assert_eq!(restored.response_headers_probed_at(), Some(1_700_000_000));
+    }
+
+    fn redirected(requested: &str, served: &str) -> Download {
+        let mut dl = test_download(vec![]);
+        dl.requested_url = Some(Url::parse(requested).unwrap());
+        dl.url = Url::parse(served).unwrap();
+        dl.credentials = Some(Credentials::new("user", Some("pass")));
+        dl
+    }
+
+    #[test]
+    fn credentials_stay_with_the_requested_origin() {
+        let mut caller = HeaderMap::new();
+        caller.insert("cookie", HeaderValue::from_static("session=secret"));
+        caller.insert("authorization", HeaderValue::from_static("Bearer t"));
+        caller.insert("referer", HeaderValue::from_static("https://a.test/"));
+
+        let same = redirected("https://a.test/file", "https://a.test:443/cdn/file?sig=1");
+        assert_eq!(same.transfer_headers(caller.clone()), caller);
+        assert!(same.transfer_credentials().is_some());
+
+        for served in [
+            "https://b.test/file",
+            "https://a.test:8443/file",
+            "http://a.test/file",
+        ] {
+            let other = redirected("https://a.test/file", served);
+            let sent = other.transfer_headers(caller.clone());
+            assert!(sent.get("cookie").is_none(), "cookie sent to {served}");
+            assert!(
+                sent.get("authorization").is_none(),
+                "token sent to {served}"
+            );
+            assert!(
+                sent.get("referer").is_some(),
+                "{served} lost a plain header"
+            );
+            assert!(
+                other.transfer_credentials().is_none(),
+                "basic auth sent to {served}"
+            );
+        }
+    }
+
+    #[test]
+    fn requested_url_round_trips_and_older_files_fall_back_to_url() {
+        let dl = redirected("https://a.test/file", "https://b.test/signed");
+        let restored = Download::from_metadata(PathBuf::from("/tmp/dl"), dl.as_metadata()).unwrap();
+        assert_eq!(restored.requested_url().as_str(), "https://a.test/file");
+        assert_eq!(restored.url().as_str(), "https://b.test/signed");
+
+        // Written before the field existed: the stored URL is the only one
+        // known, so it is taken as the one asked for.
+        let mut legacy = dl.as_metadata();
+        legacy.requested_url = None;
+        let restored = Download::from_metadata(PathBuf::from("/tmp/dl"), legacy).unwrap();
+        assert_eq!(restored.requested_url(), restored.url());
+    }
+
+    #[test]
+    fn request_header_secrets_never_reach_metadata() {
+        let mut headers = HeaderMap::new();
+        headers.insert("cookie", HeaderValue::from_static("session=secret"));
+        headers.insert("authorization", HeaderValue::from_static("Bearer t"));
+        headers.insert("x-api-key", HeaderValue::from_static("k-123"));
+        headers.insert("referer", HeaderValue::from_static("https://a.test/"));
+        let mut dl = test_download(vec![]);
+        dl.headers = Some(headers);
+
+        let stored = dl.as_metadata().headers;
+        assert_eq!(stored.keys().collect::<Vec<_>>(), ["referer"]);
+
+        // A file from an older version holds them in plaintext. Loading it
+        // must not hand them back.
+        let mut legacy = dl.as_metadata();
+        legacy
+            .headers
+            .insert("Cookie".to_owned(), "session=secret".to_owned());
+        let restored = Download::from_metadata(PathBuf::from("/tmp/dl"), legacy).unwrap();
+        let restored = restored.headers().unwrap();
+        assert!(restored.get("cookie").is_none());
+        assert!(restored.get("referer").is_some());
     }
 
     #[test]

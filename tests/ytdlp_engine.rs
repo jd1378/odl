@@ -359,16 +359,17 @@ fn a_second_run_reuses_the_finished_file_instead_of_downloading_again() {
     );
 }
 
-#[test]
-fn an_interrupted_download_resumes_with_the_same_pinned_format() {
-    // First run fails after leaving a partial file behind.
-    let failing = r#"
+/// A stand-in that fails after leaving a partial file behind.
+const INTERRUPTED_DOWNLOAD_BODY: &str = r#"
 echo '{"k":"d","d":1024,"t":3072,"s":900.0,"f":"137","st":"downloading"}'
 head -c 1024 /dev/zero > "$OUT_DIR/$STEM.mkv.part"
 echo "network died" >&2
 exit 1
 "#;
-    let fx = Fixture::new(failing);
+
+#[test]
+fn an_interrupted_download_resumes_with_the_same_pinned_format() {
+    let fx = Fixture::new(INTERRUPTED_DOWNLOAD_BODY);
     let out = fx.run(&[]);
     assert!(!out.status.success(), "the first run is meant to fail");
 
@@ -401,6 +402,39 @@ exit 1
     for call in fx.calls().lines().filter(|c| c.contains("--paths")) {
         assert!(call.contains("-f 137+251"), "unpinned resume: {call}");
     }
+}
+
+/// Earlier versions stored request headers verbatim, sessions included. The
+/// first resume after upgrading takes them out of the file.
+#[test]
+fn resuming_scrubs_credentials_an_older_version_stored() {
+    use odl::download_metadata::DownloadMetadata;
+    use prost::Message;
+
+    let fx = Fixture::new(INTERRUPTED_DOWNLOAD_BODY);
+    assert!(
+        !fx.run(&[]).status.success(),
+        "the first run is meant to fail"
+    );
+
+    let path = fx.download_dir().join("metadata.pb");
+    let read = || {
+        DownloadMetadata::decode_length_delimited(std::fs::read(&path).unwrap().as_slice()).unwrap()
+    };
+    let mut legacy = read();
+    legacy
+        .headers
+        .insert("cookie".to_owned(), "user_session=SECRET".to_owned());
+    std::fs::write(&path, legacy.encode_length_delimited_to_vec()).unwrap();
+
+    write_fake_ytdlp(fx.tool_dir.path(), &successful_download_body());
+    let out = fx.run(&["--on-same-download-exists", "resume"]);
+    assert!(
+        out.status.success(),
+        "resume failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!read().headers.contains_key("cookie"));
 }
 
 #[test]

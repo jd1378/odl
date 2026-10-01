@@ -1491,6 +1491,11 @@ async fn download_part(
         if randomize_user_agent {
             req = req.header(USER_AGENT, random_user_agent())
         }
+        // A server that wants basic auth on the probe wants it on every
+        // range too.
+        if let Some(creds) = instruction.transfer_credentials() {
+            req = req.basic_auth(creds.username(), creds.password());
+        }
 
         // A server that accepts the request and then never answers is the
         // client's `read_timeout` to catch: it reports as a timeout here,

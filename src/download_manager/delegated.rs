@@ -434,6 +434,7 @@ mod imp {
                     let mut m = stored;
                     m.save_dir = instruction.save_dir().to_string_lossy().into_owned();
                     m.filename = instruction.filename().to_string();
+                    m.drop_secret_headers();
                     m
                 }
                 Some(reason) => {
@@ -487,6 +488,10 @@ mod imp {
                 message: e.to_string(),
             })?;
 
+        // From the options, like every HTTP request: what the instruction
+        // carries may have been read back from disk, where no credentials are
+        // kept.
+        let headers = HeaderMap::from(opts);
         let plan = DownloadPlan {
             source_url: &source_url,
             format_id: &stored_ytdlp(&metadata)
@@ -498,7 +503,7 @@ mod imp {
             use_server_time: instruction.use_server_time(),
             proxy: opts.proxy_process_arg(),
             speed_limit: opts.speed_limit(),
-            headers: instruction.headers(),
+            headers: Some(&headers),
             concurrent_fragments: opts.max_connections(),
             max_retries: opts.max_retries(),
             wait_between_retries: opts.wait_between_retries(),

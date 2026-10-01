@@ -44,6 +44,12 @@ message DownloadMetadata {
     YtdlpDetails ytdlp_details = 19;
     // TorrentDetails torrent_details = 20; // planned
   }
+  // the URL the caller asked for. `url` is where its redirects led, and the
+  // two differ in origin when a server hands the file off to another host,
+  // which is what decides whether the caller's credentials go along.
+  // absent in files written before this field existed; readers take `url`,
+  // the only URL such a file knows.
+  optional string requested_url = 21;
 }
 
 // Named after what the engine does rather than a version number: a version

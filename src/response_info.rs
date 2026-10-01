@@ -14,16 +14,20 @@ use crate::hash::HashDigest;
 #[derive(Debug, Clone)]
 pub struct ResponseInfo {
     status_code: u16,
-    request_url: Url,
+    /// The URL that answered, after any redirects.
+    url: Url,
+    /// The URL that was asked for.
+    requested_url: Url,
     response_headers: HeaderMap,
 }
 
 impl ResponseInfo {
     #[cfg(test)]
-    fn new(status_code: u16, request_url: Url, response_headers: HeaderMap) -> Self {
+    fn new(status_code: u16, url: Url, response_headers: HeaderMap) -> Self {
         Self {
             status_code,
-            request_url,
+            requested_url: url.clone(),
+            url,
             response_headers,
         }
     }
@@ -32,11 +36,24 @@ impl ResponseInfo {
     /// HTTP request. Status is 0 and headers are empty, so filename
     /// extraction falls back to URL path/query and all server-derived
     /// fields (size, etag, last-modified, hashes, resumability) are absent.
-    pub fn from_url(request_url: Url) -> Self {
+    pub fn from_url(url: Url) -> Self {
         Self {
             status_code: 0,
-            request_url,
+            requested_url: url.clone(),
+            url,
             response_headers: HeaderMap::new(),
+        }
+    }
+
+    /// Describe `response`, the answer to a request for `requested_url`.
+    /// The response only knows where the redirects ended, and credentials
+    /// are scoped to where they began.
+    pub fn from_response(requested_url: Url, response: Response) -> Self {
+        Self {
+            status_code: response.status().as_u16(),
+            url: response.url().to_owned(),
+            requested_url,
+            response_headers: response.headers().to_owned(),
         }
     }
 
@@ -49,7 +66,11 @@ impl ResponseInfo {
     }
 
     pub fn url(&self) -> &Url {
-        &self.request_url
+        &self.url
+    }
+
+    pub fn requested_url(&self) -> &Url {
+        &self.requested_url
     }
 
     pub fn response_headers(&self) -> &HeaderMap {
@@ -117,7 +138,7 @@ impl ResponseInfo {
             }
         }
         // Fallback: try query params (file=, filename=, name=), then URL path
-        let name_from_query = self.request_url.query_pairs().find_map(|(k, v)| {
+        let name_from_query = self.url.query_pairs().find_map(|(k, v)| {
             let key = k.as_ref();
             if (key.eq_ignore_ascii_case("file")
                 || key.eq_ignore_ascii_case("filename")
@@ -131,7 +152,7 @@ impl ResponseInfo {
         });
 
         let name = name_from_query.or_else(|| {
-            self.request_url
+            self.url
                 .path_segments()
                 .and_then(|segments| segments.rev().find(|s| !s.is_empty()))
                 .map(|s| s.to_string())
@@ -429,16 +450,6 @@ impl ResponseInfo {
         }
 
         hashes
-    }
-}
-
-impl From<Response> for ResponseInfo {
-    fn from(value: Response) -> Self {
-        Self {
-            status_code: value.status().as_u16(),
-            request_url: value.url().to_owned(),
-            response_headers: value.headers().to_owned(),
-        }
     }
 }
 

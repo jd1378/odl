@@ -403,7 +403,9 @@ impl DownloadManager {
             return Ok(instruction);
         }
 
-        let client = self.get_client(opts)?;
+        // Unscoped: if the probe is redirected to another origin, reqwest
+        // drops the credentials itself.
+        let client = self.get_client(opts, HeaderMap::from(opts))?;
 
         let retry_policy = FixedThenExponentialRetry {
             max_n_retries: opts.max_retries(),
@@ -448,7 +450,7 @@ impl DownloadManager {
                 }
             }
         };
-        let info = ResponseInfo::from(resp);
+        let info = ResponseInfo::from_response(url, resp);
         let instruction = Download::from_response_info(
             self.config.download_dir(),
             save_dir,
@@ -649,15 +651,18 @@ impl DownloadManager {
             .map(DownloadPermit)
     }
 
-    fn get_client(&self, opts: &DownloadOptions) -> Result<Client, OdlError> {
+    /// A client for one phase of a job. `headers` go on every request it
+    /// makes: the caller's own, minus whatever must not reach the server
+    /// this client talks to.
+    fn get_client(&self, opts: &DownloadOptions, headers: HeaderMap) -> Result<Client, OdlError> {
         let mut client = reqwest::Client::builder();
 
         // Always source per-job knobs from `opts` so per-job overrides are
         // applied uniformly at every phase (evaluate AND download). The
         // proxy/headers captured into `Download` at evaluate time are kept
         // for metadata/round-trip but aren't read here.
-        if opts.headers().is_some_and(|x| !x.is_empty()) {
-            client = client.default_headers(HeaderMap::from(opts));
+        if !headers.is_empty() {
+            client = client.default_headers(headers);
         }
         if opts.no_proxy() {
             // Also switches off the environment/system proxy reqwest would
@@ -809,7 +814,8 @@ impl DownloadManager {
                     opts.randomize_user_agent()
                 };
 
-                let client = self.get_client(opts)?;
+                let client =
+                    self.get_client(opts, instruction.transfer_headers(HeaderMap::from(opts)))?;
                 let retry_policy = crate::retry_policies::FixedThenExponentialRetry {
                     max_n_retries: opts.max_retries(),
                     wait_time: opts.wait_between_retries(),
@@ -3032,6 +3038,175 @@ mod tests {
         let on_disk = fs::read(&final_path).await?;
         assert_eq!(on_disk, file_content);
 
+        Ok(())
+    }
+
+    /// One-part options carrying `headers`, the way an embedder passes the
+    /// cookies and tokens it captured for a job.
+    fn opts_with_headers(headers: &[(&str, &str)]) -> DownloadOptions {
+        let headers = headers
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        DownloadOptionsBuilder::default()
+            .max_connections(1)
+            .headers(Some(headers))
+            .build()
+            .unwrap()
+    }
+
+    /// Evaluate and download `url` with the same options and credentials,
+    /// as an embedder does. Returns the metadata left on disk and the file.
+    async fn evaluate_then_download(
+        url: String,
+        opts: &DownloadOptions,
+        credentials: Credentials,
+    ) -> Result<(DownloadMetadata, Vec<u8>), Box<dyn std::error::Error>> {
+        let data_dir = tempdir()?;
+        let save_dir = tempdir()?;
+        let dlm = DownloadManager::new(test_cfg(data_dir.path(), 1));
+        let instruction = dlm
+            .evaluate(
+                EvaluateRequest::new(Url::parse(&url)?, save_dir.path(), &AlwaysReplaceResolver)
+                    .options(opts)
+                    .credentials(credentials),
+            )
+            .await?;
+        let metadata_path = instruction.metadata_path();
+        let final_path = dlm
+            .download(DownloadRequest::new(instruction, &AlwaysAbortResolver).options(opts))
+            .await?;
+        let metadata = crate::fs_utils::read_delimited_message_from_path(&metadata_path).await?;
+        Ok((metadata, fs::read(final_path).await?))
+    }
+
+    /// A redirect to another origin must not take the caller's credentials
+    /// along. reqwest drops them on the probe's redirect hop, but parts go
+    /// straight to the redirect target, so that rule never runs for them.
+    /// Two mockito servers share a host and differ by port: another origin.
+    #[tokio::test]
+    async fn credentials_do_not_follow_a_cross_origin_redirect()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let body = b"0123456789";
+        let mut origin = Server::new_async().await;
+        let mut mirror = Server::new_async().await;
+
+        let probe = origin
+            .mock("HEAD", "/file")
+            .match_header("cookie", "user_session=SECRET")
+            .with_status(302)
+            .with_header("location", &format!("{}/signed", mirror.url()))
+            .create_async()
+            .await;
+        mirror
+            .mock("HEAD", "/signed")
+            .with_status(200)
+            .with_header("content-length", &body.len().to_string())
+            .with_header("accept-ranges", "bytes")
+            .create_async()
+            .await;
+        let clean = mirror
+            .mock("GET", "/signed")
+            .match_header("cookie", Matcher::Missing)
+            .match_header("authorization", Matcher::Missing)
+            .with_status(206)
+            .with_body(body)
+            .create_async()
+            .await;
+        // What a signed-URL host does with a session it never issued.
+        for leaked in ["cookie", "authorization"] {
+            mirror
+                .mock("GET", "/signed")
+                .match_header(leaked, Matcher::Regex(".*".into()))
+                .with_status(401)
+                .create_async()
+                .await;
+        }
+
+        let opts = opts_with_headers(&[
+            ("Cookie", "user_session=SECRET"),
+            ("Authorization", "Bearer TOKEN"),
+            ("Referer", "https://example.com/page"),
+        ]);
+        let (metadata, downloaded) = evaluate_then_download(
+            format!("{}/file", origin.url()),
+            &opts,
+            Credentials::new("user", Some("pass")),
+        )
+        .await?;
+
+        assert_eq!(downloaded, body);
+        probe.assert_async().await;
+        clean.assert_async().await;
+
+        assert!(
+            !metadata.headers.contains_key("cookie")
+                && !metadata.headers.contains_key("authorization"),
+            "credentials written to disk: {:?}",
+            metadata.headers
+        );
+        assert_eq!(
+            metadata.headers.get("referer").map(String::as_str),
+            Some("https://example.com/page"),
+            "headers that carry no secret are still recorded"
+        );
+        // So a download resumed from disk alone knows the origin too.
+        assert_eq!(
+            metadata.requested_url,
+            Some(format!("{}/file", origin.url()))
+        );
+        assert_eq!(metadata.url, format!("{}/signed", mirror.url()));
+        Ok(())
+    }
+
+    /// The other side of the origin rule: a redirect within the origin keeps
+    /// every credential, and basic auth reaches the parts, not only the probe.
+    #[tokio::test]
+    async fn credentials_reach_every_part_within_the_origin()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let body = b"0123456789";
+        let basic = "Basic dXNlcjpwYXNz"; // user:pass
+        let mut server = Server::new_async().await;
+
+        server
+            .mock("HEAD", "/file")
+            .with_status(302)
+            .with_header("location", "/real")
+            .create_async()
+            .await;
+        server
+            .mock("HEAD", "/real")
+            .match_header("authorization", basic)
+            .with_status(200)
+            .with_header("content-length", &body.len().to_string())
+            .with_header("accept-ranges", "bytes")
+            .create_async()
+            .await;
+        let part = server
+            .mock("GET", "/real")
+            .match_header("authorization", basic)
+            .match_header("cookie", "user_session=SECRET")
+            .with_status(206)
+            .with_body(body)
+            .create_async()
+            .await;
+        server
+            .mock("GET", "/real")
+            .match_header("authorization", Matcher::Missing)
+            .with_status(401)
+            .create_async()
+            .await;
+
+        let opts = opts_with_headers(&[("Cookie", "user_session=SECRET")]);
+        let (_, downloaded) = evaluate_then_download(
+            format!("{}/file", server.url()),
+            &opts,
+            Credentials::new("user", Some("pass")),
+        )
+        .await?;
+
+        assert_eq!(downloaded, body);
+        part.assert_async().await;
         Ok(())
     }
 }

@@ -66,6 +66,7 @@ where
             disk_metadata.requires_basic_auth = instruction.requires_basic_auth();
             disk_metadata.use_server_time = instruction.use_server_time();
             disk_metadata.save_dir = instruction.save_dir().to_string_lossy().into_owned();
+            disk_metadata.drop_secret_headers();
             // Refresh the stored probe. Skipped when this instruction never
             // probed (`quick_evaluate`), so an older observation survives
             // rather than being replaced by nothing.
@@ -304,6 +305,41 @@ mod tests {
         assert_eq!(written.response_headers.len(), 1);
         assert_eq!(written.response_headers[0].value, "HIT");
         assert_eq!(written.response_headers_probed_at, Some(1_700_000_100));
+        Ok(())
+    }
+
+    /// Versions that stored request headers verbatim left sessions in
+    /// plaintext. The first resume after upgrading takes them out.
+    #[tokio::test]
+    async fn resume_scrubs_credentials_an_older_version_stored()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let tmp = tempfile::tempdir()?;
+        let save_dir = tempfile::tempdir()?;
+        let instruction = DownloadBuilder::default()
+            .download_dir(tmp.path().to_path_buf())
+            .save_dir(save_dir.path().to_path_buf())
+            .url(Url::parse("http://example.invalid/file")?)
+            .filename("file".to_string())
+            .size(Some(1024))
+            .is_resumable(true)
+            .max_connections(1)
+            .parts(Download::determine_parts(Some(1024), 1))
+            .build()?;
+
+        let mut on_disk = instruction.as_metadata();
+        on_disk
+            .headers
+            .insert("cookie".to_string(), "user_session=SECRET".to_string());
+        on_disk
+            .headers
+            .insert("referer".to_string(), "http://example.invalid/".to_string());
+        persist_metadata(&on_disk, &instruction).await?;
+
+        resolve_server_conflicts(&instruction, &RestartResolver, true).await?;
+
+        let written: DownloadMetadata =
+            read_delimited_message_from_path(&instruction.metadata_path()).await?;
+        assert_eq!(written.headers.keys().collect::<Vec<_>>(), ["referer"]);
         Ok(())
     }
 }
