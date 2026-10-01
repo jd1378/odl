@@ -1,5 +1,40 @@
 # Changelog
 
+## 3.3.1
+
+### A probe the server refuses for good fails on its first answer
+
+The evaluate probe retried every error, a `404` or `401` included, with the
+full backoff, and then reported it as a network error: exit 3, the class that
+tells a script or a GUI to try the whole job again. With the default retry
+settings that was four `HEAD` requests and two seconds to report what the
+first response had already said; with a larger retry budget it grew to
+minutes of reconnecting before a refusal that was never going to change.
+
+Part requests have classified their statuses since 2.0.1, and the probe now
+uses the same rules. `401`, `403` and `407` end it at once as
+`ServerConflict::CredentialsInvalid`, `404` and `410` as
+`ServerConflict::UrlBroken`, both exit 4; any other `4xx` ends it as a refusal
+not worth repeating, exit 1. `408`, `425`, `429` and `5xx` keep their retries
+and their retryable class, and a `Retry-After` on them is honoured as it is
+for parts.
+
+An embedder that matched `OdlError::Network` to recognise a dead link or
+rejected credentials at evaluate time now receives `OdlError::Conflict` for
+them, the same error a part request already produced.
+
+### A single-part download reports why it failed
+
+When the last part standing failed, the download ended with a generic "All
+parts failed" error and dropped the failure behind it. A single-part download
+is in that position from its first failure on, which covers small files,
+servers that do not serve ranges and `--max-connections 1`: a `404` exited 1
+instead of 4, and a `503` exited 1 instead of the retryable 3. The download
+now ends with the failure itself.
+
+The exit code tables in `odl --help` and the agent skill still put every HTTP
+status under exit 3; they now say which statuses land where.
+
 ## 3.3.0
 
 ### Credentials stay with the host they were given for
