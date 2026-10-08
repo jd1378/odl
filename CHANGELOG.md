@@ -100,6 +100,30 @@ It is now applied as soon as the loop is free.
 `ytdlp` engine, failed to compile: two helpers `odl update` needs were built
 only with `ytdlp`. It builds now, and every feature set passes clippy cleanly.
 
+### `-o` with a directory saves into it
+
+For a single URL, `-o` named the output file even when it named a directory.
+`odl <url> -o /downloads/` took `downloads` as the filename and tried to write
+a file over the directory, failing with an I/O error that did not say why. The
+agent skill documents that very call as the way to keep the server's filename.
+
+An existing directory, or a path ending in a separator, now names the folder to
+save into, under the server's filename, the way `cp` treats a directory. Any
+other path is still the file itself. On Unix a name ending in `\` is a file,
+since only the platform's own separators count.
+
+For a list of URLs, `-o` is the folder for every file, and an existing file
+there is now refused with exit 2 instead of failing later.
+
+Thanks to @Xxx91n for the report (#2) and the first take on a fix (#4).
+
+### Only `http` and `https` input is a URL
+
+Any input that parsed as a URL was downloaded as one. A Windows path such as
+`C:\urls.txt` parses as a URL with the scheme `c`, so a list of URLs given by
+its absolute path was fetched instead of read. Other schemes now go through as
+file paths, and input that is neither says so with exit 2.
+
 ## 3.3.1
 
 ### A probe the server refuses for good fails on its first answer
