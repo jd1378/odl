@@ -795,16 +795,8 @@ impl DownloadManager {
                 return Ok(final_path_recovery);
             }
 
-            // If the caller asked for more connections than the metadata
-            // was sealed with, statically subdivide unfinished parts so
-            // the downloader actually has more work to schedule in
-            // parallel. Decreases are intentionally ignored — shrinking
-            // would require merging parts (and their part files), which
-            // is more invasive than it's worth. A download the server will
-            // not serve in ranges stays whole no matter what was asked for:
-            // every extra part would be a request it answers from byte zero.
-            if metadata.is_resumable && opts.max_connections() > metadata.max_connections {
-                grow_parts(&instruction, &mut metadata, opts.max_connections()).await?;
+            if fit_parts_to_connections(&instruction, &mut metadata, opts.max_connections()).await?
+            {
                 persist_metadata(&metadata, &instruction).await?;
             }
 
@@ -979,16 +971,45 @@ impl DownloadManager {
     }
 }
 
+/// Set the connection limit this run starts from, and split unfinished parts
+/// until there are enough to keep that many connections busy. Returns
+/// whether the metadata changed.
+///
+/// The limit is the one asked for now, not the one the metadata was sealed
+/// with: a resumed download takes fewer connections as readily as more.
+/// Parts are never merged, so with fewer connections than parts the rest
+/// wait their turn. A download the server will not serve in ranges stays at
+/// one, since every extra connection would be a request it answers from
+/// byte zero.
+async fn fit_parts_to_connections(
+    instruction: &Download,
+    metadata: &mut crate::download_metadata::DownloadMetadata,
+    requested: u64,
+) -> Result<bool, OdlError> {
+    let limit = if metadata.is_resumable {
+        requested.max(1)
+    } else {
+        1
+    };
+    // Split here rather than leave it to the downloader: at rest every
+    // unfinished part is a candidate, where a running download only splits
+    // parts already on a connection.
+    let unfinished = metadata.parts.values().filter(|p| !p.finished).count() as u64;
+    let grew = unfinished < limit && grow_parts(instruction, metadata, limit).await?;
+    let changed = grew || metadata.max_connections != limit;
+    metadata.max_connections = limit;
+    Ok(changed)
+}
+
 /// Grow the unfinished-part set by subdividing the largest unfinished
 /// part whose remaining bytes can be split into two halves both at least
 /// `MIN_PART_SIZE` and cluster-aligned. Stops when `target` is reached or
-/// no candidate qualifies. Updates `metadata.max_connections` to the new
-/// part count when growth happened. Decreases are not handled here.
+/// no candidate qualifies. Returns whether any part was split.
 async fn grow_parts(
     instruction: &Download,
     metadata: &mut crate::download_metadata::DownloadMetadata,
     target: u64,
-) -> Result<(), OdlError> {
+) -> Result<bool, OdlError> {
     let target_n = target as usize;
 
     // Snapshot on-disk bytes per part once; we only subdivide each part
@@ -1013,6 +1034,7 @@ async fn grow_parts(
         on_disk.insert(ulid.clone(), size);
     }
 
+    let mut grew = false;
     loop {
         let unfinished_count = metadata.parts.values().filter(|p| !p.finished).count();
         if unfinished_count >= target_n {
@@ -1054,10 +1076,10 @@ async fn grow_parts(
             },
         );
         on_disk.insert(new_ulid, 0);
+        grew = true;
     }
 
-    metadata.max_connections = metadata.parts.len() as u64;
-    Ok(())
+    Ok(grew)
 }
 
 #[cfg(test)]
@@ -1152,10 +1174,9 @@ mod tests {
             ..Default::default()
         };
 
-        grow_parts(&instruction, &mut metadata, 4).await?;
+        assert!(grow_parts(&instruction, &mut metadata, 4).await?);
         let unfinished = metadata.parts.values().filter(|p| !p.finished).count();
         assert_eq!(unfinished, 4, "should grow to 4 unfinished parts");
-        assert_eq!(metadata.max_connections, 4);
         let total: u64 = metadata.parts.values().map(|p| p.size).sum();
         assert_eq!(total, large_size, "total coverage must not change");
         Ok(())
@@ -1206,8 +1227,97 @@ mod tests {
         };
 
         // Target == current → nothing changes.
-        grow_parts(&instruction, &mut metadata, 2).await?;
+        assert!(!grow_parts(&instruction, &mut metadata, 2).await?);
         assert_eq!(metadata.parts.len(), 2);
+        Ok(())
+    }
+
+    /// Metadata for `parts` laid end to end, each `(size, finished)`.
+    fn metadata_with_parts(
+        save_dir: &Path,
+        parts: &[(u64, bool)],
+        max_connections: u64,
+        is_resumable: bool,
+    ) -> crate::download_metadata::DownloadMetadata {
+        let mut map = HashMap::new();
+        let mut offset = 0;
+        for (i, &(size, finished)) in parts.iter().enumerate() {
+            let ulid = format!("p{i}");
+            map.insert(
+                ulid.clone(),
+                PartDetails {
+                    ulid,
+                    offset,
+                    size,
+                    finished,
+                },
+            );
+            offset += size;
+        }
+        crate::download_metadata::DownloadMetadata {
+            url: "http://example.invalid/x".to_string(),
+            filename: "dummy".to_string(),
+            save_dir: save_dir.to_string_lossy().into_owned(),
+            is_resumable,
+            size: Some(offset),
+            max_connections,
+            parts: map,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_splits_when_fewer_parts_are_left_than_connections()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempdir()?;
+        let instruction = build_dummy_instruction(tmp.path());
+        // Sealed with the same four connections asked for now, three parts
+        // since finished.
+        let size = Download::MIN_PART_SIZE * 16;
+        let mut metadata = metadata_with_parts(
+            tmp.path(),
+            &[(size, true), (size, true), (size, true), (size, false)],
+            4,
+            true,
+        );
+
+        assert!(fit_parts_to_connections(&instruction, &mut metadata, 4).await?);
+        let unfinished = metadata.parts.values().filter(|p| !p.finished).count();
+        assert_eq!(unfinished, 4);
+        // The limit asked for, not the seven parts now on record.
+        assert_eq!(metadata.max_connections, 4);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resume_takes_fewer_connections_without_merging_parts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempdir()?;
+        let instruction = build_dummy_instruction(tmp.path());
+        let size = Download::MIN_PART_SIZE * 16;
+        let mut metadata = metadata_with_parts(tmp.path(), &[(size, false); 8], 8, true);
+
+        assert!(fit_parts_to_connections(&instruction, &mut metadata, 2).await?);
+        assert_eq!(metadata.max_connections, 2);
+        assert_eq!(metadata.parts.len(), 8);
+
+        // Already fitted: nothing to persist.
+        assert!(!fit_parts_to_connections(&instruction, &mut metadata, 2).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resume_keeps_one_connection_without_ranges() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let tmp = tempdir()?;
+        let instruction = build_dummy_instruction(tmp.path());
+        let size = Download::MIN_PART_SIZE * 16;
+        // `from_response_info` records the request even when ranges are off.
+        let mut metadata = metadata_with_parts(tmp.path(), &[(size, false)], 8, false);
+
+        assert!(fit_parts_to_connections(&instruction, &mut metadata, 8).await?);
+        assert_eq!(metadata.max_connections, 1);
+        assert_eq!(metadata.parts.len(), 1);
         Ok(())
     }
 
