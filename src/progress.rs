@@ -575,14 +575,9 @@ pub(crate) fn speed_window_rate(
     Some(b1.saturating_sub(b0) as f64 / dt)
 }
 
-/// Internal aggregate progress tracker used by the downloader to drive
-/// dynamic-split decisions without depending on tracing-indicatif.
-///
-/// Tracks bytes downloaded since `started_at`, plus an optional total
-/// byte count. ETA is `(total - downloaded) / rate`, where `rate` is the
-/// average over the elapsed window.
+/// Internal aggregate byte count for one run of the downloader, read by the
+/// speed sampler. Starts with what is already on disk.
 pub(crate) struct ProgressTracker {
-    started_at: Instant,
     downloaded: std::sync::atomic::AtomicU64,
     total: std::sync::atomic::AtomicU64, // 0 means unknown
 }
@@ -590,7 +585,6 @@ pub(crate) struct ProgressTracker {
 impl ProgressTracker {
     pub fn new(total: Option<u64>) -> Self {
         Self {
-            started_at: Instant::now(),
             downloaded: std::sync::atomic::AtomicU64::new(0),
             total: std::sync::atomic::AtomicU64::new(total.unwrap_or(0)),
         }
@@ -610,37 +604,5 @@ impl ProgressTracker {
     pub fn total(&self) -> Option<u64> {
         let t = self.total.load(std::sync::atomic::Ordering::Relaxed);
         if t == 0 { None } else { Some(t) }
-    }
-
-    #[allow(dead_code)]
-    pub fn set_total(&self, total: Option<u64>) {
-        self.total
-            .store(total.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
-    }
-
-    pub fn elapsed(&self) -> std::time::Duration {
-        self.started_at.elapsed()
-    }
-
-    /// Estimated time to completion. `Duration::ZERO` when unknown.
-    pub fn eta(&self) -> std::time::Duration {
-        let Some(total) = self.total() else {
-            return std::time::Duration::ZERO;
-        };
-        let downloaded = self.downloaded();
-        if downloaded == 0 || downloaded >= total {
-            return std::time::Duration::ZERO;
-        }
-        let elapsed = self.elapsed().as_secs_f64();
-        if elapsed <= 0.0 {
-            return std::time::Duration::ZERO;
-        }
-        let rate = downloaded as f64 / elapsed;
-        if rate <= 0.0 {
-            return std::time::Duration::ZERO;
-        }
-        let remaining = (total - downloaded) as f64;
-        std::time::Duration::try_from_secs_f64(remaining / rate)
-            .unwrap_or(std::time::Duration::ZERO)
     }
 }

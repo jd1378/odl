@@ -48,19 +48,14 @@ use crate::{
 /// changes.
 const SPEED_WINDOW: Duration = Duration::from_millis(1500);
 
-/// Minimum chunk size we keep on a single task before attempting another split.
+/// Smallest half a running part is split into.
+///
+/// The split decision rests on sizes alone. A part's remaining bytes only
+/// shrink, so a part too small to split now never qualifies later, and the
+/// moments capacity frees up (a part ends or is handed back, the run starts,
+/// the limit changes) are the only ones a split can become possible: the
+/// run loop already wakes for each, and needs nothing on a clock.
 const MIN_DYNAMIC_SPLIT_SIZE: u64 = 3 * 1024 * 1024; // 3 MB
-/// Minimum eta needed for dynamic split to happen. any eta less than this will skip creating more chunks
-/// as it will be inefficient
-#[cfg(not(test))]
-const MIN_DYNAMIC_SPLIT_ETA: Duration = Duration::from_secs(60);
-#[cfg(test)]
-const MIN_DYNAMIC_SPLIT_ETA: Duration = Duration::from_secs(0);
-
-#[cfg(not(test))]
-const MIN_DYNAMIC_SPLIT_ELAPSED: Duration = Duration::from_secs(15);
-#[cfg(test)]
-const MIN_DYNAMIC_SPLIT_ELAPSED: Duration = Duration::from_millis(0);
 
 /// Controls staggered opening of new connections. Some servers cap
 /// sudden bursts of simultaneous connections per IP, dropping or
@@ -913,15 +908,6 @@ impl Downloader {
         &self,
         candidate: &SplitCandidate,
     ) -> Result<Option<(PartDetails, u64)>, OdlError> {
-        // If estimated time to finish entire download is <= 60s,
-        // Or if elapsed time is under 15 seconds
-        // avoid splitting as it will be inefficient
-        if self.tracker.elapsed() <= MIN_DYNAMIC_SPLIT_ELAPSED
-            || self.tracker.eta() <= MIN_DYNAMIC_SPLIT_ETA
-        {
-            return Ok(None);
-        }
-
         let downloaded = candidate.controller.downloaded();
         let current_limit = candidate.controller.limit();
         // Shared split geometry: cluster-aligned boundary at roughly the
@@ -2125,13 +2111,6 @@ mod tests {
             FixedThenExponentialRetry::default(),
             DownloadContext::new(),
         );
-        // Seed tracker so it has computable ETA: pretend we made some progress.
-        downloader.tracker.set_total(Some(120_000));
-        downloader.tracker.advance(1);
-        // give tracker a tiny moment to record elapsed time so ETA can be computed
-        time::sleep(Duration::from_millis(100)).await;
-        assert!(downloader.tracker.eta() > MIN_DYNAMIC_SPLIT_ETA);
-
         let controller = Arc::new(PartController::new(original_size, 0));
         let candidate = SplitCandidate {
             ulid: "orig".to_string(),
