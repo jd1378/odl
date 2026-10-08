@@ -1,5 +1,99 @@
 # Changelog
 
+## Unreleased
+
+### A running download's speed limit can change
+
+The speed limit was fixed when a download started; the connection count was
+the only setting a running download would take. Changing the speed meant
+stopping and restarting the transfer, which drops every connection and starts
+over on a server that cannot resume.
+
+`LiveControls::set_speed_limit(Option<u64>)` changes it mid-run. `None` or
+`Some(0)` lifts it. A raised or lifted limit reaches the transfer within about
+100 ms, and a lowered one applies from the next chunk, with no burst of what
+was saved up under the old rate.
+
+The value is an override on top of the options, not a copy of them: odl never
+writes it, so whatever was set last is in force, before the start, during the
+probe, or across a restart. It stays for every later run the same controls are
+attached to, until `LiveControls::clear_speed_limit` hands the decision back
+to the options.
+
+For an embedder that layers its own settings, such as a per-download override
+over a global limit: work out the limit that applies and pass it to
+`set_speed_limit` whenever any layer changes. Calling `clear_speed_limit` when
+the per-download override is removed is not the same thing. It falls back to
+the options the run started with, which already contain the override that was
+just removed.
+
+A download delegated to yt-dlp takes its limit from the options when the tool
+starts. The limit is on its command line, and these controls do not reach it.
+
+### `ProgressEvent::ConnectionLimitChanged`
+
+The connection limit could change without the caller being told. odl lowers it
+by one when a part fails, to suit a server that turns parallel connections
+away. The built-in downloader now sends the limit in force when the transfer
+starts, and again whenever it changes, whether the caller set it or odl lowered
+it. A run never sends the same value twice in a row. It is a limit, not a count:
+fewer connections are open while the download ramps up, or when fewer parts
+are left than the limit allows.
+
+Show this value rather than the last one you set. The CLI's NDJSON stream
+leaves the event out, as it does every event it has not documented.
+
+### `LiveControls::clear_max_connections`
+
+`set_max_connections(0)` means one connection, not "unset", and the downloader
+seeds the limit only while it is unset. Controls kept across runs, one set per
+job for example, therefore carried the first value they held into every later
+run, along with any lowering odl did after failed parts. Nothing could return
+them to the download's own limit.
+
+`clear_max_connections` unsets the limit. A running download goes back to the
+connections it was asked for, and so does every later run the controls are
+attached to. An embedder that keeps controls across runs should call it when a
+per-download connection override is removed, rather than passing `0`, and at
+the start of each run of a download that has no override, so lowering left over
+from an earlier run does not carry on.
+
+### Dynamic split uses connections as soon as they are free
+
+The runtime splitter refused for the first 15 seconds of a run, and whenever
+the whole download's estimated time left was under a minute. A refusal was
+never revisited until another part finished. On a resume the estimate counted
+bytes already on disk as if this run had fetched them, so it read seconds
+where minutes were left, and a resumed download hardly ever split.
+
+Size alone decides now: a running part splits when it has at least 3 MB left
+for each half, the floor it already had, in the manner of aria2's
+`--min-split-size`. Connections that free up are put to work at once, from the
+start of a run on. Splits near the end of a fast download, which the estimate
+used to rule out, now happen; each costs one more request.
+
+### A resume takes the connections asked for now
+
+A resume split unfinished parts only when more connections were asked for than
+the download was started with, and then recorded the part count, finished
+parts included, as its limit. One started with four connections that resumed
+with a single part left was not split; one that was split could record and
+open seven connections where four were asked for. A lower request on resume
+was ignored.
+
+The limit is now the one asked for, or one for a server that does not serve
+ranges, and unfinished parts are split whenever fewer are left than that. Parts
+are never merged: with fewer connections than parts, the rest wait their turn.
+`Download::max_connections`, and `max_connections` in the stored metadata, now
+hold that limit rather than a part count.
+
+### A connection change made while odl is busy applies at once
+
+The run loop learned of a new connection limit only while it was waiting for
+one. A change made while it was busy, such as opening a ramp-up batch or
+waiting out the delay before the next, went unnoticed until a part next ended.
+It is now applied as soon as the loop is free.
+
 ## 3.3.1
 
 ### A probe the server refuses for good fails on its first answer
