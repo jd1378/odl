@@ -122,6 +122,9 @@ pub struct Downloader {
     /// notifying — this flips false and the ramp falls back to a
     /// strict one-at-a-time, probe-gated cadence.
     ramp_armed: std::sync::atomic::AtomicBool,
+    /// The connection limit this download was asked for, which cleared
+    /// `ctx.live` controls fall back to.
+    requested_connections: usize,
     /// Last limit sent as `ConnectionLimitChanged`; `0` before the first.
     reported_connection_limit: AtomicUsize,
 }
@@ -139,11 +142,11 @@ impl Downloader {
         retry_policy: FixedThenExponentialRetry,
         ctx: DownloadContext,
     ) -> Self {
-        let concurrency_limit = metadata.max_connections as usize;
+        let requested_connections = (metadata.max_connections as usize).max(1);
         // Seed the live cap from metadata when the caller hasn't set
         // anything yet. A caller that pre-set `ctx.live.set_max_connections`
         // before download wins (seed_if_unset is a no-op when non-zero).
-        ctx.live.seed_if_unset(concurrency_limit.max(1));
+        ctx.live.seed_if_unset(requested_connections);
         // Built even without a limit: `ctx.live` can impose one mid-run.
         let speed_limiter = Arc::new(BandwidthLimiter::new(ctx.live.clone(), speed_limit));
         let total = metadata.size;
@@ -177,6 +180,7 @@ impl Downloader {
             tracker,
             active_parts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             ramp_armed: std::sync::atomic::AtomicBool::new(true),
+            requested_connections,
             reported_connection_limit: AtomicUsize::new(0),
         }
     }
@@ -471,15 +475,11 @@ impl Downloader {
         last_failure: &mut Option<OdlError>,
         stalls: &mut HashMap<String, StallWatch>,
     ) -> Result<(), OdlError> {
-        if self.ctx.live.max_connections() == 0 {
-            return Ok(());
-        }
-
         self.ensure_pending_pool(pending, active).await?;
 
         if !self.rampup.enabled {
             // Legacy single-shot fill: open everything at once.
-            while active.len() < self.ctx.live.max_connections() {
+            while active.len() < self.connection_limit() {
                 let Some(part) = pending.pop_front() else {
                     return Ok(());
                 };
@@ -505,8 +505,8 @@ impl Downloader {
             1
         };
         loop {
-            let cap = self.ctx.live.max_connections();
-            if cap == 0 || active.len() >= cap {
+            let cap = self.connection_limit();
+            if active.len() >= cap {
                 return Ok(());
             }
 
@@ -586,7 +586,7 @@ impl Downloader {
                 return Ok(());
             }
 
-            if pending.is_empty() || active.len() >= self.ctx.live.max_connections() {
+            if pending.is_empty() || active.len() >= self.connection_limit() {
                 return Ok(());
             }
 
@@ -601,10 +601,16 @@ impl Downloader {
         }
     }
 
+    /// The connection limit in force. Controls cleared mid-run fall back to
+    /// the one this download was asked for, as the next run would.
+    fn connection_limit(&self) -> usize {
+        self.ctx.live.seed_if_unset(self.requested_connections)
+    }
+
     /// Send `ConnectionLimitChanged` if the limit moved since it was last
     /// sent. Called wherever it may have moved.
     fn report_connection_limit(&self) {
-        let limit = self.ctx.live.max_connections();
+        let limit = self.connection_limit();
         if self.reported_connection_limit.swap(limit, Ordering::SeqCst) != limit {
             self.ctx.emit(ProgressEvent::ConnectionLimitChanged {
                 max_connections: limit,
@@ -620,8 +626,8 @@ impl Downloader {
     /// progress is lost — partial bytes stay on disk and the controller is
     /// rebuilt from disk size on reschedule.
     fn apply_live_cap(&self, active: &mut HashMap<String, ActiveTask>) {
-        let cap = self.ctx.live.max_connections();
-        if cap == 0 || active.len() <= cap {
+        let cap = self.connection_limit();
+        if active.len() <= cap {
             return;
         }
         let surplus = active.len() - cap;
@@ -771,7 +777,7 @@ impl Downloader {
     ) -> Result<(), OdlError> {
         // Only attempt to create enough pending parts to fill the spare capacity
         // (i.e. `live.max_connections() - active.len()`)
-        let spare_capacity = self.ctx.live.max_connections().saturating_sub(active.len());
+        let spare_capacity = self.connection_limit().saturating_sub(active.len());
         if !self.dynamic_split {
             return Ok(());
         }
@@ -2076,6 +2082,10 @@ mod tests {
         assert_eq!(ctx.live.max_connections(), 1);
         ctx.live.set_max_connections(6);
         assert_eq!(ctx.live.max_connections(), 6);
+        // cleared, the next seed takes again
+        ctx.live.clear_max_connections();
+        assert_eq!(ctx.live.max_connections(), 0);
+        assert_eq!(ctx.live.seed_if_unset(8), 8);
     }
 
     #[tokio::test]
@@ -2923,6 +2933,42 @@ mod tests {
         limits.extend(connection_limits(&mut rx));
         assert_eq!(limits.first(), Some(&3), "{limits:?}");
         assert!(limits.windows(2).all(|w| w[0] > w[1]), "{limits:?}");
+        server_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cleared_connection_limit_falls_back_to_the_request() {
+        let (addr, _counter, server_task) = spawn_hanging_http_server().await;
+        let (_instruction, mut downloader, _tmp) =
+            build_rampup_test_downloader(addr, 3, RampupConfig::disabled()).await;
+        let (reporter, mut rx) = crate::progress::channel_reporter();
+        downloader.ctx.reporter = reporter;
+        // Left over from an earlier run, as controls a caller keeps would be.
+        let live = downloader.ctx.live.clone();
+        live.set_max_connections(1);
+        let cancel = downloader.ctx.cancel.clone();
+        let active_parts = Arc::clone(&downloader.active_parts);
+        let dl_task = tokio::spawn(async move {
+            let _ = downloader.run().await;
+        });
+
+        let mut limits = Vec::new();
+        wait_for("leftover limit reported", Duration::from_secs(5), || {
+            limits.extend(connection_limits(&mut rx));
+            !limits.is_empty()
+        })
+        .await;
+        live.clear_max_connections();
+
+        wait_for("all three parts open", Duration::from_secs(5), || {
+            active_parts.lock().unwrap().len() == 3
+        })
+        .await;
+        cancel.cancel();
+        let _ = dl_task.await;
+        limits.extend(connection_limits(&mut rx));
+        assert_eq!(limits, vec![1, 3]);
+        assert_eq!(live.max_connections(), 3);
         server_task.abort();
     }
 }

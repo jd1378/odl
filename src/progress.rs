@@ -351,7 +351,7 @@ impl ProgressReporter for AsyncReporter {
 /// queue and resume later as capacity frees up.
 ///
 /// A fresh instance reports `max_connections() == 0` (unset); the
-/// downloader seeds it from `metadata.max_connections` on first run.
+/// downloader seeds it with the connections the download was asked for.
 ///
 /// Both knobs reach downloads odl transfers itself. One delegated to
 /// `yt-dlp` takes its settings from the options when the tool starts.
@@ -378,7 +378,8 @@ impl LiveControls {
         Self::default()
     }
 
-    /// Set the desired number of live connections. `0` is clamped to `1`.
+    /// Set the desired number of live connections. `0` is clamped to `1`;
+    /// [`clear_max_connections`](Self::clear_max_connections) unsets it.
     /// Effective on a running download as soon as the run loop observes
     /// the notification (next iteration).
     pub fn set_max_connections(&self, n: usize) {
@@ -386,10 +387,20 @@ impl LiveControls {
         self.inner.notify.notify_waiters();
     }
 
-    /// Current live-connection target. `0` means unset (downloader will
-    /// seed from `metadata.max_connections` on first run).
+    /// Current live-connection target. `0` means unset (the downloader
+    /// seeds it with the connections the download was asked for).
     pub fn max_connections(&self) -> usize {
         self.inner.max_connections.load(Ordering::SeqCst)
+    }
+
+    /// Forget the limit set through
+    /// [`set_max_connections`](Self::set_max_connections), along with any
+    /// lowering odl did after failed parts. A running download goes back to
+    /// the connections it was asked for, as does every later run these
+    /// controls are attached to.
+    pub fn clear_max_connections(&self) {
+        self.inner.max_connections.store(0, Ordering::SeqCst);
+        self.inner.notify.notify_waiters();
     }
 
     /// Atomically initialize the cap if still unset; returns the post-call
