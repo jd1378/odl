@@ -1458,30 +1458,35 @@ fn determine_download_type(args: &Args) -> Result<DownloadType, OdlError> {
             .to_string(),
     })?;
 
-    Ok(match Url::parse(input) {
-        Ok(url) => {
-            if args.remote_list {
-                DownloadType::FileAtUrl(url)
-            } else {
-                DownloadType::Url(url)
-            }
-        }
-        Err(_) => {
-            let path = PathBuf::from(input);
-            if path.try_exists()? {
-                if args.remote_list {
-                    return Err(OdlError::CliError {
-                        message: "Expected input to be a Url, found file path instead".to_string(),
-                    });
-                }
-                DownloadType::File(Box::new(path))
-            } else {
-                return Err(OdlError::CliError {
-                    message: "Input is not a valid Url or a valid file path. Check file permissions if file exists.".to_string(),
-                });
-            }
-        }
-    })
+    if let Some(url) = download_url(input) {
+        return Ok(if args.remote_list {
+            DownloadType::FileAtUrl(url)
+        } else {
+            DownloadType::Url(url)
+        });
+    }
+
+    let path = PathBuf::from(input);
+    if !path.try_exists()? {
+        return Err(OdlError::CliError {
+            message: "Input is neither an http(s) URL nor an existing file. Check file permissions if the file exists.".to_string(),
+        });
+    }
+    if args.remote_list {
+        return Err(OdlError::CliError {
+            message: "Expected input to be a Url, found file path instead".to_string(),
+        });
+    }
+    Ok(DownloadType::File(Box::new(path)))
+}
+
+/// `input` as a URL to download from. Only `http` and `https` count: a
+/// Windows path such as `C:\urls.txt` parses as a URL with the scheme `c`,
+/// and would be fetched instead of read.
+fn download_url(input: &str) -> Option<Url> {
+    Url::parse(input)
+        .ok()
+        .filter(|url| matches!(url.scheme(), "http" | "https"))
 }
 
 struct ForcedResolver;
@@ -2336,4 +2341,23 @@ async fn run_status(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::download_url;
+
+    #[test]
+    fn download_url_takes_only_http_and_https() {
+        assert!(download_url("https://example.com/file.zip").is_some());
+        assert!(download_url("http://example.com/file.zip").is_some());
+        assert!(download_url("ftp://example.com/file.zip").is_none());
+        assert!(download_url("urls.txt").is_none());
+    }
+
+    #[test]
+    fn download_url_leaves_a_windows_path_to_be_read() {
+        assert!(download_url(r"C:\urls.txt").is_none());
+        assert!(download_url("D:/lists/urls.txt").is_none());
+    }
 }
