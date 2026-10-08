@@ -1,6 +1,8 @@
 //! `--ascii-filenames` end to end: the name odl actually writes to disk is the
 //! transliterated one, and the default is left byte-identical.
 
+#![cfg(feature = "cli")]
+
 use std::process::{Command, Stdio};
 
 const BODY: &[u8] = b"ascii filename test payload";

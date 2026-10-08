@@ -2,6 +2,8 @@
 //! binary against a mock HTTP server and assert the documented exit codes
 //! (0 on match, 4 on mismatch, 2 on malformed input).
 
+#![cfg(feature = "cli")]
+
 use std::process::{Command, Stdio};
 
 use sha2::{Digest, Sha256};

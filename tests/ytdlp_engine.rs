@@ -5,7 +5,7 @@
 //! extraction, format pinning, progress parsing, the final move, resume, and
 //! the conflict rules — testable without a network or an installed yt-dlp.
 
-#![cfg(all(unix, feature = "ytdlp"))]
+#![cfg(all(unix, feature = "ytdlp", feature = "cli"))]
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};

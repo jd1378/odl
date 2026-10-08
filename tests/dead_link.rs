@@ -11,6 +11,8 @@
 //! These tests hold connections open deliberately and assert that odl gives
 //! up on its own.
 
+#![cfg(feature = "cli")]
+
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};

@@ -3,6 +3,8 @@
 //! error page, or the whole file where a slice was requested — because both
 //! used to be written into the part file and completed with a zero exit code.
 
+#![cfg(feature = "cli")]
+
 use std::process::{Command, Stdio};
 
 /// Large enough to be split across several parts (`MIN_PART_SIZE` is 300 KB),

@@ -6,6 +6,8 @@
 //! `Retry-After` — which a UI can phrase differently and a caller cannot
 //! shorten.
 
+#![cfg(feature = "cli")]
+
 use std::process::{Command, Stdio};
 use std::time::Instant;
 

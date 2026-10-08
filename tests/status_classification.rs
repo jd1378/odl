@@ -7,6 +7,8 @@
 //! reports a retryable error class, which invites whatever runs odl to do it
 //! all again.
 
+#![cfg(feature = "cli")]
+
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 

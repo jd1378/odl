@@ -9,7 +9,7 @@
 //! That matters beyond the exit code: a caller that auto-retries failures
 //! would restart a job the user just paused.
 
-#![cfg(unix)]
+#![cfg(all(unix, feature = "cli"))]
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
