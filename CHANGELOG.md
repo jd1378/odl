@@ -124,6 +124,24 @@ Any input that parsed as a URL was downloaded as one. A Windows path such as
 its absolute path was fetched instead of read. Other schemes now go through as
 file paths, and input that is neither says so with exit 2.
 
+### Long filenames download on Windows
+
+A download whose filename ran to a couple of hundred characters, such as a
+PlantUML link that carries the whole diagram in its path, failed on Windows
+with `os error 3` before any byte arrived. Its work directory is named after
+the file, and that put `metadata.pb` past the 260 characters Win32 allows a
+path without the `\\?\` prefix. Creating the directory worked, because std
+adds that prefix itself; the atomic rename that writes the metadata did not,
+since the `atomicwrites` crate passed the path to Windows as given.
+
+odl now does that rename itself, with the same guarantees: on Unix the rename
+and the directory syncs act on the same open directories, and on Windows the
+move is still written through to disk before it returns. The `atomicwrites`
+dependency is gone. Work directories keep their names, so downloads in
+progress resume as before.
+
+Thanks to @Xxx91n for the detailed report (#3).
+
 ## 3.3.1
 
 ### A probe the server refuses for good fails on its first answer
