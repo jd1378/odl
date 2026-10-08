@@ -647,7 +647,6 @@ pub(super) use imp::{bytes_on_disk, planned_engine, process, try_evaluate};
 mod tests {
     use super::*;
     use crate::download::YtdlpSpec;
-    use crate::download_metadata::{DownloadMetadata, EngineDetails, YtdlpDetails};
     use crate::format::Quality;
 
     fn instruction(source: &str, format: &str) -> Download {
@@ -714,6 +713,7 @@ mod tests {
     #[cfg(feature = "ytdlp")]
     mod continuation {
         use super::*;
+        use crate::download_metadata::{DownloadMetadata, EngineDetails, YtdlpDetails};
 
         fn metadata_for(source: &str, format: &str) -> DownloadMetadata {
             metadata_with_id(source, format, "")

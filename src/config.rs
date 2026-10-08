@@ -875,6 +875,7 @@ impl DownloadOptions {
     /// `yt-dlp` reads `HTTP_PROXY` and friends from the environment it
     /// inherits, so "no proxy" cannot be expressed by passing nothing: the
     /// empty string is its own spelling of a direct connection.
+    #[cfg(feature = "ytdlp")]
     pub(crate) fn proxy_process_arg(&self) -> Option<&str> {
         if self.no_proxy {
             return Some("");
@@ -1093,6 +1094,7 @@ M-Header = "m"
         assert!(opts.proxy_client_setting().is_none());
         // yt-dlp reads the environment on its own, so "direct" has to be said
         // out loud rather than left unsaid.
+        #[cfg(feature = "ytdlp")]
         assert_eq!(opts.proxy_process_arg(), Some(""));
     }
 
@@ -1104,6 +1106,7 @@ M-Header = "m"
             .expect("builds");
         assert_eq!(opts.proxy(), Some("http://127.0.0.1:8080"));
         assert!(opts.proxy_client_setting().is_some());
+        #[cfg(feature = "ytdlp")]
         assert_eq!(opts.proxy_process_arg(), Some("http://127.0.0.1:8080"));
     }
 
@@ -1112,6 +1115,7 @@ M-Header = "m"
         let opts: DownloadOptions =
             toml::from_str("proxy = \"http://127.0.0.1:8080\"\nno_proxy = true\n").expect("parse");
         assert!(opts.proxy_client_setting().is_none());
+        #[cfg(feature = "ytdlp")]
         assert_eq!(opts.proxy_process_arg(), Some(""));
     }
 
