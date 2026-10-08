@@ -17,7 +17,7 @@
 //! from the receiver in a long-running task.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
@@ -333,23 +333,34 @@ impl ProgressReporter for AsyncReporter {
     }
 }
 
-/// Runtime knob to change the number of live connections of a running
-/// download. Cheap to clone (single `Arc` inside). Increases let the
-/// downloader split unfinished parts to fill the new capacity (subject to
-/// `dynamic_split`). Decreases cancel surplus in-flight parts; their
-/// remaining bytes go back to the pending queue and resume later as
-/// capacity frees up.
+/// Runtime knobs for a running download: its number of live connections
+/// and its speed limit. Cheap to clone (single `Arc` inside).
+///
+/// Connection count increases let the downloader split unfinished parts to
+/// fill the new capacity (subject to `dynamic_split`). Decreases cancel
+/// surplus in-flight parts; their remaining bytes go back to the pending
+/// queue and resume later as capacity frees up.
 ///
 /// A fresh instance reports `max_connections() == 0` (unset); the
 /// downloader seeds it from `metadata.max_connections` on first run.
+///
+/// Both knobs reach downloads odl transfers itself. One delegated to
+/// `yt-dlp` takes its settings from the options when the tool starts.
 #[derive(Clone, Default)]
 pub struct LiveControls {
     inner: Arc<LiveControlsInner>,
 }
 
+/// `LiveControlsInner::speed_limit` when no override is set.
+const SPEED_LIMIT_UNSET: u64 = 0;
+/// `LiveControlsInner::speed_limit` when the override is "no limit".
+const SPEED_LIMIT_NONE: u64 = u64::MAX;
+
 #[derive(Default)]
 struct LiveControlsInner {
     max_connections: AtomicUsize,
+    /// Bytes per second, or one of the `SPEED_LIMIT_*` markers.
+    speed_limit: AtomicU64,
     notify: Notify,
 }
 
@@ -398,12 +409,50 @@ impl LiveControls {
     pub(crate) fn notified(&self) -> tokio::sync::futures::Notified<'_> {
         self.inner.notify.notified()
     }
+
+    /// Cap the download at `limit` bytes per second, or lift any cap with
+    /// `None`; `Some(0)` also means no cap. Applies to a running download
+    /// within about 100 ms, and to every later run these controls are
+    /// attached to, ahead of the speed limit in the download's options,
+    /// until [`clear_speed_limit`](Self::clear_speed_limit).
+    pub fn set_speed_limit(&self, limit: Option<u64>) {
+        let stored = match limit {
+            Some(0) | None => SPEED_LIMIT_NONE,
+            Some(n) => n,
+        };
+        self.inner.speed_limit.store(stored, Ordering::SeqCst);
+    }
+
+    /// Drop the override set by [`set_speed_limit`](Self::set_speed_limit):
+    /// the download goes back to the speed limit in its options.
+    pub fn clear_speed_limit(&self) {
+        self.inner
+            .speed_limit
+            .store(SPEED_LIMIT_UNSET, Ordering::SeqCst);
+    }
+
+    /// The speed limit in force when the download's options say `options`:
+    /// the override if one is set, `options` otherwise.
+    pub(crate) fn speed_limit_over(&self, options: Option<u64>) -> Option<u64> {
+        match self.inner.speed_limit.load(Ordering::SeqCst) {
+            SPEED_LIMIT_UNSET => options,
+            SPEED_LIMIT_NONE => None,
+            n => Some(n),
+        }
+    }
 }
 
 impl std::fmt::Debug for LiveControls {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let stored = self.inner.speed_limit.load(Ordering::SeqCst);
+        let speed_limit: &dyn std::fmt::Debug = match stored {
+            SPEED_LIMIT_UNSET => &"unset",
+            SPEED_LIMIT_NONE => &"none",
+            _ => &stored,
+        };
         f.debug_struct("LiveControls")
             .field("max_connections", &self.max_connections())
+            .field("speed_limit", &speed_limit)
             .finish()
     }
 }
@@ -419,8 +468,8 @@ pub struct DownloadContext {
     /// Optional URL the GUI knows this context by. Reporters that
     /// multiplex many downloads onto one channel use this to disambiguate.
     pub url: Option<Url>,
-    /// Live knobs (currently: connection count). Clone and call
-    /// `set_max_connections` on it mid-download to grow or shrink.
+    /// Live knobs: connection count and speed limit. Clone and call
+    /// `set_max_connections` or `set_speed_limit` on it mid-download.
     pub live: LiveControls,
 }
 

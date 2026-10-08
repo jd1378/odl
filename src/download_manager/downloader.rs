@@ -26,8 +26,8 @@ use ulid::Ulid;
 use prost::Message;
 
 use crate::progress::{
-    DownloadContext, ProgressEvent, ProgressTracker, SAMPLE_INTERVAL, speed_window_rate,
-    trim_speed_window,
+    DownloadContext, LiveControls, ProgressEvent, ProgressTracker, SAMPLE_INTERVAL,
+    speed_window_rate, trim_speed_window,
 };
 use crate::retry_policies::{
     FixedThenExponentialRetry, StatusVerdict, classify_status, retry_after, wait_for_retry,
@@ -110,7 +110,7 @@ pub struct Downloader {
     /// Whether to attempt mid-flight subdivision of long-running parts.
     dynamic_split: bool,
     rampup: RampupConfig,
-    speed_limiter: Option<Arc<BandwidthLimiter>>,
+    speed_limiter: Arc<BandwidthLimiter>,
     retry_policy: FixedThenExponentialRetry,
     persist_mutex: Arc<Mutex<()>>,
     ctx: DownloadContext,
@@ -147,9 +147,8 @@ impl Downloader {
         // anything yet. A caller that pre-set `ctx.live.set_max_connections`
         // before download wins (seed_if_unset is a no-op when non-zero).
         ctx.live.seed_if_unset(concurrency_limit.max(1));
-        let speed_limiter = speed_limit
-            .filter(|limit| *limit > 0)
-            .map(|limit| Arc::new(BandwidthLimiter::new(limit)));
+        // Built even without a limit: `ctx.live` can impose one mid-run.
+        let speed_limiter = Arc::new(BandwidthLimiter::new(ctx.live.clone(), speed_limit));
         let total = metadata.size;
         let tracker = Arc::new(ProgressTracker::new(total));
         // seed tracker with bytes already on disk for parts marked finished
@@ -1068,8 +1067,16 @@ enum PartEvent {
     },
 }
 
+/// Longest a waiter sleeps before reading the rate again, which bounds how
+/// long a raised or lifted limit takes to reach it.
+const LIMITER_MAX_WAIT: Duration = Duration::from_millis(100);
+
+/// Token bucket shared by every part of a download. The rate is read on
+/// each pass, so a limit changed through `LiveControls` applies mid-run.
 struct BandwidthLimiter {
-    rate: f64,
+    live: LiveControls,
+    /// The limit from the download's options, used while `live` has none.
+    options: Option<u64>,
     state: std::sync::Mutex<LimiterState>,
     seq: AtomicU64,
 }
@@ -1102,12 +1109,20 @@ impl Drop for QueueGuard<'_> {
 }
 
 impl BandwidthLimiter {
-    fn new(bytes_per_second: u64) -> Self {
-        let rate = bytes_per_second.max(1) as f64;
+    fn new(live: LiveControls, options: Option<u64>) -> Self {
+        // Zero means no limit, as it does for the override. Taken as a
+        // rate it would hand out nothing and spin `acquire` forever.
+        let options = options.filter(|limit| *limit > 0);
+        // Full when a limit applies from the start. One imposed later finds
+        // it refilled across the unlimited stretch.
+        let available = live
+            .speed_limit_over(options)
+            .map_or(0.0, |rate| rate as f64);
         Self {
-            rate,
+            live,
+            options,
             state: std::sync::Mutex::new(LimiterState {
-                available: rate,
+                available,
                 last_refill: Instant::now(),
                 queue: VecDeque::new(),
             }),
@@ -1115,22 +1130,33 @@ impl BandwidthLimiter {
         }
     }
 
+    /// Bytes per second, or `None` while unlimited.
+    fn rate(&self) -> Option<u64> {
+        self.live.speed_limit_over(self.options)
+    }
+
+    fn is_limited(&self) -> bool {
+        self.rate().is_some()
+    }
+
     /// Acquire `amount` tokens, blocking via async sleeps until granted.
-    /// Requests larger than the bucket capacity are split into rate-sized
-    /// sub-acquires so an oversized chunk never deadlocks against the
-    /// `available <= rate` cap.
+    /// Taken at most one bucket (a second at the current rate) at a time,
+    /// so a chunk larger than the bucket, or one the limit is lowered
+    /// under while it waits, never waits for more than the bucket holds.
     async fn acquire(&self, amount: u64) {
-        let chunk_cap = self.rate as u64;
         let mut remaining = amount;
         while remaining > 0 {
-            let take = remaining.min(chunk_cap);
-            self.acquire_one(take).await;
-            remaining -= take;
+            remaining -= self.acquire_some(remaining).await;
         }
     }
 
-    async fn acquire_one(&self, amount: u64) {
-        let amount_f = amount as f64;
+    /// Wait in line, then take as much of `wanted` as one bucket holds at
+    /// the rate in force. Returns how much was taken: all of it once the
+    /// limit is lifted.
+    async fn acquire_some(&self, wanted: u64) -> u64 {
+        if !self.is_limited() {
+            return wanted;
+        }
 
         let my_seq = self.seq.fetch_add(1, Ordering::SeqCst);
         {
@@ -1145,27 +1171,32 @@ impl BandwidthLimiter {
         };
 
         loop {
+            // Lifted while waiting: the guard takes us out of the queue.
+            let Some(rate) = self.rate() else {
+                return wanted;
+            };
+            let take = wanted.min(rate);
+            let (rate_f, take_f) = (rate as f64, take as f64);
+
             let sleep_duration = {
                 let mut state = self.state.lock().expect("limiter mutex poisoned");
-                state.refill(self.rate);
+                state.refill(rate_f);
 
                 if let Some(&front) = state.queue.front()
                     && front == my_seq
-                    && state.available >= amount_f
+                    && state.available >= take_f
                 {
-                    state.available -= amount_f;
+                    state.available -= take_f;
                     state.queue.pop_front();
                     guard.consumed = true;
-                    return;
+                    return take;
                 }
 
-                if state.available < amount_f {
-                    let deficit = amount_f - state.available;
-                    let wait_secs = deficit / self.rate;
-                    match Duration::try_from_secs_f64(wait_secs) {
-                        Ok(d) => Some(d.max(Duration::from_millis(1))),
-                        Err(_) => Some(Duration::from_millis(1)),
-                    }
+                if state.available < take_f {
+                    let deficit = take_f - state.available;
+                    let wait =
+                        Duration::try_from_secs_f64(deficit / rate_f).unwrap_or(LIMITER_MAX_WAIT);
+                    Some(wait.clamp(Duration::from_millis(1), LIMITER_MAX_WAIT))
                 } else {
                     None
                 }
@@ -1182,6 +1213,9 @@ impl BandwidthLimiter {
 }
 
 impl LimiterState {
+    /// Credit the time since the last refill at `rate`. The bucket holds a
+    /// second's worth, so a lowered limit also cuts what was saved up
+    /// under the old one down to a second at the new rate.
     fn refill(&mut self, rate: f64) {
         let now = Instant::now();
         let elapsed = now - self.last_refill;
@@ -1342,7 +1376,7 @@ async fn download_part(
     part: PartDetails,
     controller: Arc<PartController>,
     randomize_user_agent: bool,
-    speed_limiter: Option<Arc<BandwidthLimiter>>,
+    speed_limiter: Arc<BandwidthLimiter>,
     probe_notify: Option<Arc<Notify>>,
     policy: FixedThenExponentialRetry,
     ctx: DownloadContext,
@@ -1614,9 +1648,11 @@ async fn download_part(
             }
 
             let len = chunk.len() as u64;
-            if let Some(limiter) = speed_limiter.as_ref() {
+            // Checked first so an unlimited download never pays for the
+            // `select!`, which can register with the shared cancel tokens.
+            if speed_limiter.is_limited() {
                 tokio::select! {
-                    _ = limiter.acquire(len) => {}
+                    _ = speed_limiter.acquire(len) => {}
                     _ = ctx.cancel.cancelled() => {
                         let _ = file.finish().await;
                         return Err(OdlError::Cancelled);
@@ -2176,7 +2212,7 @@ mod tests {
             part,
             controller,
             false,
-            None,
+            Arc::new(BandwidthLimiter::new(LiveControls::new(), None)),
             None,
             FixedThenExponentialRetry::default(),
             DownloadContext::new(),
@@ -2198,9 +2234,13 @@ mod tests {
         Ok(())
     }
 
+    fn limiter_at(rate: u64) -> BandwidthLimiter {
+        BandwidthLimiter::new(LiveControls::new(), Some(rate))
+    }
+
     #[tokio::test(start_paused = true)]
     async fn test_bandwidth_limiter_enforces_limit() {
-        let limiter = BandwidthLimiter::new(1024);
+        let limiter = limiter_at(1024);
         limiter.acquire(1024).await;
 
         let second = limiter.acquire(1024);
@@ -2217,7 +2257,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_bandwidth_limiter_dropped_acquire_does_not_block_queue() {
         // Drain the initial bucket so the next acquire must wait.
-        let limiter = BandwidthLimiter::new(1024);
+        let limiter = limiter_at(1024);
         limiter.acquire(1024).await;
 
         // Start an acquire, poll once to enqueue the seq, then drop it
@@ -2241,12 +2281,210 @@ mod tests {
     async fn test_bandwidth_limiter_handles_amount_larger_than_rate() {
         // Chunk larger than the per-second rate must not deadlock against
         // the bucket capacity cap; acquire splits it into sub-acquires.
-        let limiter = Arc::new(BandwidthLimiter::new(8192));
+        let limiter = Arc::new(limiter_at(8192));
         // 32 KiB at 8 KiB/s → ~3s. Bound test under a generous timeout to
         // catch deadlocks without flaking on slow CI.
         tokio::time::timeout(Duration::from_secs(10), limiter.acquire(32 * 1024))
             .await
             .expect("acquire must not deadlock for amount > rate");
+    }
+
+    #[test]
+    fn bandwidth_limiter_treats_zero_options_limit_as_none() {
+        assert!(!BandwidthLimiter::new(LiveControls::new(), Some(0)).is_limited());
+    }
+
+    #[test]
+    fn live_speed_limit_overrides_the_options_until_cleared() {
+        let live = LiveControls::new();
+        assert_eq!(live.speed_limit_over(Some(500)), Some(500));
+        assert_eq!(live.speed_limit_over(None), None);
+
+        live.set_speed_limit(Some(1000));
+        assert_eq!(live.speed_limit_over(Some(500)), Some(1000));
+        assert_eq!(live.speed_limit_over(None), Some(1000));
+
+        live.set_speed_limit(None);
+        assert_eq!(live.speed_limit_over(Some(500)), None);
+        live.set_speed_limit(Some(0));
+        assert_eq!(live.speed_limit_over(Some(500)), None);
+
+        live.clear_speed_limit();
+        assert_eq!(live.speed_limit_over(Some(500)), Some(500));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_bandwidth_limiter_cuts_saved_burst_when_lowered() {
+        let live = LiveControls::new();
+        let limiter = BandwidthLimiter::new(live.clone(), Some(10_000));
+        live.set_speed_limit(Some(1000));
+
+        // Ten seconds' worth at the new rate were saved up; one is left.
+        assert!(limiter.acquire(1000).now_or_never().is_some());
+        let next = limiter.acquire(1000);
+        tokio::pin!(next);
+        assert!(next.as_mut().now_or_never().is_none());
+
+        time::advance(Duration::from_millis(900)).await;
+        assert!(next.as_mut().now_or_never().is_none());
+
+        time::advance(Duration::from_millis(200)).await;
+        assert!(next.as_mut().now_or_never().is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_bandwidth_limiter_picks_up_raised_limit_while_waiting() {
+        let live = LiveControls::new();
+        let limiter = BandwidthLimiter::new(live.clone(), Some(1000));
+        assert!(limiter.acquire(1000).now_or_never().is_some());
+
+        // A full second away at the old rate.
+        let waiting = limiter.acquire(1000);
+        tokio::pin!(waiting);
+        assert!(waiting.as_mut().now_or_never().is_none());
+
+        live.set_speed_limit(Some(1_000_000));
+        time::advance(LIMITER_MAX_WAIT + Duration::from_millis(10)).await;
+        assert!(waiting.as_mut().now_or_never().is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_bandwidth_limiter_releases_waiters_when_lifted() {
+        let live = LiveControls::new();
+        let limiter = BandwidthLimiter::new(live.clone(), Some(1000));
+        assert!(limiter.acquire(1000).now_or_never().is_some());
+
+        let waiting = limiter.acquire(5000);
+        tokio::pin!(waiting);
+        assert!(waiting.as_mut().now_or_never().is_none());
+
+        live.set_speed_limit(None);
+        time::advance(LIMITER_MAX_WAIT + Duration::from_millis(10)).await;
+        assert!(waiting.as_mut().now_or_never().is_some());
+        // Nothing left in line to hold up a limit imposed later.
+        assert!(limiter.state.lock().unwrap().queue.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_bandwidth_limiter_applies_limit_imposed_mid_run() {
+        let live = LiveControls::new();
+        let limiter = BandwidthLimiter::new(live.clone(), None);
+        assert!(!limiter.is_limited());
+        assert!(limiter.acquire(10_000_000).now_or_never().is_some());
+
+        time::advance(Duration::from_secs(5)).await;
+        live.set_speed_limit(Some(1000));
+        assert!(limiter.is_limited());
+
+        // The unlimited stretch refilled one bucket and no more.
+        assert!(limiter.acquire(1000).now_or_never().is_some());
+        let next = limiter.acquire(1000);
+        tokio::pin!(next);
+        assert!(next.as_mut().now_or_never().is_none());
+
+        time::advance(Duration::from_millis(900)).await;
+        assert!(next.as_mut().now_or_never().is_none());
+
+        time::advance(Duration::from_millis(200)).await;
+        assert!(next.as_mut().now_or_never().is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_bandwidth_limiter_finishes_chunk_when_lowered_below_it() {
+        let live = LiveControls::new();
+        let limiter = BandwidthLimiter::new(live.clone(), Some(8192));
+        assert!(limiter.acquire(8192).now_or_never().is_some());
+
+        let start = Instant::now();
+        let waiting = limiter.acquire(8192);
+        tokio::pin!(waiting);
+        assert!(waiting.as_mut().now_or_never().is_none());
+
+        // The chunk no longer fits in a bucket at the new rate. Paused time
+        // auto-advances, so this resolves at once in real time.
+        live.set_speed_limit(Some(1024));
+        time::timeout(Duration::from_secs(30), waiting)
+            .await
+            .expect("acquire must not stall when the limit drops below it");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(7) && elapsed <= Duration::from_secs(9),
+            "8 KiB at 1 KiB/s took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_downloader_follows_live_speed_limit() -> Result<(), Box<dyn std::error::Error>> {
+        // A minute's worth at the limit below.
+        let file_content = vec![7u8; 64 * 1024];
+        let mut server = Server::new_async().await;
+        let base = server.url();
+        let get_mock = server
+            .mock("GET", "/file")
+            .match_header(
+                "range",
+                Matcher::Exact(format!("bytes=0-{}", file_content.len() - 1)),
+            )
+            .with_status(206)
+            .with_body(&file_content)
+            .create_async()
+            .await;
+
+        let tmp = tempdir()?;
+        let download_dir = tmp.path().join("download");
+        let save_dir = tmp.path().join("save");
+        fs::create_dir_all(&download_dir).await?;
+        fs::create_dir_all(&save_dir).await?;
+
+        let mut parts = HashMap::new();
+        parts.insert(
+            "part1".to_string(),
+            make_part("part1", 0, file_content.len() as u64),
+        );
+        let instruction = create_instruction(
+            &download_dir,
+            &save_dir,
+            &format!("{}/file", base),
+            file_content.len() as u64,
+            parts,
+            1,
+        )
+        .await;
+
+        // The options set no limit; the live override imposes one anyway.
+        let ctx = DownloadContext::new();
+        ctx.live.set_speed_limit(Some(1024));
+        let downloader = Downloader::new(
+            Arc::clone(&instruction),
+            instruction.as_metadata(),
+            reqwest::Client::builder().build()?,
+            false,
+            None,
+            true,
+            RampupConfig::disabled(),
+            FixedThenExponentialRetry::default(),
+            ctx.clone(),
+        );
+        let run = tokio::spawn(downloader.run());
+
+        time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !run.is_finished(),
+            "the override must throttle the download"
+        );
+
+        ctx.live.set_speed_limit(None);
+        let metadata = time::timeout(Duration::from_secs(10), run)
+            .await
+            .expect("download must finish once the limit is lifted")??;
+
+        assert!(metadata.parts.get("part1").is_some_and(|p| p.finished));
+        assert_eq!(
+            fs::read(instruction.part_path("part1")).await?,
+            file_content
+        );
+        get_mock.assert_async().await;
+        Ok(())
     }
 
     #[test]
