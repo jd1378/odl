@@ -142,6 +142,16 @@ progress resume as before.
 
 Thanks to @Xxx91n for the detailed report (#3).
 
+### `odl update` recognises script installs on Windows
+
+`odl update` replaces only a binary in a directory odl's installers used. It
+compared the running binary's resolved path with that directory as written,
+and on Windows a resolved path starts with `\\?\`, so it never matched and
+every install made by `install.ps1` was refused as an unknown one. A link in
+the install path did the same anywhere, such as `/home` pointing to
+`/var/home` on Fedora Atomic desktops. Both sides are now resolved before they
+are compared.
+
 ## 3.3.1
 
 ### A probe the server refuses for good fails on its first answer
