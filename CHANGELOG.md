@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 3.4.0
 
 ### A running download's speed limit can change
 
@@ -93,6 +93,12 @@ The run loop learned of a new connection limit only while it was waiting for
 one. A change made while it was busy, such as opening a ramp-up batch or
 waiting out the delay before the next, went unnoticed until a part next ended.
 It is now applied as soon as the loop is free.
+
+### The CLI builds without yt-dlp support
+
+`cargo install odl --no-default-features --features cli`, the CLI without the
+`ytdlp` engine, failed to compile: two helpers `odl update` needs were built
+only with `ytdlp`. It builds now, and every feature set passes clippy cleanly.
 
 ## 3.3.1
 
