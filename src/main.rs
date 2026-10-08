@@ -1659,9 +1659,9 @@ async fn maybe_offer_missing_tools(
 
 /// Path of the config file this invocation reads and writes.
 ///
-/// Only the helper-install paths need it, which a build without a delegating
-/// engine does not compile.
-#[cfg(feature = "ytdlp")]
+/// Only the helper-install and self-update paths need it, and a build with
+/// neither does not compile them.
+#[cfg(any(feature = "ytdlp", feature = "self-update"))]
 fn config_path_for(args: &Args) -> PathBuf {
     args.config_file
         .clone()
@@ -1673,7 +1673,7 @@ fn config_path_for(args: &Args) -> PathBuf {
 ///
 /// Returns `false` without prompting when there is no terminal to ask on:
 /// a script must never be blocked by a question it cannot see.
-#[cfg(feature = "ytdlp")]
+#[cfg(any(feature = "ytdlp", feature = "self-update"))]
 fn confirm(question: &str) -> Option<bool> {
     use std::io::Write;
     // `None`, not `false`: "nobody could be asked" is not the same as "the
