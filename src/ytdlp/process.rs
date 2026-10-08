@@ -150,13 +150,11 @@ impl ManagedChild {
         // non-console child, so the job is terminated directly.
         self.job.terminate();
 
-        match tokio::time::timeout(grace, self.child.wait()).await {
-            Ok(status) => return status.map(Some),
-            Err(_) => {
-                #[cfg(unix)]
-                unix_impl::signal_group(&self.child, unix_impl::SIGKILL);
-            }
+        if let Ok(status) = tokio::time::timeout(grace, self.child.wait()).await {
+            return status.map(Some);
         }
+        #[cfg(unix)]
+        unix_impl::signal_group(&self.child, unix_impl::SIGKILL);
 
         // After SIGKILL (or a job terminate) the wait cannot block for long.
         let status = self.child.wait().await.map(Some);
@@ -336,7 +334,8 @@ mod windows_impl {
     }
 }
 
-#[cfg(test)]
+// Every test here drives process groups and signals, which are Unix-only.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::time::Duration;
@@ -344,7 +343,6 @@ mod tests {
     /// Spawn a shell that starts a long-lived grandchild, then confirm the
     /// grandchild dies with the group rather than outliving it. This is the
     /// behaviour the whole module exists for.
-    #[cfg(unix)]
     #[tokio::test]
     async fn terminate_kills_grandchildren() {
         let marker = tempfile::NamedTempFile::new().unwrap();
@@ -380,7 +378,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn wait_reports_exit_status() {
         let mut cmd = Command::new("/bin/sh");
@@ -392,7 +389,6 @@ mod tests {
 
     /// The escape hatch must not become a leak: a hard exit still has to take
     /// the helpers with it.
-    #[cfg(unix)]
     #[tokio::test]
     async fn killing_all_groups_reaches_grandchildren() {
         let marker = tempfile::NamedTempFile::new().unwrap();
@@ -421,7 +417,6 @@ mod tests {
         drop(managed);
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn a_finished_child_leaves_no_group_behind() {
         let mut cmd = Command::new("/bin/sh");
@@ -442,7 +437,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn terminate_on_already_exited_child_is_ok() {
         let mut cmd = Command::new("/bin/sh");
