@@ -342,6 +342,7 @@ impl Downloader {
         let mut stalls: HashMap<String, StallWatch> = HashMap::new();
 
         self.report_connection_limit();
+        let mut applied_limit = self.connection_limit();
 
         // Schedule a single probe connection first. Once it begins receiving data
         // we'll expand to fill the full concurrency capacity.
@@ -389,18 +390,30 @@ impl Downloader {
         loop {
             let live_changed = self.ctx.live.notified();
             tokio::pin!(live_changed);
-            // A change made while the last pass was busy woke nobody.
+            // Read after subscribing: a change from here on wakes the
+            // `select!`, and one made while the last pass was busy, which
+            // woke nobody, is applied now rather than when a part next ends.
             self.report_connection_limit();
+            let limit = self.connection_limit();
+            if limit != applied_limit {
+                applied_limit = limit;
+                self.apply_live_cap(&mut active);
+                self.fill_capacity(
+                    &mut pending,
+                    &mut active,
+                    join_set,
+                    &mut last_failure,
+                    &mut stalls,
+                )
+                .await?;
+                continue;
+            }
             tokio::select! {
                 _ = self.ctx.cancel.cancelled() => {
                     return Err(OdlError::Cancelled);
                 }
-                _ = &mut live_changed => {
-                    self.report_connection_limit();
-                    self.apply_live_cap(&mut active);
-                    self.fill_capacity(&mut pending, &mut active, join_set, &mut last_failure, &mut stalls)
-                        .await?;
-                }
+                // Applied at the top of the next pass.
+                _ = &mut live_changed => {}
                 next = join_set.join_next() => {
                     let Some(result) = next else { break };
                     self.handle_join_result_item(
@@ -2969,6 +2982,47 @@ mod tests {
         limits.extend(connection_limits(&mut rx));
         assert_eq!(limits, vec![1, 3]);
         assert_eq!(live.max_connections(), 3);
+        server_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn applies_connection_limit_lowered_while_ramping() {
+        use std::sync::atomic::Ordering;
+
+        const DELAY: Duration = Duration::from_millis(500);
+        let (addr, counter, server_task) = spawn_hanging_http_server().await;
+        let (_instruction, downloader, _tmp) = build_rampup_test_downloader(
+            addr,
+            3,
+            RampupConfig {
+                enabled: true,
+                batch_size: 1,
+                delay_min: DELAY,
+                delay_max: DELAY,
+            },
+        )
+        .await;
+        let live = downloader.ctx.live.clone();
+        let cancel = downloader.ctx.cancel.clone();
+        let active_parts = Arc::clone(&downloader.active_parts);
+        let dl_task = tokio::spawn(async move {
+            let _ = downloader.run().await;
+        });
+
+        // The probe and the first batch are open, and the ramp is waiting
+        // before the next one: a pass of the run loop nothing can wake.
+        wait_for("probe and first batch open", Duration::from_secs(5), || {
+            counter.load(Ordering::SeqCst) >= 2
+        })
+        .await;
+        live.set_max_connections(1);
+
+        wait_for("surplus connection closed", Duration::from_secs(5), || {
+            active_parts.lock().unwrap().len() == 1
+        })
+        .await;
+        cancel.cancel();
+        let _ = dl_task.await;
         server_task.abort();
     }
 }
