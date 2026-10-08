@@ -172,14 +172,41 @@ async fn is_replaceable(exe: &Path) -> bool {
 /// `exe` is the running binary, with symlinks resolved by the caller: updating
 /// through a symlink would replace the link and orphan its target.
 pub async fn eligibility(exe: &Path) -> Result<(), Ineligible> {
-    let receipt = InstallReceipt::load().await;
-    let claimed = decide(exe, receipt.as_ref(), &default_install_dirs())?;
+    eligibility_against(exe, InstallReceipt::load().await, default_install_dirs()).await
+}
+
+async fn eligibility_against(
+    exe: &Path,
+    mut receipt: Option<InstallReceipt>,
+    default_dirs: Vec<PathBuf>,
+) -> Result<(), Ineligible> {
+    // `exe` arrives canonical, and the directories it is compared with have to
+    // be in the same form: on Windows a canonical path carries a `\\?\` prefix
+    // that no `Path` without one equals, and anywhere a link in the way, such
+    // as `/home` pointing to `/var/home`, gives one directory two spellings.
+    if let Some(receipt) = receipt.as_mut() {
+        receipt.install_dir = canonical(&receipt.install_dir).await;
+    }
+    let mut known = Vec::with_capacity(default_dirs.len());
+    for dir in &default_dirs {
+        known.push(canonical(dir).await);
+    }
+
+    let claimed = decide(exe, receipt.as_ref(), &known)?;
     // Left until last because it costs a write: the answers above are free and
     // one of them usually settles it.
     if !is_replaceable(claimed).await {
         return Err(Ineligible::NotWritable(exe.to_path_buf()));
     }
     Ok(())
+}
+
+/// `dir` resolved as `exe` is, or as given if it cannot be: one that does not
+/// exist holds no binary to match anyway.
+async fn canonical(dir: &Path) -> PathBuf {
+    tokio::fs::canonicalize(dir)
+        .await
+        .unwrap_or_else(|_| dir.to_path_buf())
 }
 
 /// Everything about eligibility that does not need to touch the disk.
@@ -653,6 +680,49 @@ mod tests {
         assert_eq!(
             decide(exe, Some(&receipt), &[]),
             Err(Ineligible::ManagedBy("cargo install"))
+        );
+    }
+
+    /// The running binary is canonical, as `run_update` resolves it, while the
+    /// receipt holds the directory as the install script wrote it. On Windows
+    /// the two differ by a `\\?\` prefix, on macOS by `/var` being a link to
+    /// `/private/var`, and they still name the same place.
+    #[tokio::test]
+    async fn a_receipt_matches_however_its_directory_is_spelled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install_dir = tmp.path().join("bin");
+        std::fs::create_dir(&install_dir).unwrap();
+        std::fs::write(install_dir.join("odl"), b"").unwrap();
+        let exe = std::fs::canonicalize(install_dir.join("odl")).unwrap();
+
+        let receipt = receipt_for(&install_dir);
+        assert_eq!(
+            eligibility_against(&exe, Some(receipt), vec![]).await,
+            Ok(())
+        );
+        assert_eq!(
+            eligibility_against(&exe, None, vec![install_dir]).await,
+            Ok(())
+        );
+    }
+
+    /// `/home` is a link to `/var/home` on Fedora Atomic desktops: the script
+    /// records one spelling and the running binary resolves to the other.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_receipt_matches_through_a_linked_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(real.join("odl"), b"").unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let exe = std::fs::canonicalize(link.join("odl")).unwrap();
+
+        let receipt = receipt_for(&link);
+        assert_eq!(
+            eligibility_against(&exe, Some(receipt), vec![]).await,
+            Ok(())
         );
     }
 
