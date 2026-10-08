@@ -36,7 +36,6 @@ ulid = "3"
 futures = "0.3.31"
 tempfile = "3.20.0"
 bytes = "1"
-atomicwrites = "0.4.4"
 digest = "0.11"
 sha1 = "0.11"
 sha2 = "0.11"
@@ -57,11 +56,19 @@ humantime = "2"
 reflink-copy = { version = "0.1.29", features = ["tracing"] }
 deunicode = "1.6.2"
 
+[target.'cfg(unix)'.dependencies]
+# `renameat` on open directory handles, so a rename over a file and the
+# directory syncs that make it durable act on the same directories
+# (`fs_utils`). std has no `renameat`. Already in the tree through `tempfile`.
+rustix = { version = "1", features = ["fs"] }
+
 [target.'cfg(windows)'.dependencies]
-# Job Objects are the only reliable way to tear down a spawned yt-dlp together
-# with the grandchildren it spawns (ffmpeg). Bindings-only crate: the code it
-# calls lives in the OS, so the binary-size cost is negligible.
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading"], optional = true }
+# Win32 for what std leaves out: a rename over an existing file that is on
+# disk before it returns (`fs_utils`), and, with `ytdlp`, Job Objects, the only
+# reliable way to tear down a spawned yt-dlp together with the grandchildren it
+# spawns (ffmpeg). Bindings-only crate: the code it calls lives in the OS, so
+# the binary-size cost is negligible.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 reqwest = { version = "0.13", default-features = false, features = ["http2", "gzip", "brotli", "rustls", "socks", "stream", "blocking"] }
@@ -90,7 +97,7 @@ cli = ["dep:clap", "dep:indicatif", "dep:tracing-subscriber", "dep:serde_json", 
 # Delegate downloads of known media hosts to an externally installed `yt-dlp`.
 # Adds no crate dependencies of its own beyond JSON parsing and process control;
 # `yt-dlp` itself is discovered at runtime and is never bundled.
-ytdlp = ["dep:serde_json", "dep:windows-sys", "tokio/process", "tokio/io-util"]
+ytdlp = ["dep:serde_json", "windows-sys/Win32_System_JobObjects", "windows-sys/Win32_System_Threading", "tokio/process", "tokio/io-util"]
 # Replace odl's own binary with the latest GitHub release (`odl update`).
 # Needs JSON to read the release listing and a process spawn to unpack the
 # archive; the binary it replaces is only ever one odl's installer put there.

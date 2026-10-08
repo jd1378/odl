@@ -4,6 +4,8 @@ use std::{io, path::Path, path::PathBuf};
 
 use tokio::{fs::OpenOptions, io::AsyncWriteExt};
 
+mod replace;
+
 /// Longest filename component the common filesystems accept, in bytes.
 const MAX_FILENAME_BYTES: usize = 255;
 
@@ -138,7 +140,7 @@ pub async fn read_delimited_message_from_path<M: Message + Default, P: AsRef<Pat
 pub(crate) const OWNER_ONLY_MODE: u32 = 0o600;
 
 pub async fn atomic_replace(src: PathBuf, dst: PathBuf) -> io::Result<()> {
-    tokio::task::spawn_blocking(move || atomicwrites::replace_atomic(&src, &dst))
+    tokio::task::spawn_blocking(move || replace::replace_atomic(&src, &dst))
         .await
         .map_err(io::Error::other)??;
 
