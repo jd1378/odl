@@ -94,6 +94,10 @@ odl https://example.com/file.zip
 
 # Specify output file path
 odl https://example.com/file.zip -o /path/to/save/file.zip
+
+# Save into a directory under the server-provided filename: an existing
+# directory, or a path ending in a separator
+odl https://example.com/file.zip -o /path/to/save/
 ```
 
 - **Download from a remote list (URL pointing to a newline-separated list of URLs)**

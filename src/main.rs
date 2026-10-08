@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -1026,19 +1026,27 @@ async fn run(args: Args) -> Result<(), OdlError> {
     }
 
     let mut user_provided_filename: Option<String> = None;
-    let save_dir: PathBuf = if let Some(path) = args.output.clone() {
-        if let DownloadType::Url(_) = &download_type {
+    let single_url = matches!(download_type, DownloadType::Url(_));
+    let save_dir: PathBuf = match args.output.clone() {
+        // A single URL's `-o` names the file, unless it names a directory,
+        // which keeps the server's filename, as `cp` would.
+        Some(path) if single_url && !names_directory(&path) => {
             user_provided_filename = path
                 .file_name()
                 .map(|os_str| os_str.to_string_lossy().into_owned());
-            path.parent()
-                .expect("Failed to get output's parent directory")
-                .to_path_buf()
-        } else {
-            path
+            path.parent().unwrap_or(Path::new("")).to_path_buf()
         }
-    } else {
-        std::env::current_dir()?
+        // A list saves every file into `-o`, so it cannot be a file.
+        Some(path) if !single_url && path.is_file() => {
+            return Err(OdlError::CliError {
+                message: format!(
+                    "`-o {}` is an existing file; with a list of URLs, -o names the directory to save them in",
+                    path.display()
+                ),
+            });
+        }
+        Some(path) => path,
+        None => std::env::current_dir()?,
     };
 
     // todo: stream file, as processing a large file in advance is not a good idea
@@ -1478,6 +1486,18 @@ fn determine_download_type(args: &Args) -> Result<DownloadType, OdlError> {
         });
     }
     Ok(DownloadType::File(Box::new(path)))
+}
+
+/// Whether `-o` names a directory: one that exists, or a path written with a
+/// trailing separator. Only this platform's separators count, so on Unix a
+/// trailing `\` is part of a filename.
+fn names_directory(path: &Path) -> bool {
+    path.is_dir()
+        || path
+            .as_os_str()
+            .as_encoded_bytes()
+            .last()
+            .is_some_and(|&b| std::path::is_separator(b.into()))
 }
 
 /// `input` as a URL to download from. Only `http` and `https` count: a

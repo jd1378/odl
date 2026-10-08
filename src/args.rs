@@ -232,7 +232,14 @@ ENGINES:
 
   Quality is chosen once and pinned: a resume never mixes encodings. To change
   it, name another format (--format-id) or ask again (--choose-format always);
-  either discards what was downloaded and starts over.";
+  either discards what was downloaded and starts over.
+
+OUTPUT (-o):
+  One URL:  -o FILE saves under that name. An existing directory, or a path
+            ending in a separator (-o /downloads/), saves inside it under the
+            server's filename.
+  URL list: -o DIR is where every file is saved; an existing file is refused
+            (exit 2).";
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None, after_long_help = MACHINE_INTERFACE_HELP)]
@@ -291,9 +298,10 @@ pub struct Args {
     #[arg(long, value_name = "COUNT")]
     pub max_concurrent_downloads: Option<usize>,
 
-    /// When `input` is a URL, this specifies the output file path.
+    /// When `input` is a URL, this specifies the output file path, or, given an existing
+    /// directory or a path ending in a separator, the directory to save it in.
     /// When `input` is a file containing URLs, this specifies the output directory for downloaded files.
-    /// Will use server provided name if not specified or if `input` is a file.
+    /// Will use server provided name if not specified, if it names a directory, or if `input` is a file.
     #[arg(short, long, value_name = "FILE|DIR")]
     pub output: Option<PathBuf>,
 
