@@ -170,6 +170,15 @@ pub enum ProgressEvent {
         /// and a caller knows shortening it will not help.
         server_requested: bool,
     },
+    /// The most connections the download may have open at once. Sent when
+    /// the transfer starts and again whenever the limit changes: set by the
+    /// caller through [`LiveControls`], or lowered by odl after a part
+    /// fails, for a server that turns parallel connections away.
+    ///
+    /// A limit, not a count: fewer are open while the download ramps up, or
+    /// when fewer parts are left than the limit allows. Only the built-in
+    /// downloader sends this.
+    ConnectionLimitChanged { max_connections: usize },
     /// Free-form status message (e.g. "Warming up", "Waiting for retry…").
     Message(String),
     /// Download finished successfully and final file is at `path`.

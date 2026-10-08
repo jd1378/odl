@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, VecDeque},
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
 };
 
@@ -127,6 +127,8 @@ pub struct Downloader {
     /// notifying — this flips false and the ramp falls back to a
     /// strict one-at-a-time, probe-gated cadence.
     ramp_armed: std::sync::atomic::AtomicBool,
+    /// Last limit sent as `ConnectionLimitChanged`; `0` before the first.
+    reported_connection_limit: AtomicUsize,
 }
 
 impl Downloader {
@@ -180,6 +182,7 @@ impl Downloader {
             tracker,
             active_parts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             ramp_armed: std::sync::atomic::AtomicBool::new(true),
+            reported_connection_limit: AtomicUsize::new(0),
         }
     }
 
@@ -339,6 +342,8 @@ impl Downloader {
         // [`Downloader::worth_requeueing`].
         let mut stalls: HashMap<String, StallWatch> = HashMap::new();
 
+        self.report_connection_limit();
+
         // Schedule a single probe connection first. Once it begins receiving data
         // we'll expand to fill the full concurrency capacity.
         if let Some(first_part) = pending.pop_front() {
@@ -385,11 +390,14 @@ impl Downloader {
         loop {
             let live_changed = self.ctx.live.notified();
             tokio::pin!(live_changed);
+            // A change made while the last pass was busy woke nobody.
+            self.report_connection_limit();
             tokio::select! {
                 _ = self.ctx.cancel.cancelled() => {
                     return Err(OdlError::Cancelled);
                 }
                 _ = &mut live_changed => {
+                    self.report_connection_limit();
                     self.apply_live_cap(&mut active);
                     self.fill_capacity(&mut pending, &mut active, join_set, &mut last_failure, &mut stalls)
                         .await?;
@@ -598,6 +606,17 @@ impl Downloader {
         }
     }
 
+    /// Send `ConnectionLimitChanged` if the limit moved since it was last
+    /// sent. Called wherever it may have moved.
+    fn report_connection_limit(&self) {
+        let limit = self.ctx.live.max_connections();
+        if self.reported_connection_limit.swap(limit, Ordering::SeqCst) != limit {
+            self.ctx.emit(ProgressEvent::ConnectionLimitChanged {
+                max_connections: limit,
+            });
+        }
+    }
+
     /// React to a runtime change in `ctx.live.max_connections()`. When the
     /// new cap is below the current `active.len()`, cancel the surplus
     /// in-flight tasks (chosen arbitrarily). Each cancelled task returns
@@ -728,6 +747,7 @@ impl Downloader {
                             // simultaneous connections if the server only
                             // allows a small number. Ensure minimum of 1.
                             self.ctx.live.shrink_by_one();
+                            self.report_connection_limit();
                         }
                     } else {
                         // If the task wasn't in `active`, still check whether
@@ -2846,6 +2866,84 @@ mod tests {
 
         cancel.cancel();
         let _ = dl_task.await;
+        server_task.abort();
+    }
+
+    /// The `ConnectionLimitChanged` values received so far, in order.
+    fn connection_limits(rx: &mut mpsc::UnboundedReceiver<ProgressEvent>) -> Vec<usize> {
+        let mut limits = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let ProgressEvent::ConnectionLimitChanged { max_connections } = event {
+                limits.push(max_connections);
+            }
+        }
+        limits
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reports_connection_limit_at_start_and_on_change() {
+        use std::sync::atomic::Ordering;
+
+        let (addr, counter, server_task) = spawn_hanging_http_server().await;
+        let (_instruction, mut downloader, _tmp) =
+            build_rampup_test_downloader(addr, 4, RampupConfig::disabled()).await;
+        let (reporter, mut rx) = crate::progress::channel_reporter();
+        downloader.ctx.reporter = reporter;
+        let live = downloader.ctx.live.clone();
+        let cancel = downloader.ctx.cancel.clone();
+        let dl_task = tokio::spawn(async move {
+            let _ = downloader.run().await;
+        });
+
+        wait_for("all four parts open", Duration::from_secs(5), || {
+            counter.load(Ordering::SeqCst) >= 4
+        })
+        .await;
+        live.set_max_connections(2);
+        // The same limit again is not a change.
+        live.set_max_connections(2);
+
+        let mut limits = Vec::new();
+        wait_for("lowered limit reported", Duration::from_secs(5), || {
+            limits.extend(connection_limits(&mut rx));
+            limits.contains(&2)
+        })
+        .await;
+        cancel.cancel();
+        let _ = dl_task.await;
+        limits.extend(connection_limits(&mut rx));
+        assert_eq!(limits, vec![4, 2]);
+        server_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reports_connection_limit_lowered_after_part_failure() {
+        let (addr, _counter, server_task) = spawn_drop_server().await;
+        let (_instruction, mut downloader, _tmp) =
+            build_rampup_test_downloader(addr, 3, RampupConfig::disabled()).await;
+        downloader.retry_policy = FixedThenExponentialRetry {
+            max_n_retries: 1,
+            wait_time: Duration::from_millis(20),
+            n_fixed_retries: 1,
+        };
+        let (reporter, mut rx) = crate::progress::channel_reporter();
+        downloader.ctx.reporter = reporter;
+        let cancel = downloader.ctx.cancel.clone();
+        let dl_task = tokio::spawn(async move {
+            let _ = downloader.run().await;
+        });
+
+        let mut limits = Vec::new();
+        wait_for("limit lowered by a failure", Duration::from_secs(5), || {
+            limits.extend(connection_limits(&mut rx));
+            limits.contains(&2)
+        })
+        .await;
+        cancel.cancel();
+        let _ = dl_task.await;
+        limits.extend(connection_limits(&mut rx));
+        assert_eq!(limits.first(), Some(&3), "{limits:?}");
+        assert!(limits.windows(2).all(|w| w[0] > w[1]), "{limits:?}");
         server_task.abort();
     }
 }
