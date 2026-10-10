@@ -1,5 +1,66 @@
 # Changelog
 
+## 3.4.1
+
+### The probe asks with `GET` for the first byte, not `HEAD`
+
+Every download began with a `HEAD` request, and parts then fetched with `GET`
+from wherever that request's redirects led. Servers do not have to route the
+two methods the same way, and GitHub does not: a signed-in `HEAD` for a
+release asset is redirected to a host that answers 401, while a `GET` with the
+same cookies is redirected to one that serves the file. A release asset
+captured from a browser along with its github.com cookies failed at the probe,
+and the same link without cookies worked. Servers that refuse `HEAD`
+outright, or sign a link for one method only, failed the same way.
+
+The probe is now a `GET` with `Range: bytes=0-0`, asked the way parts ask, and
+only its headers are read. It costs the same single round trip, and a `206`
+answer shows that ranges work rather than leaving that to `Accept-Ranges`. A
+server that ignores the range and starts sending the whole file has the
+connection dropped after the headers. An empty file answers `416` and is then
+asked for without a range. Like parts, the probe asks for `identity` encoding,
+so the length it reads is the file's.
+
+A `206` describes one byte, so its own length, its `Content-Range` and its
+body digests (`Content-Digest`, `Content-MD5`, `Content-SHA256`) are not taken
+as the file's. Its `Repr-Digest`, `Digest` and `X-Checksum-*` headers still
+are. `Download::response_headers` reads as a `HEAD` for the file would:
+`Content-Length` is the file's length, and the range and body digests are left
+out.
+
+A status past 599 now refuses the probe, where it used to be taken as an
+answer. GitHub's asset host sends 618 for a link that has expired.
+
+An embedder whose test servers answer `HEAD` for the probe has to answer this
+`GET` instead.
+
+### A part refused by an expired link gets a fresh one
+
+Parts fetch from where the probe's redirects led, which is often a signed link
+that expires; GitHub's last five minutes. A part that reconnected after a
+dropped connection, one split off late in a long download, and every part of a
+download started a while after it was evaluated asked an expired link, and were
+refused until their retries ran out.
+
+When the probe was redirected and a part is refused with a status an expired
+link could send (any `4xx` except `407`, `408`, `416`, `425` and `429`, or a
+status past 599), odl now asks the requested URL again with the credentials
+the probe had, and parts carry on from the link that leads to. Parts refused
+together renew once. The fresh link is used only if it is on the origin of the
+old one, where the parts' headers already apply, and only if the server
+describes the same file: a different size, `ETag` or `Last-Modified` ends the
+download with `ServerConflict::FileChanged`, since the parts on disk belong to
+the file it was. A part renews at most once between good responses, so a
+server that hands out links refused at once, single-use ones spent on the
+asking among them, is not asked forever.
+
+### A numbered name keeps `.tar.gz` together
+
+When a file of the same name existed, `foo.tar.gz` was saved as
+`foo.tar_2.gz`, which archive tools no longer recognise as a compressed
+tarball. It is now `foo_2.tar.gz`, and the same goes for `.tar` followed by any
+other extension.
+
 ## 3.4.0
 
 ### A running download's speed limit can change
