@@ -56,7 +56,7 @@ pub use tokio_util::sync::CancellationToken;
 // stays open rather than breaking every consumer each time one is added.
 #[non_exhaustive]
 pub enum Phase {
-    /// Probing the server (HEAD request, redirect resolution, etc.).
+    /// Probing the server (first-byte request, redirect resolution, etc.).
     Evaluating,
     /// Resolving save / server conflicts before download begins.
     ResolvingConflicts,

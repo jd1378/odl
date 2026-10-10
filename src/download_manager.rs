@@ -2,13 +2,14 @@ mod checksum;
 mod delegated;
 mod downloader;
 mod io;
+mod probe;
 mod recover_metadata;
 mod save_conflict;
 mod server_conflict;
 
 use std::{path::PathBuf, sync::Arc};
 
-use http::header::{HeaderMap, USER_AGENT};
+use http::header::HeaderMap;
 use reqwest::Client;
 use url::Url;
 
@@ -20,11 +21,13 @@ use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore};
 pub struct DownloadPermit(#[allow(dead_code)] OwnedSemaphorePermit);
 
 use crate::config::{Config, DownloadOptions};
+use crate::credentials::Credentials;
 use crate::download_manager::checksum::check_final_file_checksum;
 use crate::download_manager::recover_metadata::recover_metadata;
 use crate::download_manager::{
     downloader::{Downloader, RampupConfig},
     io::persist_metadata,
+    probe::ProbeRequest,
 };
 use crate::download_manager::{io::assemble_final_file, server_conflict::resolve_server_conflicts};
 use crate::download_manager::{io::remove_all_parts, save_conflict::resolve_save_conflicts};
@@ -33,16 +36,13 @@ use crate::error::MetadataError;
 use crate::format::{FormatSelector, Quality};
 use crate::progress::{DownloadContext, Phase, ProgressEvent};
 use crate::response_info::ResponseInfo;
-use crate::retry_policies::{
-    FixedThenExponentialRetry, StatusVerdict, classify_status, retry_after, wait_for_retry,
-};
+use crate::retry_policies::FixedThenExponentialRetry;
 use crate::{
     conflict::{
         NotResumableResolution, SaveConflictResolver, ServerConflict, ServerConflictResolver,
     },
     download_manager::io::sum_parts_on_disk,
 };
-use crate::{credentials::Credentials, user_agents::random_user_agent};
 use crate::{
     download::Download,
     download_metadata::{DownloadMetadata, PartDetails},
@@ -415,48 +415,14 @@ impl DownloadManager {
             n_fixed_retries: opts.n_fixed_retries(),
         };
 
-        let mut attempts: u32 = 0;
-        let resp = loop {
-            let mut req = client
-                .head(url.clone())
-                // we request hash just in case server implements and responds
-                // we will use this later for checking the final file against
-                .header(
-                    "Want-Repr-Digest",
-                    "sha-512=9, sha-384=8, sha-256=7, sha-1=1, md5=1",
-                )
-                .header(
-                    "Want-Content-Digest",
-                    "sha-512=9, sha-384=8, sha-256=7, sha-1=1, md5=1",
-                );
-            if let Some(creds) = &credentials {
-                req = req.basic_auth(creds.username(), creds.password());
-            }
-            if opts.user_agent().is_none() && opts.randomize_user_agent() {
-                req = req.header(USER_AGENT, random_user_agent());
-            }
-
-            let (cause, retry_after) = match req.send().await {
-                Ok(r) if !r.status().is_client_error() && !r.status().is_server_error() => break r,
-                // Judged the way part requests are: a server that has
-                // settled the matter is not asked again.
-                Ok(r) => match classify_status(r.status(), r.url()) {
-                    StatusVerdict::Terminal(cause) => return Err(cause),
-                    StatusVerdict::Transient(cause) => (cause, retry_after(&r)),
-                },
-                Err(e) => (OdlError::from_reqwest(e), None),
-            };
-            attempts = attempts.saturating_add(1);
-            if !wait_for_retry(&retry_policy, attempts, ctx, None, retry_after).await {
-                // `false` also means the wait was cancelled, and a stopped
-                // download must not report the network error that happened
-                // to precede the stop.
-                if ctx.is_cancelled() {
-                    return Err(OdlError::Cancelled);
-                }
-                return Err(cause);
-            }
-        };
+        let resp = ProbeRequest {
+            client: &client,
+            url: &url,
+            credentials: credentials.as_ref(),
+            randomize_user_agent: opts.user_agent().is_none() && opts.randomize_user_agent(),
+        }
+        .run(&retry_policy, ctx)
+        .await?;
         let info = ResponseInfo::from_response(url, resp);
         let instruction = Download::from_response_info(
             self.config.download_dir(),
@@ -692,7 +658,7 @@ impl DownloadManager {
         // so a slow download is never cut off, but a server that accepts the
         // request and then stops speaking, without closing the connection,
         // surfaces as a timeout instead of an indefinite wait. Applies to the
-        // evaluate `HEAD` and to every part body alike.
+        // evaluate probe and to every part body alike.
         if let Some(timeout) = opts.read_timeout() {
             client = client.read_timeout(timeout);
         }
@@ -1479,14 +1445,19 @@ mod tests {
         let mut server = Server::new_async().await;
         let url = server.url();
 
-        // HEAD request returns file info
-        let head_mock = server
-            .mock("HEAD", "/testfile")
-            .with_status(200)
-            .with_header("content-length", &file_content.len().to_string())
+        // The probe returns file info
+        let probe_mock = server
+            .mock("GET", "/testfile")
+            .match_header("range", "bytes=0-0")
+            .with_status(206)
+            .with_header(
+                "content-range",
+                &format!("bytes 0-0/{}", file_content.len()),
+            )
             .with_header("accept-ranges", "bytes")
             .with_header("etag", "testetag")
             .with_header("last-modified", "Wed, 21 Oct 2015 07:28:00 GMT")
+            .with_body("x")
             .create_async()
             .await;
 
@@ -1571,7 +1542,7 @@ mod tests {
         assert_eq!(result, file_content);
 
         // Ensure mocks were hit
-        head_mock.assert_async().await;
+        probe_mock.assert_async().await;
         get_mock1.assert_async().await;
         get_mock2.assert_async().await;
 
@@ -1583,12 +1554,14 @@ mod tests {
         let mut server = Server::new_async().await;
         let base = server.url();
 
-        let head_mock = server
-            .mock("HEAD", "/headerfile")
-            .with_status(200)
-            .with_header("content-length", "10")
+        let probe_mock = server
+            .mock("GET", "/headerfile")
+            .match_header("range", "bytes=0-0")
+            .with_status(206)
+            .with_header("content-range", "bytes 0-0/10")
             .with_header("accept-ranges", "bytes")
             .with_header("x-custom", "downstream-value")
+            .with_body("x")
             .create_async()
             .await;
 
@@ -1622,7 +1595,7 @@ mod tests {
             .await?;
         assert!(quick.response_headers().is_none());
 
-        head_mock.assert_async().await;
+        probe_mock.assert_async().await;
         Ok(())
     }
 
@@ -1633,12 +1606,14 @@ mod tests {
         let mut server = Server::new_async().await;
         let base = server.url();
 
-        // HEAD request returns file info
-        let head_mock = server
-            .mock("HEAD", "/file_abort")
-            .with_status(200)
-            .with_header("content-length", "1")
+        // The probe returns file info
+        let probe_mock = server
+            .mock("GET", "/file_abort")
+            .match_header("range", "bytes=0-0")
+            .with_status(206)
+            .with_header("content-range", "bytes 0-0/1")
             .with_header("accept-ranges", "bytes")
+            .with_body("x")
             .create_async()
             .await;
 
@@ -1686,7 +1661,7 @@ mod tests {
             }))
         ));
 
-        head_mock.assert_async().await;
+        probe_mock.assert_async().await;
 
         Ok(())
     }
@@ -1698,12 +1673,14 @@ mod tests {
         let mut server = Server::new_async().await;
         let base = server.url();
 
-        // HEAD request returns file info
-        let head_mock = server
-            .mock("HEAD", "/file_add")
-            .with_status(200)
-            .with_header("content-length", "1")
+        // The probe returns file info
+        let probe_mock = server
+            .mock("GET", "/file_add")
+            .match_header("range", "bytes=0-0")
+            .with_status(206)
+            .with_header("content-range", "bytes 0-0/1")
             .with_header("accept-ranges", "bytes")
+            .with_body("x")
             .create_async()
             .await;
 
@@ -1747,7 +1724,7 @@ mod tests {
         // Expect suggested alternative filename (file_add_2)
         assert_eq!(instruction.filename(), "file_add_2");
 
-        head_mock.assert_async().await;
+        probe_mock.assert_async().await;
 
         Ok(())
     }
@@ -1763,14 +1740,19 @@ mod tests {
         let mut server = Server::new_async().await;
         let url = server.url();
 
-        // HEAD request returns file info
-        let head_mock = server
-            .mock("HEAD", "/singlefile")
-            .with_status(200)
-            .with_header("content-length", &file_content.len().to_string())
+        // The probe returns file info
+        let probe_mock = server
+            .mock("GET", "/singlefile")
+            .match_header("range", "bytes=0-0")
+            .with_status(206)
+            .with_header(
+                "content-range",
+                &format!("bytes 0-0/{}", file_content.len()),
+            )
             .with_header("accept-ranges", "bytes")
             .with_header("etag", "singleetag")
             .with_header("last-modified", "Thu, 22 Oct 2015 07:28:00 GMT")
+            .with_body("x")
             .create_async()
             .await;
 
@@ -1837,7 +1819,7 @@ mod tests {
         assert_eq!(result, file_content);
 
         // Ensure mocks were hit
-        head_mock.assert_async().await;
+        probe_mock.assert_async().await;
         get_mock.assert_async().await;
 
         Ok(())
@@ -1853,13 +1835,14 @@ mod tests {
         let mut server = Server::new_async().await;
         let url = server.url();
 
-        // HEAD request returns file info, but not resumable (no accept-ranges)
-        let head_mock = server
-            .mock("HEAD", "/nonresumablefile")
+        // The probe returns file info, but not resumable (no accept-ranges)
+        let probe_mock = server
+            .mock("GET", "/nonresumablefile")
+            .match_header("range", "bytes=0-0")
             .with_status(200)
-            .with_header("content-length", &file_content.len().to_string())
             .with_header("etag", "nonresumableetag")
             .with_header("last-modified", "Fri, 23 Oct 2015 07:28:00 GMT")
+            .with_body(file_content)
             .create_async()
             .await;
 
@@ -1937,8 +1920,8 @@ mod tests {
             }))
         ));
 
-        // Ensure HEAD mock was hit, GET mocks may not be hit
-        head_mock.assert_async().await;
+        // Ensure the probe mock was hit, part mocks may not be hit
+        probe_mock.assert_async().await;
 
         Ok(())
     }
@@ -1954,13 +1937,14 @@ mod tests {
         let mut server = Server::new_async().await;
         let url = server.url();
 
-        // HEAD request returns file info, but not resumable (no accept-ranges)
-        let head_mock = server
-            .mock("HEAD", "/nonresumablefile_restart")
+        // The probe returns file info, but not resumable (no accept-ranges)
+        let probe_mock = server
+            .mock("GET", "/nonresumablefile_restart")
+            .match_header("range", "bytes=0-0")
             .with_status(200)
-            .with_header("content-length", &file_content.len().to_string())
             .with_header("etag", "nonresumableetag")
             .with_header("last-modified", "Fri, 23 Oct 2015 07:28:00 GMT")
+            .with_body(file_content)
             .create_async()
             .await;
 
@@ -2049,7 +2033,7 @@ mod tests {
         assert_eq!(result, file_content);
 
         // Ensure mocks were hit
-        head_mock.assert_async().await;
+        probe_mock.assert_async().await;
         get_mock.assert_async().await;
 
         Ok(())
@@ -2065,11 +2049,19 @@ mod tests {
         let mut server = Server::new_async().await;
         let url = server.url();
 
-        // HEAD request returns file info for 0 bytes
-        let head_mock = server
-            .mock("HEAD", "/zerofile")
+        // An empty file has no first byte to ask for, so the probe asks again
+        // for the whole of it.
+        let range_mock = server
+            .mock("GET", "/zerofile")
+            .match_header("range", "bytes=0-0")
+            .with_status(416)
+            .with_header("content-range", "bytes */0")
+            .create_async()
+            .await;
+        let probe_mock = server
+            .mock("GET", "/zerofile")
+            .match_header("range", Matcher::Missing)
             .with_status(200)
-            .with_header("content-length", "0")
             .with_header("accept-ranges", "bytes")
             .with_header("etag", "zeroetag")
             .with_header("last-modified", "Sat, 24 Oct 2015 07:28:00 GMT")
@@ -2128,7 +2120,8 @@ mod tests {
         assert_eq!(result, file_content);
 
         // Ensure mocks were hit
-        head_mock.assert_async().await;
+        range_mock.assert_async().await;
+        probe_mock.assert_async().await;
 
         Ok(())
     }
@@ -2242,17 +2235,22 @@ mod tests {
         let mut server = Server::new_async().await;
         let url = server.url();
 
-        // Expect a custom user agent header in HEAD and GET requests
+        // Expect a custom user agent header on the probe and on parts
         let custom_ua = "MyCustomUserAgent/1.0";
 
-        let head_mock = server
-            .mock("HEAD", "/useragentfile")
+        let probe_mock = server
+            .mock("GET", "/useragentfile")
+            .match_header("range", "bytes=0-0")
             .match_header("user-agent", Matcher::Exact(custom_ua.into()))
-            .with_status(200)
-            .with_header("content-length", &file_content.len().to_string())
+            .with_status(206)
+            .with_header(
+                "content-range",
+                &format!("bytes 0-0/{}", file_content.len()),
+            )
             .with_header("accept-ranges", "bytes")
             .with_header("etag", "uaetag")
             .with_header("last-modified", "Sun, 25 Oct 2015 07:28:00 GMT")
+            .with_body("x")
             .create_async()
             .await;
 
@@ -2328,14 +2326,14 @@ mod tests {
         let result = tokio::fs::read(&final_path).await?;
         assert_eq!(result, file_content);
 
-        head_mock.assert_async().await;
+        probe_mock.assert_async().await;
         get_mock.assert_async().await;
 
         Ok(())
     }
 
     /// Per-job `DownloadOptions` override must replace the manager's
-    /// own UA (and propagate to both evaluate's HEAD and download's GET).
+    /// own UA (and propagate to both evaluate's probe and download's parts).
     /// Regression guard for the get_client unification.
     #[tokio::test]
     async fn test_per_job_options_override_user_agent_end_to_end()
@@ -2348,14 +2346,19 @@ mod tests {
         let manager_ua = "ManagerUA/1.0";
         let job_ua = "PerJobUA/2.0";
 
-        // Both HEAD and GET must see the per-job UA, not the manager UA.
-        let head_mock = server
-            .mock("HEAD", "/perjob")
+        // The probe and parts must both see the per-job UA, not the manager UA.
+        let probe_mock = server
+            .mock("GET", "/perjob")
+            .match_header("range", "bytes=0-0")
             .match_header("user-agent", Matcher::Exact(job_ua.into()))
-            .with_status(200)
-            .with_header("content-length", &file_content.len().to_string())
+            .with_status(206)
+            .with_header(
+                "content-range",
+                &format!("bytes 0-0/{}", file_content.len()),
+            )
             .with_header("accept-ranges", "bytes")
             .with_header("etag", "pjetag")
+            .with_body("x")
             .create_async()
             .await;
 
@@ -2437,7 +2440,7 @@ mod tests {
         let result = fs::read(&final_path).await?;
         assert_eq!(result, file_content);
 
-        head_mock.assert_async().await;
+        probe_mock.assert_async().await;
         get_mock.assert_async().await;
 
         Ok(())
@@ -2459,14 +2462,19 @@ mod tests {
         let mut server = Server::new_async().await;
         let url = server.url();
 
-        let head_mock = server
-            .mock("HEAD", "/payload.bin")
-            .with_status(200)
-            .with_header("content-length", &file_content.len().to_string())
+        let probe_mock = server
+            .mock("GET", "/payload.bin")
+            .match_header("range", "bytes=0-0")
+            .with_status(206)
+            .with_header(
+                "content-range",
+                &format!("bytes 0-0/{}", file_content.len()),
+            )
             .with_header("accept-ranges", "bytes")
             .with_header("etag", "e2eetag")
             .with_header("last-modified", "Tue, 27 Oct 2015 07:28:00 GMT")
             .with_header("Repr-Digest", &repr_digest_value)
+            .with_body("x")
             .create_async()
             .await;
 
@@ -2516,7 +2524,7 @@ mod tests {
         let actual_b64 = base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
         assert_eq!(actual_b64, sha256_b64);
 
-        head_mock.assert_async().await;
+        probe_mock.assert_async().await;
         get_mock.assert_async().await;
         Ok(())
     }
@@ -2531,12 +2539,17 @@ mod tests {
         let mut server = Server::new_async().await;
         let url = server.url();
 
-        let head_mock = server
-            .mock("HEAD", "/bad.bin")
-            .with_status(200)
-            .with_header("content-length", &file_content.len().to_string())
+        let probe_mock = server
+            .mock("GET", "/bad.bin")
+            .match_header("range", "bytes=0-0")
+            .with_status(206)
+            .with_header(
+                "content-range",
+                &format!("bytes 0-0/{}", file_content.len()),
+            )
             .with_header("accept-ranges", "bytes")
             .with_header("Repr-Digest", bogus_repr_digest)
+            .with_body("x")
             .create_async()
             .await;
 
@@ -2578,7 +2591,7 @@ mod tests {
             result
         );
 
-        head_mock.assert_async().await;
+        probe_mock.assert_async().await;
         get_mock.assert_async().await;
         Ok(())
     }
@@ -2605,13 +2618,15 @@ mod tests {
         let mut server = Server::new_async().await;
         let url = server.url();
 
-        let head_mock = server
-            .mock("HEAD", "/big.bin")
-            .with_status(200)
-            .with_header("content-length", &size.to_string())
+        let probe_mock = server
+            .mock("GET", "/big.bin")
+            .match_header("range", "bytes=0-0")
+            .with_status(206)
+            .with_header("content-range", &format!("bytes 0-0/{}", size))
             .with_header("accept-ranges", "bytes")
             .with_header("etag", "bigetag")
             .with_header("Repr-Digest", &repr_digest_value)
+            .with_body("x")
             .create_async()
             .await;
 
@@ -2689,7 +2704,7 @@ mod tests {
         let actual_b64 = base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
         assert_eq!(actual_b64, sha256_b64);
 
-        head_mock.assert_async().await;
+        probe_mock.assert_async().await;
         for m in &get_mocks {
             m.assert_async().await;
         }
@@ -2706,14 +2721,19 @@ mod tests {
         let url = server.url();
 
         // Accept any user agent, but ensure it's not the default reqwest one
-        let head_mock = server
-            .mock("HEAD", "/randomua")
+        let probe_mock = server
+            .mock("GET", "/randomua")
+            .match_header("range", "bytes=0-0")
             .match_header("user-agent", Matcher::Any)
-            .with_status(200)
-            .with_header("content-length", &file_content.len().to_string())
+            .with_status(206)
+            .with_header(
+                "content-range",
+                &format!("bytes 0-0/{}", file_content.len()),
+            )
             .with_header("accept-ranges", "bytes")
             .with_header("etag", "randomuaetag")
             .with_header("last-modified", "Mon, 26 Oct 2015 07:28:00 GMT")
+            .with_body("x")
             .create_async()
             .await;
 
@@ -2788,7 +2808,7 @@ mod tests {
         let result = tokio::fs::read(&final_path).await?;
         assert_eq!(result, file_content);
 
-        head_mock.assert_async().await;
+        probe_mock.assert_async().await;
         get_mock.assert_async().await;
 
         Ok(())
@@ -3209,17 +3229,20 @@ mod tests {
         let mut mirror = Server::new_async().await;
 
         let probe = origin
-            .mock("HEAD", "/file")
+            .mock("GET", "/file")
+            .match_header("range", "bytes=0-0")
             .match_header("cookie", "user_session=SECRET")
             .with_status(302)
             .with_header("location", &format!("{}/signed", mirror.url()))
             .create_async()
             .await;
         mirror
-            .mock("HEAD", "/signed")
-            .with_status(200)
-            .with_header("content-length", &body.len().to_string())
+            .mock("GET", "/signed")
+            .match_header("range", "bytes=0-0")
+            .with_status(206)
+            .with_header("content-range", &format!("bytes 0-0/{}", body.len()))
             .with_header("accept-ranges", "bytes")
+            .with_body("x")
             .create_async()
             .await;
         let clean = mirror
@@ -3286,17 +3309,20 @@ mod tests {
         let mut server = Server::new_async().await;
 
         server
-            .mock("HEAD", "/file")
+            .mock("GET", "/file")
+            .match_header("range", "bytes=0-0")
             .with_status(302)
             .with_header("location", "/real")
             .create_async()
             .await;
         server
-            .mock("HEAD", "/real")
+            .mock("GET", "/real")
+            .match_header("range", "bytes=0-0")
             .match_header("authorization", basic)
-            .with_status(200)
-            .with_header("content-length", &body.len().to_string())
+            .with_status(206)
+            .with_header("content-range", &format!("bytes 0-0/{}", body.len()))
             .with_header("accept-ranges", "bytes")
+            .with_body("x")
             .create_async()
             .await;
         let part = server

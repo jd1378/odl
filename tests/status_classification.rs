@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 const SIZE: usize = 4 * 1024 * 1024;
 
-/// Serve a resumable file on `HEAD` but answer every part `GET` with `status`.
+/// Serve a resumable file to the probe but answer every part with `status`.
 /// Returns odl's exit code and how long it spent before giving up.
 fn refuse_every_part_with(status: usize) -> (Option<i32>, Duration, String) {
     refuse_parts_over(4, status)
@@ -25,11 +25,13 @@ fn refuse_parts_over(connections: usize, status: usize) -> (Option<i32>, Duratio
     let url = format!("{}/file", server.url());
 
     let _head = server
-        .mock("HEAD", "/file")
-        .with_status(200)
-        .with_header("content-length", &SIZE.to_string())
+        .mock("GET", "/file")
+        .match_header("range", "bytes=0-0")
+        .with_status(206)
+        .with_header("content-range", &format!("bytes 0-0/{}", SIZE))
         .with_header("accept-ranges", "bytes")
         .with_header("etag", "statusetag")
+        .with_body("x")
         .create();
     let _get = server
         .mock("GET", "/file")
@@ -45,8 +47,9 @@ fn refuse_parts_over(connections: usize, status: usize) -> (Option<i32>, Duratio
 fn refuse_the_probe_with(status: usize) -> (Option<i32>, Duration, String) {
     let mut server = mockito::Server::new();
     let url = format!("{}/file", server.url());
-    let _head = server
-        .mock("HEAD", "/file")
+    let _probe = server
+        .mock("GET", "/file")
+        .match_header("range", "bytes=0-0")
         .expect_at_least(1)
         .with_status(status)
         .create();

@@ -68,10 +68,11 @@ async fn run_and_record() -> Vec<ProgressEvent> {
     let url = format!("{}/file", server.url());
     let data = body();
 
-    let _head = server
-        .mock("HEAD", "/file")
-        .with_status(200)
-        .with_header("content-length", &SIZE.to_string())
+    let _probe = server
+        .mock("GET", "/file")
+        .match_header("range", "bytes=0-0")
+        .with_status(206)
+        .with_header("content-range", &format!("bytes 0-0/{SIZE}"))
         .with_header("accept-ranges", "bytes")
         .with_header("etag", "stages")
         // Server-advertised digest, so verification actually hashes the file.
@@ -88,6 +89,7 @@ async fn run_and_record() -> Vec<ProgressEvent> {
                 )
             }),
         )
+        .with_body("x")
         .expect_at_least(1)
         .create();
     let _get = server

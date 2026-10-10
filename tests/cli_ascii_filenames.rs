@@ -18,11 +18,13 @@ fn saved_name(extra: &[&str]) -> String {
         "attachment; filename*=UTF-8\'\'Caf%C3%A9%20M%C3%BCnster%20%E6%97%A5%E6%9C%AC%E8%AA%9E.bin";
 
     let _head = server
-        .mock("HEAD", "/f")
-        .with_status(200)
-        .with_header("content-length", &BODY.len().to_string())
+        .mock("GET", "/f")
+        .match_header("range", "bytes=0-0")
+        .with_status(206)
+        .with_header("content-range", &format!("bytes 0-0/{}", BODY.len()))
         .with_header("accept-ranges", "bytes")
         .with_header("content-disposition", disposition)
+        .with_body("x")
         .create();
     let _get = server
         .mock("GET", "/f")

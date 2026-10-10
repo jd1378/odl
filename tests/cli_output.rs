@@ -21,10 +21,12 @@ fn serve() -> Served {
     let mut server = mockito::Server::new();
     let mocks = vec![
         server
-            .mock("HEAD", "/report.bin")
-            .with_status(200)
-            .with_header("content-length", &BODY.len().to_string())
+            .mock("GET", "/report.bin")
+            .match_header("range", "bytes=0-0")
+            .with_status(206)
+            .with_header("content-range", &format!("bytes 0-0/{}", BODY.len()))
             .with_header("accept-ranges", "bytes")
+            .with_body("x")
             .create(),
         server
             .mock("GET", "/report.bin")

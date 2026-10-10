@@ -52,11 +52,13 @@ fn run_capturing_with_args(
     let url = format!("{}/file", server.url());
 
     let _head = server
-        .mock("HEAD", "/file")
-        .with_status(200)
-        .with_header("content-length", &SIZE.to_string())
+        .mock("GET", "/file")
+        .match_header("range", "bytes=0-0")
+        .with_status(206)
+        .with_header("content-range", &format!("bytes 0-0/{}", SIZE))
         .with_header("accept-ranges", "bytes")
         .with_header("etag", "rangeetag")
+        .with_body("x")
         .create();
     let _get = get(&mut server);
 

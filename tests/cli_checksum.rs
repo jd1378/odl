@@ -22,12 +22,17 @@ fn run_with_checksum_args(checksum_arg: &str, extra: &[&str]) -> i32 {
     let url = format!("{}/file", server.url());
 
     let head = server
-        .mock("HEAD", "/file")
-        .with_status(200)
-        .with_header("content-length", &FILE_CONTENT.len().to_string())
+        .mock("GET", "/file")
+        .match_header("range", "bytes=0-0")
+        .with_status(206)
+        .with_header(
+            "content-range",
+            &format!("bytes 0-0/{}", FILE_CONTENT.len()),
+        )
         .with_header("accept-ranges", "bytes")
         .with_header("etag", "e2eetag")
         .with_header("last-modified", "Wed, 21 Oct 2015 07:28:00 GMT")
+        .with_body("x")
         .create();
 
     let get = server

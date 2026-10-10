@@ -30,8 +30,9 @@ const SERVED_BEFORE_DEATH: usize = 64 * 1024;
 enum Behavior {
     /// Never answer anything. The connection stays open, unanswered.
     SayNothing,
-    /// Answer `HEAD` normally; serve the first `n` part `GET`s some data and
-    /// then stop, and answer every later `GET` with headers and nothing else.
+    /// Answer the probe normally; serve the first `n` part `GET`s some data
+    /// and then stop, and answer every later `GET` with headers and nothing
+    /// else.
     /// Both cases hold the connection open rather than closing it.
     DieAfterServing(usize),
 }
@@ -70,10 +71,14 @@ fn spawn(behavior: Behavior) -> Server {
                 let Behavior::DieAfterServing(alive_for) = behavior else {
                     return;
                 };
-                if request.starts_with("HEAD") {
+                if request
+                    .to_ascii_lowercase()
+                    .contains("\r\nrange: bytes=0-0\r\n")
+                {
                     let head = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {SIZE}\r\nAccept-Ranges: bytes\r\n\
-                         ETag: \"deadlink\"\r\nConnection: keep-alive\r\n\r\n"
+                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-0/{SIZE}\r\n\
+                         Content-Length: 1\r\nAccept-Ranges: bytes\r\n\
+                         ETag: \"deadlink\"\r\nConnection: keep-alive\r\n\r\nx"
                     );
                     let _ = stream.write_all(head.as_bytes());
                     let _ = stream.flush();

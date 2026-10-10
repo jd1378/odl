@@ -2144,7 +2144,7 @@ async fn run_tools(
     })
 }
 
-/// `odl probe <url>` — HEAD-probe a URL and report what a download would
+/// `odl probe <url>`: probe a URL and report what a download would
 /// resolve to, without writing anything. Uses the same config/flags as a
 /// real download so the reported filename/resumability match.
 async fn run_probe(args: &Args, url_str: &str, format: OutputFormat) -> Result<(), OdlError> {

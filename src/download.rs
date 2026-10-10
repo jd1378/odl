@@ -796,8 +796,8 @@ impl Download {
         // Empty means no probe was made (`quick_evaluate`), not "server sent
         // nothing" — keep that distinguishable for downstream consumers.
         let response_headers = {
-            let h = response_info.response_headers();
-            (!h.is_empty()).then(|| h.clone())
+            let h = response_info.file_headers();
+            (!h.is_empty()).then_some(h)
         };
         Self {
             download_dir: download_dir.join(&filename),

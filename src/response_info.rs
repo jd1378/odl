@@ -77,6 +77,33 @@ impl ResponseInfo {
         &self.response_headers
     }
 
+    /// The headers the file itself is served with. The probe asks for one
+    /// byte, and a 206's length, range and body digests describe that byte;
+    /// here the length is the file's again and the rest is left out, so the
+    /// set reads as a `HEAD` for the file would.
+    pub fn file_headers(&self) -> HeaderMap {
+        let mut headers = self.response_headers.clone();
+        if self.is_partial() {
+            for name in [
+                CONTENT_RANGE.as_str(),
+                "content-digest",
+                "content-md5",
+                "content-sha256",
+            ] {
+                headers.remove(name);
+            }
+            match self.total_length() {
+                Some(total) => {
+                    headers.insert(CONTENT_LENGTH, total.into());
+                }
+                None => {
+                    headers.remove(CONTENT_LENGTH);
+                }
+            }
+        }
+        headers
+    }
+
     /// Returns the MIME type (media type) from the response headers, if present.
     ///
     /// Looks for the "content-type" header and returns its value as a String,
@@ -102,10 +129,12 @@ impl ResponseInfo {
 
     /// Returns the total length of the resource, even if this is a partial response.
     pub fn total_length(&self) -> Option<u64> {
-        if let Some(content_range) = self.content_range()
-            && content_range.total.is_some()
-        {
-            return content_range.total;
+        if let Some(total) = self.content_range().and_then(|r| r.total) {
+            return Some(total);
+        }
+        if self.is_partial() {
+            // A partial body's length is the range's, not the file's.
+            return None;
         }
         self.content_length()
     }
@@ -339,8 +368,19 @@ impl ResponseInfo {
             }
         }
 
+        // Digests of the body describe the file only when the body is the
+        // whole file. A 206 carries one byte of it; the representation
+        // digests above and `Repr-Digest` below still describe the file.
+        let body_digest = |name: &str| {
+            if self.is_partial() {
+                None
+            } else {
+                self.response_headers.get(name)
+            }
+        };
+
         // Content-SHA256
-        if let Some(val) = self.response_headers.get("Content-SHA256")
+        if let Some(val) = body_digest("Content-SHA256")
             && let Ok(s) = val.to_str()
         {
             hashes.push(HashDigest::SHA256(
@@ -351,7 +391,7 @@ impl ResponseInfo {
         }
 
         // Content-MD5 rfc1864
-        if let Some(val) = self.response_headers.get("Content-MD5")
+        if let Some(val) = body_digest("Content-MD5")
             && let Ok(s) = val.to_str()
         {
             hashes.push(HashDigest::MD5(
@@ -361,7 +401,7 @@ impl ResponseInfo {
         }
 
         // Prefer Content-Digest (RFC 9530) over Repr-Digest if present
-        if let Some(val) = self.response_headers.get("Content-Digest") {
+        if let Some(val) = body_digest("Content-Digest") {
             if let Ok(s) = val.to_str() {
                 for part in s.split(',') {
                     let part = part.trim();
@@ -902,6 +942,62 @@ mod tests {
             }
             _ => panic!("Expected SHA512"),
         }
+    }
+
+    #[test]
+    fn a_partial_response_does_not_report_its_range_as_the_file() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("1"));
+        headers.insert(CONTENT_RANGE, HeaderValue::from_static("bytes 0-0/*"));
+        let resp = ResponseInfo::new(206, Url::parse("http://example.com").unwrap(), headers);
+        assert_eq!(resp.total_length(), None);
+    }
+
+    #[test]
+    fn a_partial_response_keeps_only_the_digests_of_the_whole_file() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_RANGE, HeaderValue::from_static("bytes 0-0/2000"));
+        headers.insert(
+            "Content-Digest",
+            HeaderValue::from_static("sha-256=:onebyte:"),
+        );
+        headers.insert("Content-MD5", HeaderValue::from_static("b25lYnl0ZQ=="));
+        headers.insert("Content-SHA256", HeaderValue::from_static("abcdef"));
+        let partial = ResponseInfo::new(206, Url::parse("http://example.com").unwrap(), headers);
+        assert!(
+            partial.extract_hashes().is_empty(),
+            "digests of one byte taken as the file's: {:?}",
+            partial.extract_hashes()
+        );
+
+        let mut headers = partial.response_headers().clone();
+        headers.insert(
+            "Repr-Digest",
+            HeaderValue::from_static("sha-256=:wholefile:"),
+        );
+        let partial = ResponseInfo::new(206, Url::parse("http://example.com").unwrap(), headers);
+        assert!(matches!(
+            partial.extract_hashes().as_slice(),
+            [HashDigest::SHA256(v, _)] if v == "wholefile"
+        ));
+    }
+
+    #[test]
+    fn a_partial_response_exposes_the_headers_of_the_file() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("1"));
+        headers.insert(CONTENT_RANGE, HeaderValue::from_static("bytes 0-0/2000"));
+        headers.insert(
+            "Content-Digest",
+            HeaderValue::from_static("sha-256=:onebyte:"),
+        );
+        headers.insert(ETAG, HeaderValue::from_static("\"e\""));
+        let partial = ResponseInfo::new(206, Url::parse("http://example.com").unwrap(), headers);
+        let exposed = partial.file_headers();
+        assert_eq!(exposed.get(CONTENT_LENGTH).unwrap(), "2000");
+        assert!(exposed.get(CONTENT_RANGE).is_none());
+        assert!(exposed.get("content-digest").is_none());
+        assert_eq!(exposed.get(ETAG).unwrap(), "\"e\"");
     }
 
     #[test]

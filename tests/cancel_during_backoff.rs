@@ -17,7 +17,7 @@ use std::process::{Command, Stdio};
 
 const SIZE: usize = 8 * 1024 * 1024;
 
-/// Answer `HEAD` as a resumable file and refuse every part with 503, so odl
+/// Answer the probe as a resumable file and refuse every part with 503, so odl
 /// settles into a retry backoff and stays there.
 fn spawn_always_busy_server() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -40,10 +40,13 @@ fn serve(mut stream: TcpStream) {
             Ok(n) => req.extend_from_slice(&buf[..n]),
         }
     }
-    let _ = if req.starts_with(b"HEAD") {
+    let is_probe = String::from_utf8_lossy(&req)
+        .to_ascii_lowercase()
+        .contains("\r\nrange: bytes=0-0\r\n");
+    let _ = if is_probe {
         write!(
             stream,
-            "HTTP/1.1 200 OK\r\nContent-Length: {SIZE}\r\nAccept-Ranges: bytes\r\nETag: \"c\"\r\nConnection: close\r\n\r\n"
+            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-0/{SIZE}\r\nContent-Length: 1\r\nAccept-Ranges: bytes\r\nETag: \"c\"\r\nConnection: close\r\n\r\nx"
         )
     } else {
         write!(
