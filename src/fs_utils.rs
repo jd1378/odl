@@ -187,10 +187,10 @@ pub async fn is_filename_unique<P: AsRef<Path>>(path: &P) -> io::Result<IsUnique
         return Ok(IsUnique::Yes);
     }
 
-    let file_stem = path.file_stem().and_then(|s| s.to_str()).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "Path has no valid file stem")
+    let file_name = path.file_name().and_then(|s| s.to_str()).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "Path has no valid file name")
     })?;
-    let extension = path.extension().and_then(|e| e.to_str());
+    let (file_stem, extension) = split_extension(file_name);
     let parent = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => {
@@ -203,16 +203,33 @@ pub async fn is_filename_unique<P: AsRef<Path>>(path: &P) -> io::Result<IsUnique
 
     let mut counter = 2;
     loop {
-        let new_file_name = if let Some(ext) = extension {
-            format!("{}_{}.{}", file_stem, counter, ext)
-        } else {
-            format!("{}_{}", file_stem, counter)
-        };
+        let new_file_name = format!("{file_stem}_{counter}{extension}");
         let new_path = parent.join(new_file_name.clone());
         if !tokio::fs::try_exists(&new_path).await? {
             return Ok(IsUnique::SuggestedAlternative(new_file_name));
         }
         counter += 1;
+    }
+}
+
+/// `name` split before its extension, dot included. A compressed tarball
+/// keeps both of its own (`foo.tar.gz` is `foo` and `.tar.gz`), so a number
+/// put between them does not hide the name from archive tools. A leading
+/// dot starts a name, not an extension.
+fn split_extension(name: &str) -> (&str, &str) {
+    let Some(dot) = name.rfind('.').filter(|&i| i > 0) else {
+        return (name, "");
+    };
+    let (stem, extension) = name.split_at(dot);
+    match stem.len().checked_sub(".tar".len()) {
+        Some(tar)
+            if tar > 0
+                && stem.is_char_boundary(tar)
+                && stem[tar..].eq_ignore_ascii_case(".tar") =>
+        {
+            name.split_at(tar)
+        }
+        _ => (stem, extension),
     }
 }
 
@@ -346,6 +363,36 @@ mod tests {
             result,
             IsUnique::SuggestedAlternative("file_4.txt".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn a_compressed_tarball_is_numbered_before_both_extensions() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("oxdm-v1-x86_64.tar.gz");
+        fs::write(&file_path, b"test").unwrap();
+        let result = is_filename_unique(&file_path).await.unwrap();
+        assert_eq!(
+            result,
+            IsUnique::SuggestedAlternative("oxdm-v1-x86_64_2.tar.gz".to_string())
+        );
+    }
+
+    #[test]
+    fn split_extension_keeps_tar_with_its_compression() {
+        for (name, stem, ext) in [
+            ("a.tar.gz", "a", ".tar.gz"),
+            ("a.TAR.XZ", "a", ".TAR.XZ"),
+            ("pkg-1.0.pkg.tar.zst", "pkg-1.0.pkg", ".tar.zst"),
+            ("a.tar", "a", ".tar"),
+            ("a.gz", "a", ".gz"),
+            ("v1.2.zip", "v1.2", ".zip"),
+            (".tar.gz", ".tar", ".gz"),
+            (".bashrc", ".bashrc", ""),
+            ("README", "README", ""),
+            ("ü.tar.gz", "ü", ".tar.gz"),
+        ] {
+            assert_eq!(split_extension(name), (stem, ext), "{name}");
+        }
     }
 
     #[tokio::test]
