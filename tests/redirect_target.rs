@@ -1,8 +1,11 @@
-//! The probe against a link that redirects somewhere else.
+//! The probe and the parts against a link that redirects somewhere else.
 //!
-//! Met on GitHub: a release asset URL redirects to a signed link on another
-//! host. For a signed-in `HEAD` it redirects to one that answers 401, while a
-//! `GET` gets one that serves the file, so the probe asks with `GET`.
+//! Both failures here were met on GitHub. A release asset URL redirects to a
+//! signed link on another host. For a signed-in `HEAD` it redirects to one
+//! that answers 401, while a `GET` gets one that serves the file, so the
+//! probe asks with `GET`. And the signed link expires after five minutes,
+//! answering 618 from then on, so a part that reconnects after that never
+//! gets its bytes from it again.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -12,10 +15,10 @@ use std::time::Duration;
 use odl::config::{ConfigBuilder, DownloadOptions, DownloadOptionsBuilder};
 use odl::conflict::{
     FileChangedResolution, FinalFileExistsResolution, NotResumableResolution,
-    SameDownloadExistsResolution, SaveConflictResolver, ServerConflictResolver,
+    SameDownloadExistsResolution, SaveConflictResolver, ServerConflict, ServerConflictResolver,
 };
 use odl::download_manager::{DownloadManager, DownloadRequest, EvaluateRequest};
-use odl::error::OdlError;
+use odl::error::{ConflictError, OdlError};
 use url::Url;
 
 /// Large enough for four parts.
@@ -49,6 +52,11 @@ impl Request {
         let first = first.parse().ok()?;
         let last = last.parse().unwrap_or(SIZE - 1).min(SIZE - 1);
         Some((first, last))
+    }
+
+    /// The probe asks for byte zero alone; parts ask for their windows.
+    fn is_part(&self) -> bool {
+        self.method == "GET" && self.header("range") != Some("bytes=0-0")
     }
 }
 
@@ -284,5 +292,157 @@ async fn an_empty_file_is_asked_for_whole() {
         log[..2],
         ["GET /empty bytes=0-0 cookie", "GET /empty cookie"],
         "{log:?}"
+    );
+}
+
+/// A site that redirects `/file` to a new signed link on `assets` each time
+/// it is asked: `/signed/0`, then `/signed/1`, and so on.
+fn signing_site(assets: String) -> (String, Log) {
+    let issued = Mutex::new(0u32);
+    serve(move |_| {
+        let mut n = issued.lock().unwrap();
+        let link = format!("{assets}/signed/{n}");
+        *n += 1;
+        Response::redirect(&link)
+    })
+}
+
+fn token(req: &Request) -> u32 {
+    req.path
+        .strip_prefix("/signed/")
+        .and_then(|t| t.parse().ok())
+        .unwrap_or(u32::MAX)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_link_that_expired_before_the_parts_began_is_renewed_once_for_all() {
+    // The probe's link has expired by the time parts ask for it, as it does
+    // when a download starts minutes after it was evaluated.
+    let data = Arc::new(body());
+    let served = data.clone();
+    let (assets, assets_log) = serve(move |req| {
+        if req.is_part() && token(req) == 0 {
+            Response::status(618)
+        } else {
+            Response::file(req, &served, ETAG)
+        }
+    });
+    let (site, site_log) = signing_site(assets);
+
+    let file = fetch(&format!("{site}/file"), &options(4))
+        .await
+        .expect("an expired link is renewed");
+    assert!(file == *data, "the file came out wrong");
+
+    let site_log = entries(&site_log);
+    assert_eq!(
+        site_log,
+        ["GET /file bytes=0-0 cookie", "GET /file bytes=0-0 cookie"],
+        "one probe and one renewal, however many parts were refused"
+    );
+    let assets_log = entries(&assets_log);
+    assert!(
+        assets_log.iter().all(|l| !l.ends_with(" cookie")),
+        "the session followed the redirect: {assets_log:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_part_cut_off_after_its_link_expired_resumes_from_a_fresh_one() {
+    // The link works for one part request. That one is cut off halfway, and
+    // the reconnect finds the link expired.
+    let data = Arc::new(body());
+    let served = data.clone();
+    let used = Mutex::new(Vec::<u32>::new());
+    let (assets, assets_log) = serve(move |req| {
+        if !req.is_part() {
+            return Response::file(req, &served, ETAG);
+        }
+        let mut used = used.lock().unwrap();
+        if used.contains(&token(req)) {
+            return Response::status(618);
+        }
+        used.push(token(req));
+        let mut r = Response::file(req, &served, ETAG);
+        if token(req) == 0 {
+            r.cut_after = Some(SIZE / 2);
+        }
+        r
+    });
+    let (site, _) = signing_site(assets);
+
+    let file = fetch(&format!("{site}/file"), &options(1))
+        .await
+        .expect("the part resumes from a fresh link");
+    assert!(file == *data, "the file came out wrong");
+
+    let log = entries(&assets_log);
+    let resumed = format!("GET /signed/1 bytes={}-{}", SIZE / 2, SIZE - 1);
+    assert!(
+        log.contains(&resumed),
+        "the part should have resumed where it stopped: {log:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_renewed_link_on_another_origin_is_not_used() {
+    // Parts were scoped to the first asset host's origin, so a link on
+    // another one would need headers worked out afresh. The refusal stands.
+    let data = Arc::new(body());
+    let served = data.clone();
+    let (elsewhere, elsewhere_log) = serve(move |req| Response::file(req, &served, ETAG));
+    let (assets, _) = serve(|req| {
+        if req.is_part() {
+            Response::status(618)
+        } else {
+            Response::file(req, &body(), ETAG)
+        }
+    });
+    let first = Mutex::new(true);
+    let (site, _) = serve(move |_| {
+        let mut first = first.lock().unwrap();
+        let host = if *first { &assets } else { &elsewhere };
+        *first = false;
+        Response::redirect(&format!("{host}/signed/0"))
+    });
+
+    let result = fetch(&format!("{site}/file"), &options(1)).await;
+    assert!(
+        result.is_err(),
+        "the refused link cannot finish the download"
+    );
+    let log = entries(&elsewhere_log);
+    assert!(
+        log.iter().all(|l| l == "GET /signed/0 bytes=0-0"),
+        "no part may be fetched from another origin: {log:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_renewed_link_to_another_file_is_a_changed_file() {
+    let data = Arc::new(body());
+    let served = data.clone();
+    let (assets, assets_log) = serve(move |req| match token(req) {
+        0 if req.is_part() => Response::status(618),
+        0 => Response::file(req, &served, ETAG),
+        _ => Response::file(req, &served, "\"a-new-upload\""),
+    });
+    let (site, _) = signing_site(assets);
+
+    let result = fetch(&format!("{site}/file"), &options(1)).await;
+    assert!(
+        matches!(
+            result,
+            Err(OdlError::Conflict(ConflictError::Server {
+                conflict: ServerConflict::FileChanged
+            }))
+        ),
+        "expected a changed file, got {result:?}"
+    );
+    let log = entries(&assets_log);
+    assert!(
+        !log.iter()
+            .any(|l| l.starts_with("GET /signed/1") && l != "GET /signed/1 bytes=0-0"),
+        "no part may be fetched from the new file: {log:?}"
     );
 }

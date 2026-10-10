@@ -2,6 +2,7 @@ mod checksum;
 mod delegated;
 mod downloader;
 mod io;
+mod part_source;
 mod probe;
 mod recover_metadata;
 mod save_conflict;
@@ -781,6 +782,12 @@ impl DownloadManager {
 
                 let client =
                     self.get_client(opts, instruction.transfer_headers(HeaderMap::from(opts)))?;
+                // For renewing a redirect target, which only a redirected probe
+                // has. It asks the requested URL, so it carries everything the
+                // probe did.
+                let renewal_client = (instruction.requested_url() != instruction.url())
+                    .then(|| self.get_client(opts, HeaderMap::from(opts)))
+                    .transpose()?;
                 let retry_policy = crate::retry_policies::FixedThenExponentialRetry {
                     max_n_retries: opts.max_retries(),
                     wait_time: opts.wait_between_retries(),
@@ -797,7 +804,7 @@ impl DownloadManager {
                 // not-resumable conflict found before the download starts.
                 let mut restarted_unranged = false;
                 loop {
-                    let downloader = Downloader::new(
+                    let mut downloader = Downloader::new(
                         Arc::new(instruction.clone()),
                         metadata.clone(),
                         client.clone(),
@@ -813,6 +820,9 @@ impl DownloadManager {
                         retry_policy,
                         ctx.clone(),
                     );
+                    if let Some(client) = &renewal_client {
+                        downloader = downloader.renew_redirects_with(client.clone());
+                    }
 
                     // Persist per-part finished flags but DO NOT set the
                     // overall `metadata.finished = true` here: assembly is

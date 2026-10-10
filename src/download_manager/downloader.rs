@@ -35,7 +35,10 @@ use crate::retry_policies::{
 use crate::{
     conflict::ServerConflict,
     download::Download,
-    download_manager::io::persist_encoded_metadata,
+    download_manager::{
+        io::persist_encoded_metadata,
+        part_source::{PartSource, may_have_expired},
+    },
     download_metadata::{DownloadMetadata, PartDetails},
     error::{ConflictError, MetadataError, NetworkError, OdlError},
     user_agents::random_user_agent,
@@ -99,6 +102,7 @@ impl RampupConfig {
 /// all available connections busy.
 pub struct Downloader {
     instruction: Arc<Download>,
+    source: Arc<PartSource>,
     metadata: Arc<Mutex<DownloadMetadata>>,
     client: Arc<Client>,
     randomize_user_agent: bool,
@@ -162,6 +166,7 @@ impl Downloader {
             tracker.advance(already_done);
         }
         Self {
+            source: Arc::new(PartSource::fixed(&instruction)),
             instruction,
             // Splitting a part means asking for a range, so a server that
             // does not serve ranges is left with the one part it can answer —
@@ -183,6 +188,18 @@ impl Downloader {
             requested_connections,
             reported_connection_limit: AtomicUsize::new(0),
         }
+    }
+
+    /// Let parts replace a refused redirect target by asking the requested
+    /// URL again through `client`, which must send the caller's headers the
+    /// way the probe's does.
+    pub fn renew_redirects_with(mut self, client: Client) -> Self {
+        self.source = Arc::new(PartSource::renewable(
+            &self.instruction,
+            client,
+            self.randomize_user_agent,
+        ));
+        self
     }
 
     pub async fn run(self) -> Result<DownloadMetadata, OdlError> {
@@ -824,6 +841,7 @@ impl Downloader {
         let controller_clone = Arc::clone(&controller);
         let client = Arc::clone(&self.client);
         let instruction = Arc::clone(&self.instruction);
+        let source = Arc::clone(&self.source);
         let randomize_user_agent = self.randomize_user_agent;
         let speed_limiter = self.speed_limiter.clone();
         let span_ulid = task_part.ulid.clone();
@@ -842,6 +860,7 @@ impl Downloader {
                 download_part(
                     client,
                     instruction,
+                    source,
                     task_part,
                     controller_clone,
                     randomize_user_agent,
@@ -1398,6 +1417,7 @@ fn all_parts_failed(last_failure: &mut Option<OdlError>, ulid: &str, attempts: u
 async fn download_part(
     client: Arc<Client>,
     instruction: Arc<Download>,
+    source: Arc<PartSource>,
     part: PartDetails,
     controller: Arc<PartController>,
     randomize_user_agent: bool,
@@ -1418,7 +1438,6 @@ async fn download_part(
         offset, size, ulid, ..
     } = part;
     let part_path = instruction.part_path(&ulid);
-    let url = instruction.url().clone();
     let mut current_size;
     let target_size = controller.limit();
     // Unknown total length: stream until the server closes the body.
@@ -1427,10 +1446,16 @@ async fn download_part(
     let unknown_size = size == crate::download::Download::UNKNOWN_PART_SIZE;
 
     let mut attempts: u32 = 0;
+    // Whether this part asked for a fresh link since its last good response.
+    // Once is enough: a server that hands out links refused at once (a
+    // single-use one spent on the asking) would otherwise be asked forever.
+    let mut renewed = false;
 
     loop {
         // Recompute current size (in case previous attempts wrote some bytes)
         current_size = controller.downloaded();
+        // Read on every attempt: another part may have renewed it.
+        let (url, generation) = source.current();
 
         // Open file for this attempt. We delegate all IO to a dedicated
         // blocking writer thread (`PartFileWriter`) to keep file writes
@@ -1550,6 +1575,12 @@ async fn download_part(
                 "part request answered with an error status"
             );
             file.finish().await?;
+            if !renewed && may_have_expired(resp.status()) {
+                renewed = true;
+                if source.renew(generation).await? {
+                    continue;
+                }
+            }
             // Carry the status through so the failure is reported as what it
             // was, and let it decide whether trying again is worth the user's
             // time at all.
@@ -1582,6 +1613,7 @@ async fn download_part(
                 Err(failed) => return Ok(failed),
             }
         }
+        renewed = false;
         if !unknown_size && let Some(conflict) = range_mismatch(&resp, &instruction, part_window) {
             file.finish().await?;
             tracing::warn!(
@@ -2231,6 +2263,7 @@ mod tests {
         let event = download_part(
             Arc::new(reqwest::Client::builder().build()?),
             Arc::clone(&instruction),
+            Arc::new(PartSource::fixed(&instruction)),
             part,
             controller,
             false,

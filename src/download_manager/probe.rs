@@ -123,6 +123,12 @@ impl ProbeRequest<'_> {
             }
         }
     }
+
+    /// One probe with no retries. `None` for an error status.
+    pub(crate) async fn once(&self) -> Result<Option<Response>, reqwest::Error> {
+        let (resp, _) = self.send(ProbeMethod::Range).await?;
+        Ok((!is_refusal(resp.status())).then_some(resp))
+    }
 }
 
 /// Whether `status` answers the probe with "no". Statuses past 599 are not
