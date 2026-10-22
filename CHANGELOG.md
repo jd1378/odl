@@ -1,5 +1,18 @@
 # Changelog
 
+## 3.4.2
+
+### The `odl` binary is built against patched rustls and webpki
+
+The lockfile now pins rustls 0.23.46 (past RUSTSEC-2026-0346, -0347, -0348
+and -0349), rustls-webpki 0.103.16 (RUSTSEC-2026-0382) and webpki-root-certs
+1.0.10 (RUSTSEC-2026-0383). Between them, a ServerHello sent before the server
+was authenticated could downgrade later connections to the same host to
+classical key exchange, certificate checks could accept distrusted
+intermediates, and a server could make the client allocate up to 1 GiB before
+authenticating. Library users resolve their own versions, and a `cargo update`
+brings in the same fixes.
+
 ## 3.4.1
 
 ### The probe asks with `GET` for the first byte, not `HEAD`
